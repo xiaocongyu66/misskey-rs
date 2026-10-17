@@ -29,8 +29,31 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/{*name}", any(api::dispatch))
         .route("/healthz", get(healthz))
         .layer(cors)
+        .layer(middleware::from_fn(json_utf8_charset))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
+}
+
+/// Upstream fastify emits `application/json; charset=utf-8`; axum's Json
+/// emits bare `application/json`. The e2e client strictly string-compares
+/// the header, so normalize it (only the bare form touches this layer).
+async fn json_utf8_charset(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut res = next.run(req).await;
+    if res
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(|v| v == "application/json")
+        .unwrap_or(false)
+    {
+        res.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+    }
+    res
 }
 
 #[tokio::main]
