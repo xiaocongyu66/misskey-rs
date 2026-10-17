@@ -6,4 +6,4 @@
 
 pub mod aid;
 
-pub use aid::gen_aid;
+pub use aid::{gen_aid, gen_aid_now, parse_aid_date};
