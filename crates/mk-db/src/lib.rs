@@ -10,6 +10,8 @@ pub mod note;
 pub mod notification;
 pub mod relation;
 pub mod role;
+// social-agent: social-graph writes (follow/mute/block/renote)
+pub mod social;
 pub mod user;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {

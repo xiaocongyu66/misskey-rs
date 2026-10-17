@@ -14,6 +14,9 @@ use crate::error::{api_err, ApiError};
 use crate::ratelimit::Limit;
 use crate::AppState;
 
+// social-agent: follow/mute/block/renote social actions (M2 truthful slice)
+mod social;
+
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
     ("server-info", 60),
@@ -127,6 +130,37 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return admin::handle(&state, &name, req).await;
     }
     // ==== END ADMIN DISPATCH ARM ====
+
+    // social-agent dispatch block: follow/mute/block social actions
+    // (following/*, mute/*, blocking/*) — requireCredential, JSON body,
+    // same token extraction as the group above (upstream
+    // endpoints/following + mute + blocking semantics).
+    if social::SOCIAL_ENDPOINTS.contains(&name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return social::route(&state, name.as_str(), &body, token, credential_declared).await;
+    }
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
@@ -1402,6 +1436,13 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             "Authentication failed. Please ensure your token is correct.",
         ));
     };
+
+    // social-agent: renote path — upstream notes/create renoteId param with
+    // NoteCreateService renote rules (textless row; M2 local-only; the
+    // target note's notifications stay with the notifications agent).
+    if body.get("renoteId").and_then(|v| v.as_str()).is_some() {
+        return social::notes_create_renote(state, body, &me_id).await;
+    }
 
     let text = match body.get("text").and_then(|v| v.as_str()) {
         Some(t) if !t.is_empty() && t.chars().count() <= 3000 => t,
