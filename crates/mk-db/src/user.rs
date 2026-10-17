@@ -270,6 +270,185 @@ pub struct ProfileRow {
 
 pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", ("followingVisibility"::text) AS "followingVisibility", ("followersVisibility"::text) AS "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds""#;
 
+pub struct ProfileUpdate {
+    // "user" table columns
+    pub name: Option<Option<String>>,
+    pub is_locked: Option<bool>,
+    pub is_explorable: Option<bool>,
+    pub hide_online_status: Option<bool>,
+    pub chat_scope: Option<String>,
+    // "user_profile" table columns
+    pub description: Option<Option<String>>,
+    pub location: Option<Option<String>>,
+    pub birthday: Option<Option<String>>,
+    pub lang: Option<Option<String>>,
+    pub url: Option<Option<String>>,
+    /// jsonb; stored via `$n::jsonb` from its JSON text.
+    pub fields: Option<serde_json::Value>,
+    pub no_crawle: Option<bool>,
+    pub prevent_ai_learning: Option<bool>,
+    pub inject_featured_note: Option<bool>,
+    pub receive_announcement_email: Option<bool>,
+    pub always_mark_nsfw: Option<bool>,
+    pub auto_sensitive: Option<bool>,
+    pub careful_bot: Option<bool>,
+    pub auto_accept_followed: Option<bool>,
+    pub public_reactions: Option<bool>,
+    /// PG enum `user_profile_followingvisibility_enum`; the plain string value
+    /// is bound and PG casts it on UPDATE (column type is the enum).
+    pub following_visibility: Option<String>,
+    /// PG enum `user_profile_followersvisibility_enum`; bound as plain string.
+    pub followers_visibility: Option<String>,
+}
+
+/// One dynamically-built SET assignment value. Text/Json/Bool values become
+/// bind parameters whose type PG infers from the assignment target; enum
+/// values are used as inlined escaped literals (sqlx binds str params with
+/// the TEXT type OID, which PG rejects against enum columns — 42804).
+enum SetVal {
+    Text(Option<String>),
+    Bool(bool),
+    JsonText(String),
+}
+
+pub async fn update_profile_subset(
+    pool: &PgPool,
+    user_id: &str,
+    u: &ProfileUpdate,
+) -> Result<(), sqlx::Error> {
+    // --- "user" table: name / isLocked / isExplorable / hideOnlineStatus /
+    // chatScope (upstream `updates`) ---
+    let mut cols: Vec<&'static str> = Vec::new();
+    let mut vals: Vec<SetVal> = Vec::new();
+    if let Some(v) = &u.name {
+        cols.push("\"name\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    if let Some(v) = u.is_locked {
+        cols.push("\"isLocked\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.is_explorable {
+        cols.push("\"isExplorable\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.hide_online_status {
+        cols.push("\"hideOnlineStatus\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = &u.chat_scope {
+        cols.push("\"chatScope\"");
+        vals.push(SetVal::Text(Some(v.clone())));
+    }
+    if !cols.is_empty() {
+        let sets: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} = ${}", c, i + 2))
+            .collect();
+        let sql = format!(r#"UPDATE "user" SET {} WHERE "id" = $1"#, sets.join(", "));
+        let mut q = sqlx::query(&sql).bind(user_id);
+        for v in &vals {
+            q = match v {
+                SetVal::Text(t) => q.bind(t.as_ref()),
+                SetVal::Bool(b) => q.bind(*b),
+                SetVal::JsonText(_) => unreachable!(),
+            };
+        }
+        q.execute(pool).await?;
+    }
+
+    // --- "user_profile" table (upstream `profileUpdates`) ---
+    // `userId` is $1; every bound value gets the next $n in push order. Enum
+    // columns take inline literals (see SetVal docs).
+    let mut sets: Vec<String> = Vec::new();
+    let mut vals: Vec<SetVal> = Vec::new();
+    macro_rules! push_set {
+        ($col:expr, bound $val:expr) => {{
+            vals.push($val);
+            sets.push(format!("{} = ${}", $col, vals.len() + 1));
+        }};
+        ($col:expr, lit $val:expr) => {{
+            sets.push(format!("{} = '{}'", $col, $val.replace('\'', "''")));
+        }};
+    }
+    if let Some(v) = &u.description {
+        push_set!("\"description\"", bound SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.location {
+        push_set!("\"location\"", bound SetVal::Text(v.clone()));
+    }
+    // birthday is always written: JSON string → value, absent/null → NULL
+    let birthday = u.birthday.clone().unwrap_or_default();
+    push_set!("\"birthday\"", bound SetVal::Text(birthday));
+    if let Some(v) = &u.lang {
+        push_set!("\"lang\"", bound SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.url {
+        push_set!("\"url\"", bound SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.fields {
+        vals.push(SetVal::JsonText(
+            serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
+        ));
+        // ::text keeps the declared param type string; PG then does the
+        // explicit text→jsonb I/O-conversion input.
+        sets.push(format!("\"fields\" = ${}::jsonb", vals.len() + 1));
+    }
+    if let Some(v) = u.no_crawle {
+        push_set!("\"noCrawle\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.prevent_ai_learning {
+        push_set!("\"preventAiLearning\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.inject_featured_note {
+        push_set!("\"injectFeaturedNote\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.receive_announcement_email {
+        push_set!("\"receiveAnnouncementEmail\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.always_mark_nsfw {
+        push_set!("\"alwaysMarkNsfw\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.auto_sensitive {
+        push_set!("\"autoSensitive\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.careful_bot {
+        push_set!("\"carefulBot\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.auto_accept_followed {
+        push_set!("\"autoAcceptFollowed\"", bound SetVal::Bool(v));
+    }
+    if let Some(v) = u.public_reactions {
+        push_set!("\"publicReactions\"", bound SetVal::Bool(v));
+    }
+    // PG enums (labels validated against the paramDef whitelist upstream of
+    // this call; escaped here regardless — PG coerces the literal to the enum).
+    if let Some(v) = &u.following_visibility {
+        push_set!("\"followingVisibility\"", lit v.clone());
+    }
+    if let Some(v) = &u.followers_visibility {
+        push_set!("\"followersVisibility\"", lit v.clone());
+    }
+    if !sets.is_empty() {
+        let sql = format!(
+            r#"UPDATE "user_profile" SET {} WHERE "userId" = $1"#,
+            sets.join(", ")
+        );
+        let mut q = sqlx::query(&sql).bind(user_id);
+        for v in &vals {
+            q = match v {
+                SetVal::Text(t) => q.bind(t.as_ref()),
+                SetVal::Bool(b) => q.bind(*b),
+                SetVal::JsonText(s) => q.bind(s),
+            };
+        }
+        q.execute(pool).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn find_profile(pool: &PgPool, user_id: &str) -> Result<ProfileRow, sqlx::Error> {
     // (column-array decode: Vec<String> is required for varchar[] columns)
     sqlx::query_as::<_, ProfileRow>(&format!(
