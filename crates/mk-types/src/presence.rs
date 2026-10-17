@@ -14,7 +14,7 @@ use serde::Serialize;
 pub type Nullable<T> = Option<T>;
 
 /// Field omitted from the JSON object entirely when `None`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(transparent)]
 pub struct Omit<T>(#[serde(skip_serializing_if = "Option::is_none")] pub Option<T>);
 
