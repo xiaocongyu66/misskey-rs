@@ -2,7 +2,6 @@
 -- PostgreSQL database dump
 --
 
-\restrict GrpjcSku2VQW4JtILFF87rrY4OOeGtfOW4OPUsWguSCClwtQ9oKSGhuSP9Qd5PG
 
 -- Dumped from database version 16.15 (Debian 16.15-1.pgdg13+2)
 -- Dumped by pg_dump version 16.15 (Ubuntu 16.15-1.pgdg24.04+2)
@@ -8800,5 +8799,4 @@ ALTER TABLE ONLY public.user_security_key
 -- PostgreSQL database dump complete
 --
 
-\unrestrict GrpjcSku2VQW4JtILFF87rrY4OOeGtfOW4OPUsWguSCClwtQ9oKSGhuSP9Qd5PG
 
