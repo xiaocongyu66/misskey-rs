@@ -963,18 +963,35 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert_eq!(arr6[0]["type"], "renote");
     assert_eq!(arr6[1]["type"], "follow");
 
-    // markAsRead:false leaves rows unread.
+    // markAsRead:false leaves rows unread. All rows above were already
+    // marked read (their calls used the markAsRead default), so seed a fresh
+    // unread mention for this leg.
+    let mention2_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_notification(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &mention2_id,
+            r#type: "mention",
+            user_id: &b_id,
+            notifier_id: Some(a["id"].as_str().unwrap()),
+            note_id: Some(&note_id),
+            reaction: None,
+        },
+    )
+    .await
+    .unwrap();
     let (s, list7) = post_json(
         app.clone(),
         "/api/notifications",
-        json!({ "i": token_b, "markAsRead": false, "unreadOnly": true, "includeTypes": ["renote", "follow"] }),
+        json!({ "i": token_b, "markAsRead": false, "unreadOnly": true, "includeTypes": ["mention"] }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list7}");
     let arr7 = list7.as_array().unwrap();
-    assert_eq!(arr7.len(), 2, "body: {list7}");
+    assert_eq!(arr7.len(), 1, "body: {list7}");
+    assert_eq!(arr7[0]["id"], mention2_id.as_str());
 
-    // Then a default call (markAsRead=true) clears them.
+    // Then a default call (markAsRead=true) clears it.
     let (s, _) = post_json(
         app.clone(),
         "/api/notifications",
