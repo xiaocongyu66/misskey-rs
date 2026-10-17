@@ -2755,25 +2755,6 @@ CREATE TABLE public.meta (
 
 
 --
--- Name: migrations; Type: TABLE; Schema: public; Owner: -
---
-
-
-
---
--- Name: migrations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: migrations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 
@@ -4516,12 +4497,6 @@ ALTER TABLE ONLY public.__chart_day__users ALTER COLUMN id SET DEFAULT nextval('
 
 
 --
--- Name: migrations id; Type: DEFAULT; Schema: public; Owner: -
---
-
-
-
---
 -- Name: user_ip id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -4998,13 +4973,6 @@ ALTER TABLE ONLY public.__chart_day__per_user_reaction
 
 ALTER TABLE ONLY public.channel_following
     ADD CONSTRAINT "PK_8b104be7f7415113f2a02cd5bdd" PRIMARY KEY (id);
-
-
---
--- Name: migrations PK_8c82d7f526340ab734260ea46be; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-    ADD CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY (id);
 
 
 --
