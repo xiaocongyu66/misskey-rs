@@ -528,10 +528,11 @@ pub async fn search_users_by_username_and_host(
         r#"SELECT {} FROM "user"
            WHERE "usernameLower" LIKE $1
              AND "isSuspended" = FALSE
-             AND CASE
-                   WHEN $2 = '.' OR $2 = $3 THEN "host" IS NULL
-                   ELSE "host" ILIKE $2
-                 END
+             AND (
+                   $2 IS NULL
+                   OR ($2 IN ('.', $3) AND "host" IS NULL)
+                   OR "host" ILIKE $2
+                 )
            ORDER BY "usernameLower" ASC
            LIMIT {}"#,
         LOCAL_USER_COLS, limit
