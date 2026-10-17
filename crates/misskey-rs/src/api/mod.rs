@@ -512,11 +512,7 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
             };
             let is_me = me_id.as_deref() == Some(row.id.as_str());
             out.push(mk_core::services::user_pack::pack_inline(
-                &row,
-                &profile,
-                is_me,
-                me_id.is_some(),
-                ctx,
+                &row, &profile, is_me, ctx,
             ));
         }
         return (StatusCode::OK, Json(json!(out))).into_response();
@@ -560,11 +556,7 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row,
-            &profile,
-            is_me,
-            me_id.is_some(),
-            ctx,
+            &row, &profile, is_me, ctx,
         )),
     )
         .into_response()
@@ -711,7 +703,7 @@ async fn i_route(
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, true, ctx,
+            &row, &profile, true, ctx,
         )),
     )
         .into_response()
@@ -1035,7 +1027,7 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, true, ctx,
+            &row, &profile, true, ctx,
         )),
     )
         .into_response()
