@@ -39,9 +39,9 @@ pub struct NoteRow {
     pub user_id: String,
     pub local_only: bool,
     pub visibility: String,
-    pub mentions: serde_json::Value,
-    pub emojis: serde_json::Value,
-    pub tags: serde_json::Value,
+    pub mentions: Vec<String>,
+    pub emojis: Vec<String>,
+    pub tags: Vec<String>,
     pub has_poll: bool,
     pub reaction_acceptance: Option<String>,
 }

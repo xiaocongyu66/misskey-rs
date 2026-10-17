@@ -68,6 +68,7 @@ pub fn note_pack_min(
             .unwrap_or(Value::Null),
     );
     o.insert("reactionEmojis".into(), json!({}));
+    let _ = &emojis;
     o.insert("emojis".into(), emojis);
     o.insert("reactions".into(), json!({}));
     o.insert("reactionCount".into(), json!(0));

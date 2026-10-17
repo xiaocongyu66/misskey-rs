@@ -1151,11 +1151,8 @@ async fn pack_note(
                 .collect()
         })
         .unwrap_or_default();
-    let emojis = if row.emojis.is_object() {
-        row.emojis.clone()
-    } else {
-        json!({})
-    };
+    // populated emoji URLs map is M2; the row field is the raw emoji-name array
+    let emojis = json!({});
     Ok(mk_core::packers::note::note_pack_min(
         &row, user_lite, created_at, &mentions, &tags, emojis,
     ))
