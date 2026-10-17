@@ -588,8 +588,17 @@ pub async fn search_users(
     offset: i64,
 ) -> Result<Vec<LocalUserRow>, sqlx::Error> {
     let like = format!("%{}%", sql_like_escape(query));
+    // [repair: social-agent] the shared muted-clause referenced $5 while both
+    // statements bind fewer params (pass 1 binds like/uname/me = 3, pass 2
+    // binds like/me = 2) — PG rejects the gap ("requires 5"), so a search
+    // with a `me` (mute exclusion path) 500'd. Numbered per statement now.
     let muted_clause = if me_id.is_some() {
-        " AND \"user\".\"id\" NOT IN (SELECT \"muteeId\" FROM \"muting\" WHERE \"muterId\" = $5)"
+        " AND \"user\".\"id\" NOT IN (SELECT \"muteeId\" FROM \"muting\" WHERE \"muterId\" = $3)"
+    } else {
+        ""
+    };
+    let muted_clause_desc_pass = if me_id.is_some() {
+        " AND \"user\".\"id\" NOT IN (SELECT \"muteeId\" FROM \"muting\" WHERE \"muterId\" = $2)"
     } else {
         ""
     };
@@ -640,7 +649,7 @@ pub async fn search_users(
              AND "user"."isSuspended" = FALSE{}{}
            ORDER BY "user"."updatedAt" DESC NULLS LAST
            LIMIT {} OFFSET {}"#,
-        LOCAL_USER_COLS, muted_clause, origin_clause, limit, offset
+        LOCAL_USER_COLS, muted_clause_desc_pass, origin_clause, limit, offset
     ))
     .bind(&like)
     .bind(me_id)
