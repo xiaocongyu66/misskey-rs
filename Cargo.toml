@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mk-types",
+    "crates/mk-jsonschema",
+    "crates/mfm-rs",
+    "crates/mk-db",
+    "crates/mk-core",
+    "crates/mk-queue",
+    "crates/mk-ap",
+    "crates/misskey-rs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "migrate"] }
+
+mk-types = { path = "crates/mk-types" }
+mk-jsonschema = { path = "crates/mk-jsonschema" }
+mfm-rs = { path = "crates/mfm-rs" }
+mk-db = { path = "crates/mk-db" }
+mk-core = { path = "crates/mk-core" }
+mk-queue = { path = "crates/mk-queue" }
+mk-ap = { path = "crates/mk-ap" }
