@@ -191,7 +191,7 @@ struct PolicyEntry<'a> {
     value: Option<&'a serde_json::Value>,
 }
 
-fn entry(role: &AssignedRole, key: &str) -> PolicyEntry<'_> {
+fn entry<'a>(role: &'a AssignedRole, key: &str) -> PolicyEntry<'a> {
     let Some(v) = role.policies.get(key) else {
         return PolicyEntry {
             priority: 0,
@@ -235,7 +235,7 @@ fn tier<'a>(assigned: &'a [AssignedRole], key: &str) -> Vec<PolicyEntry<'a>> {
 
 /// Entry value with the base substituted for `useDefault` (and for
 /// malformed values — see module deviation notes).
-fn entry_value(e: &PolicyEntry<'_>, base: &serde_json::Value) -> &serde_json::Value {
+fn entry_value<'a>(e: &'a PolicyEntry<'_>, base: &'a serde_json::Value) -> &'a serde_json::Value {
     if e.use_default {
         return base;
     }

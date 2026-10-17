@@ -161,8 +161,8 @@ mod tests {
         insert_role(&pool, "rExpired", 9, false, false, false, false, "{}").await;
 
         assign(&pool, "u1", "rLow", None).await; // never expires
-        assign(&pool, "u1", "rHigh", Some("'2099-01-01T00:00:00Z'")).await; // future → kept
-        assign(&pool, "u1", "rExpired", Some("'2000-01-01T00:00:00Z'")).await; // past → filtered
+        assign(&pool, "u1", "rHigh", Some("2099-01-01T00:00:00Z")).await; // future → kept
+        assign(&pool, "u1", "rExpired", Some("2000-01-01T00:00:00Z")).await; // past → filtered
         assign(&pool, "u2", "rHigh", None).await; // only u2
 
         let rows = user_assigned_roles(&pool, "u1").await.expect("fetch");
