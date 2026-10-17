@@ -934,6 +934,12 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         public_reactions: opt_bool(body, "publicReactions")?,
         following_visibility: opt_enum(body, "followingVisibility", &visibility)?,
         followers_visibility: opt_enum(body, "followersVisibility", &visibility)?,
+        followed_message,
+        muted_words,
+        hard_muted_words,
+        muted_instances,
+        email_notification_types,
+        notification_recieve_config,
     })
 }
 
