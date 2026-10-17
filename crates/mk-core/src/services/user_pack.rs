@@ -288,10 +288,11 @@ pub fn pack_inline(
     row: &LocalUserRow,
     profile: &ProfileRow,
     is_me: bool,
+    me_present: bool,
     ctx: InstanceCtx<'_>,
 ) -> serde_json::Value {
     if !is_me {
-        let d = detailed(row, profile, ctx, true);
+        let d = detailed(row, profile, ctx, me_present);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
     let me = detailed_as_me(row, profile, ctx, false);
