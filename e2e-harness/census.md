@@ -19,12 +19,14 @@ Test Files  1 failed (1)
 | pack 镜像（isBot/isCat 在场、requireSignin/makeNotes 缺席、avatarBlurhash present-null）| **17 → 70** |
 | i/update 补 show 家族持久化 + followedMessage + 5 个 jsonb 字段 | **70 → 75** |
 
-## 剩余失败聚类（104）
-- `users` 列表端点族（~49 例：users/getFrequentlyRepliedUsers/hashtags/users/
-  users/search 等 deepStrictEqual(response, show(...))）——依赖 M2 note 生态与
-  列表排序；`users/show` 本身已被多条一致性断言验证 ✓
-- admin/roles + suspend/delete 族（~15 例，矩阵定义为 BLOCKED）
-- 弥散题 Each 家族（users/update-memo、i/pin…单点）
+## 剩余失败聚类（104，verifier 校正后的真实分桶）
+- `users/search` + search-by-username-and-host 族 29
+- `users` 列表 + getFrequentlyRepliedUsers 列表族 23（依赖 M2 note 生态排序）
+- **`users/show` deepStrictEqual 23**（缺 unreadAnnouncements/verifiedLinks/
+  followingCount 等字段出处——非列表端点问题，pack 细节缺口）
+- `hashtags/users` 15
+- i/update each 残余 10（isBot:true 等字段不在 22 字段子集——M2）
+- admin/roles + suspend/delete 2+（BLOCKED）
 
 ## 下批（M2 note 生态后自然解锁）
 1. `users` 列表（users.ts 端点 users.ts；sortBy/limit/state）
