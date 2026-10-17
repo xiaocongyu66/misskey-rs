@@ -8,7 +8,7 @@ import { defineConfig } from 'vitest/config';
 
 EventEmitter.defaultMaxListeners = 20;
 
-const backendDir = resolve(import.meta.dirname, '..');
+const backendDir = import.meta.dirname;
 
 export default defineConfig({
 	test: {
