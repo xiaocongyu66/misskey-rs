@@ -7,6 +7,21 @@ use axum::http::Request;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// Unit-test binaries never run main(), so tracing has no subscriber and
+/// error!() calls are silently dropped. This registers the fmt subscriber
+/// exactly once per test-binary.
+fn init_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+            )
+            .try_init();
+    });
+}
+
 fn test_state(pool: mk_db::sqlx::PgPool) -> crate::AppState {
     crate::AppState {
         config: crate::config::Config {
@@ -50,6 +65,7 @@ async fn signup_roundtrip() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
+    init_tracing();
     let pool = mk_db::test_support::fresh_db("mksignup_roundtrip").await;
     mk_db::run_migrations(&pool).await.unwrap();
 
@@ -102,6 +118,7 @@ async fn signup_duplicated_username() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
+    init_tracing();
     let pool = mk_db::test_support::fresh_db("mksignup_dup").await;
     mk_db::run_migrations(&pool).await.unwrap();
 
@@ -147,6 +164,7 @@ async fn signin_flow() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
+    init_tracing();
     let pool = fresh_pool("mksignin_flow").await;
     let username = format!("carol{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool.clone()));
@@ -204,6 +222,7 @@ async fn users_show_variant() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
+    init_tracing();
     let pool = fresh_pool("mkusershow").await;
     let username = format!("dave{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool.clone()));
