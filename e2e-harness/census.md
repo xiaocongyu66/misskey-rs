@@ -7,8 +7,8 @@ harness：`vitest.e2e-rs.config.ts` + `global-setup.mts`（spawn misskey-rs + /e
 ```
 Test Files  1 failed (1)
     Tests  100 failed | 79 passed | 1 skipped | 10 todo (190)
-latest: run 39070136324 (commit 799736a~: real getRelation over 5 tables)
-history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations)
+latest: run 39071401252 (users/search + search-by-username-and-host)
+history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations) → 93 (search family)
 ```
 ```
 （第 9-14 轮的线下教训：无真实关系数据时硬编码 relations=false 组会倒退 73 例；
@@ -25,7 +25,7 @@ followedMessage 仅 Me 视图。M2 用真实 getRelation + 条件展开一次性
 | i/update 补 show 家族持久化 + followedMessage + 5 个 jsonb 字段 | **70 → 75** |
 
 ## 剩余失败聚类（104，verifier 校正后的真实分桶）
-- `users/search` + search-by-username-and-host 族 29
+- ~~`users/search` + search-by-username-and-host 族~~ 已实现（yield 14；剩余为 hashtags 与列表排序族）
 - `users` 列表 + getFrequentlyRepliedUsers 列表族 23（依赖 M2 note 生态排序）
 - **`users/show` deepStrictEqual 23**（缺 unreadAnnouncements/verifiedLinks/
   followingCount 等字段出处——非列表端点问题，pack 细节缺口）
