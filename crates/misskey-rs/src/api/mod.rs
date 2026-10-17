@@ -1133,24 +1133,6 @@ async fn pack_note(
     let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
-    let mentions: Vec<String> = row
-        .mentions
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let tags: Vec<String> = row
-        .tags
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
     // populated emoji URLs map is M2; the row field is the raw emoji-name array
     let emojis = json!({});
     Ok(mk_core::packers::note::note_pack_min(
