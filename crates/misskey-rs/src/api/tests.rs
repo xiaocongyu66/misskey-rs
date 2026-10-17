@@ -291,6 +291,7 @@ async fn i_update_roundtrip() {
         app.clone(),
         "/api/i/update",
         json!({
+            "i": my_token,
             "description": "hello bio",
             "location": "Kyoto",
             "birthday": "2000-01-31",
