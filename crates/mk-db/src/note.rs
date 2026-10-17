@@ -8,6 +8,33 @@ pub struct NewNote<'a> {
     pub user_id: &'a str,
     pub visibility: &'a str,
     pub reply_id: Option<&'a str>,
+    /// hashtags extracted from text (merged into user.tags, M2 note ecology)
+    pub hashtags: &'a [String],
+}
+
+/// Bumps user counters after a note insert (`NoteCreateService`
+/// incrementUserNotesCount + tag merge). Hashtag arrays are normalized
+/// (lowercase) at the caller.
+pub async fn credit_note_to_user(
+    pool: &PgPool,
+    user_id: &str,
+    hashtags: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "user" SET "notesCount" = "notesCount" + 1 WHERE "id" = $1"#)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    for tag in hashtags {
+        sqlx::query(
+            r#"UPDATE "user" SET "tags" = array_append("tags", $2)
+               WHERE "id" = $1 AND NOT ($2 = ANY("tags"))"#,
+        )
+        .bind(user_id)
+        .bind(tag)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Error> {

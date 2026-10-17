@@ -1,5 +1,6 @@
 //! Services ported from `src/core/`.
 
+pub mod misc;
 pub mod signup;
 pub mod user_pack;
 

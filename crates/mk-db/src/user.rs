@@ -628,3 +628,46 @@ pub async fn search_users(
     }
     Ok(seen)
 }
+
+/// `endpoints/hashtags/users.ts`: tag membership via array containment.
+/// sort signs mirror upstream's switch (column + direction).
+pub async fn users_by_tag(
+    pool: &PgPool,
+    tag: &str,
+    sort: &str,
+    state: Option<&str>,
+    origin: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LocalUserRow>, sqlx::Error> {
+    let (col, dir) = match sort {
+        "+follower" => ("followersCount", "DESC"),
+        "-follower" => ("followersCount", "ASC"),
+        "+createdAt" | "-createdAt" | "+updatedAt" | "-updatedAt" => {
+            ("id", if sort.starts_with('+') { "DESC" } else { "ASC" })
+        }
+        _ => ("id", "DESC"),
+    };
+    let mut sql = format!(
+        r#"SELECT {} FROM "user"
+           WHERE "tags" @> ARRAY[$1::varchar]
+             AND "isSuspended" = FALSE"#,
+        LOCAL_USER_COLS
+    );
+    if state == Some("alive") {
+        sql.push_str(r#" AND ("user"."updatedAt" > now() - interval '5 days' OR "user"."updatedAt" IS NULL)"#);
+    }
+    sql.push_str(match origin {
+        Some("local") => r#" AND "host" IS NULL"#,
+        Some("remote") => r#" AND "host" IS NOT NULL"#,
+        _ => "",
+    });
+    sql.push_str(&format!(
+        r#" ORDER BY "{}" {} LIMIT {} OFFSET {}"#,
+        col, dir, limit, offset
+    ));
+    sqlx::query_as::<_, LocalUserRow>(&sql)
+        .bind(tag)
+        .fetch_all(pool)
+        .await
+}

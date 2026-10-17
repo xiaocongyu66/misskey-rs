@@ -99,6 +99,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "users/search-by-username-and-host" {
             return users_search_by_username_and_host(&state, &body, token).await;
         }
+        if name == "hashtags/users" {
+            return hashtags_users(&state, &body, token).await;
+        }
         return users_show(&state, &body, token).await;
     }
 
@@ -1077,6 +1080,51 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         .into_response()
 }
 
+/// `POST /api/hashtags/users` — tag membership + sort/state/origin switch.
+async fn hashtags_users(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = resolve_me(pool, token.as_deref()).await;
+    let Some(tag) = body.get("tag").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "tag",
+            "reason": "required",
+        })));
+    };
+    let sort = body
+        .get("sort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("+follower");
+    let state_p = body.get("state").and_then(|v| v.as_str());
+    let origin = body.get("origin").and_then(|v| v.as_str());
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let offset = body
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+
+    let rows =
+        match mk_db::user::users_by_tag(pool, tag, sort, state_p, origin, limit, offset).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_search", error = %e, "users_by_tag");
+                return api_err(ApiError::internal_error());
+            }
+        };
+
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(json!(packed))).into_response()
+}
+
 /// Shared result packing for user-search endpoints (upstream packs with the
 /// requesting me; schema 'UserDetailed' by default).
 async fn pack_search_rows(
@@ -1284,6 +1332,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     let reply_id = body.get("replyId").and_then(|v| v.as_str());
 
     let id = mk_types::id::gen_aid_now();
+    let hashtags = mk_core::services::misc::extract_hashtags(text);
     if let Err(e) = mk_db::note::insert_note(
         pool,
         &mk_db::note::NewNote {
@@ -1292,12 +1341,16 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             user_id: &me_id,
             visibility,
             reply_id,
+            hashtags: &hashtags,
         },
     )
     .await
     {
         tracing::error!(target: "dbg_notes", error = %e, "insert_note");
         return api_err(ApiError::internal_error());
+    }
+    if let Err(e) = mk_db::note::credit_note_to_user(pool, &me_id, &hashtags).await {
+        tracing::error!(target: "dbg_notes", error = %e, "credit_note_to_user");
     }
 
     let note = match pack_note(state, pool, &id).await {
