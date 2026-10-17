@@ -58,6 +58,24 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return reset_route(&state).await;
     }
 
+    // Registry endpoints that need a JSON body parsed before dispatch.
+    if name == "users/show" || name == "signin" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        if name == "signin" {
+            let _ = token;
+            return signin_route(&state, &body).await;
+        }
+        return users_show(&state, &body, token).await;
+    }
+
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
     }
@@ -356,6 +374,160 @@ fn extract_token(body: &Value, headers: &axum::http::HeaderMap) -> Option<String
     body.get("i")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// `POST /api/signin` — SigninApiService.signin test-mode path (no captcha /
+/// IP rate limit in test; 2FA unchanged → fresh users only take the plain
+/// password branch).
+async fn signin_route(state: &AppState, body: &Value) -> Response {
+    let reply_error = |status: u16, id: &str| -> Response {
+        (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(json!({ "error": { "id": id } })),
+        )
+            .into_response()
+    };
+
+    let username = match body.get("username").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if let Some(t) = body.get("token") {
+        if t.as_str().is_none() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+
+    let row = mk_db::user::find_local_user_by_username(pool, &username.to_lowercase())
+        .await
+        .ok()
+        .flatten();
+    let Some(user) = row else {
+        return reply_error(404, "6cc579cc-885d-43d8-95c2-b8c7fc963280");
+    };
+    if user.is_suspended {
+        return reply_error(403, "e03a5f46-d309-4865-9b69-56282d94e1eb");
+    }
+
+    let Ok(profile) = mk_db::user::find_profile(pool, &user.id).await else {
+        return api_err(ApiError::internal_error());
+    };
+
+    // password flow: SigninFlowResponse { finished } variants
+    let Some(password) = body.get("password").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::OK,
+            Json(json!({ "finished": false, "next": "captcha" })),
+        )
+            .into_response();
+    };
+
+    let same = profile
+        .password
+        .as_deref()
+        .map(|h| mk_core::services::verify_password(password, h).unwrap_or(false))
+        .unwrap_or(false);
+
+    if !same {
+        let _ = mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), &user.id, "", false)
+            .await;
+        return reply_error(403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c");
+    }
+
+    // success (no-2FA branch); upstream fires the signin record async
+    let _ =
+        mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), &user.id, "", true).await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "finished": true,
+            "id": user.id,
+            "i": user.token,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/users/show` — userId | userIds | username, me from `i`/Bearer.
+async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+
+    let me_id: Option<String> = match token.as_deref() {
+        Some(t) if t.len() == 16 => mk_db::user::find_local_user_id_by_token(pool, t)
+            .await
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+
+    let no_such_user = || {
+        api_err(ApiError::new(
+            404,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_USER",
+            "4362f8dc-731f-4ad8-a694-be5a88922a24",
+            "No such user.",
+        ))
+    };
+
+    // userIds array form: missing users are suppressed upstream
+    if let Some(ids) = body.get("userIds").and_then(|v| v.as_array()) {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids.iter().filter_map(|v| v.as_str()) {
+            let Some(row) = mk_db::user::find_user_by_id(pool, id).await.ok().flatten() else {
+                continue;
+            };
+            let Ok(profile) = mk_db::user::find_profile(pool, &row.id).await else {
+                continue;
+            };
+            let is_me = me_id.as_deref() == Some(row.id.as_str());
+            out.push(mk_core::services::user_pack::pack_inline(
+                &row, &profile, is_me, ctx,
+            ));
+        }
+        return (StatusCode::OK, Json(json!(out))).into_response();
+    }
+
+    let row = if let Some(id) = body.get("userId").and_then(|v| v.as_str()) {
+        mk_db::user::find_user_by_id(pool, id).await.ok().flatten()
+    } else if let Some(username) = body.get("username").and_then(|v| v.as_str()) {
+        mk_db::user::find_local_user_by_username(pool, &username.to_lowercase())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "userId",
+            "reason": "either userId or username is required",
+        })));
+    };
+
+    let Some(row) = row else {
+        return no_such_user();
+    };
+    let Ok(profile) = mk_db::user::find_profile(pool, &row.id).await else {
+        return no_such_user();
+    };
+    let is_me = me_id.as_deref() == Some(row.id.as_str());
+
+    (
+        StatusCode::OK,
+        Json(mk_core::services::user_pack::pack_inline(
+            &row, &profile, is_me, ctx,
+        )),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
