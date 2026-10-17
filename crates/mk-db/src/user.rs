@@ -248,6 +248,10 @@ pub struct ProfileRow {
     pub logged_in_dates: Vec<String>,
     #[sqlx(rename = "preventAiLearning")]
     pub prevent_ai_learning: bool,
+    #[sqlx(rename = "noCrawle")]
+    pub no_crawle: bool,
+    #[sqlx(rename = "verifiedLinks")]
+    pub verified_links: Vec<String>,
     #[sqlx(rename = "notificationRecieveConfig")]
     pub notification_recieve_config: serde_json::Value,
     #[sqlx(rename = "hardMutedWords")]
@@ -268,7 +272,7 @@ pub struct ProfileRow {
     pub follow_approval_remote_seconds: Option<i32>,
 }
 
-pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", ("followingVisibility"::text) AS "followingVisibility", ("followersVisibility"::text) AS "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds""#;
+pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "noCrawle", "verifiedLinks", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", ("followingVisibility"::text) AS "followingVisibility", ("followersVisibility"::text) AS "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds""#;
 
 pub struct ProfileUpdate {
     // "user" table columns

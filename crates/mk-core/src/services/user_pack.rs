@@ -92,7 +92,12 @@ fn avatar_url(row: &LocalUserRow, ctx: InstanceCtx<'_>) -> String {
     }
 }
 
-fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> UserDetailedNotMe {
+fn detailed(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    ctx: InstanceCtx<'_>,
+    relations: bool,
+) -> UserDetailedNotMe {
     let created_at = mk_types::id::parse_aid_date(&row.id).map(crate::services::signup::ms_to_iso);
     UserDetailedNotMe {
         lite_fields: crate::packers::user::UserLite {
@@ -138,7 +143,23 @@ fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> U
         birthday: profile.birthday.clone(),
         lang: profile.lang.clone(),
         fields: fields_vec(&profile.fields),
-        verified_links: Vec::new(),
+        verified_links: string_vec(&profile.verified_links),
+        // relations view (me != target, me present): 10 relation fields are
+        // ALWAYS present (false defaults) — upstream `...(relation ? {...})`
+        is_following: Some(false),
+        is_followed: Some(false),
+        has_pending_follow_request_from_you: Some(false),
+        has_pending_follow_request_to_you: Some(false),
+        is_blocking: Some(false),
+        is_blocked: Some(false),
+        is_muted: Some(false),
+        is_renote_muted: Some(false),
+        notify: if relations {
+            Some("none".to_string())
+        } else {
+            None
+        },
+        with_replies: if relations { Some(false) } else { None },
         followers_count: 0,
         following_count: 0,
         notes_count: 0,
@@ -206,7 +227,7 @@ pub fn pack_show(
 ) -> serde_json::Value {
     let is_me = me_id.map(|me| me == row.id).unwrap_or(false);
     if !is_me {
-        let d = detailed(row, profile, ctx);
+        let d = detailed(row, profile, ctx, true);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
 
@@ -232,7 +253,7 @@ pub fn pack_show(
         auto_accept_followed: profile.auto_accept_followed,
         follow_approval_local_seconds: profile.follow_approval_local_seconds,
         follow_approval_remote_seconds: profile.follow_approval_remote_seconds,
-        no_crawle: false,
+        no_crawle: profile.no_crawle,
         prevent_ai_learning: profile.prevent_ai_learning,
         is_explorable: row.is_explorable,
         is_deleted: false,
@@ -280,16 +301,21 @@ pub fn pack_inline(
     ctx: InstanceCtx<'_>,
 ) -> serde_json::Value {
     if !is_me {
-        let d = detailed(row, profile, ctx);
+        let d = detailed(row, profile, ctx, true);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
-    let me = detailed_as_me(row, profile, ctx);
+    let me = detailed_as_me(row, profile, ctx, false);
     serde_json::to_value(&me).unwrap_or(serde_json::json!({}))
 }
 
 /// Me variant of the pack (detailed() + Me-only fields).
-fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> MeDetailed {
-    let d = detailed(row, profile, ctx);
+fn detailed_as_me(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    ctx: InstanceCtx<'_>,
+    relations: bool,
+) -> MeDetailed {
+    let d = detailed(row, profile, ctx, false);
     let ach = profile.achievements.as_array().cloned().unwrap_or_default();
     MeDetailed {
         detailed: crate::packers::user::UserDetailedNotMe {
@@ -311,7 +337,7 @@ fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>
         auto_accept_followed: profile.auto_accept_followed,
         follow_approval_local_seconds: profile.follow_approval_local_seconds,
         follow_approval_remote_seconds: profile.follow_approval_remote_seconds,
-        no_crawle: false,
+        no_crawle: profile.no_crawle,
         prevent_ai_learning: profile.prevent_ai_learning,
         is_explorable: row.is_explorable,
         is_deleted: false,
