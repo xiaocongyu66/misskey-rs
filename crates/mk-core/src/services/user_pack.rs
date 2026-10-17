@@ -143,7 +143,7 @@ fn detailed(
         birthday: profile.birthday.clone(),
         lang: profile.lang.clone(),
         fields: fields_vec(&profile.fields),
-        verified_links: string_vec(&profile.verified_links),
+        verified_links: profile.verified_links.clone(),
         // relations view (me != target, me present): 10 relation fields are
         // ALWAYS present (false defaults) — upstream `...(relation ? {...})`
         is_following: Some(false),
@@ -221,7 +221,7 @@ pub fn pack_show(
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
 
-    let d = detailed(row, profile, ctx);
+    let d = detailed(row, profile, ctx, false);
     let ach: Vec<serde_json::Value> = profile.achievements.as_array().cloned().unwrap_or_default();
     let me = MeDetailed {
         detailed: crate::packers::user::UserDetailedNotMe {
