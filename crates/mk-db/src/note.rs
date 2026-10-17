@@ -27,7 +27,7 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
 }
 
 /// Columns carried by the M1 note pack.
-pub const NOTE_COLS: &str = r#""id", "replyId", "renoteId", "text", "cw", "userId", "localOnly", "visibility", "mentions", "emojis", "tags", "hasPoll", "reactionAcceptance"::text AS "reactionAcceptance""#;
+pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "localOnly", "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance""#;
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct NoteRow {
