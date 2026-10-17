@@ -259,7 +259,8 @@ pub fn ms_to_iso(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     // days_from_civil inverse (Howard Hinnant's civil_from_days).
-    let z = secs + 719_468;
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
