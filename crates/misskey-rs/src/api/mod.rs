@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::error::ApiError;
+use crate::error::{api_err, ApiError};
 use crate::ratelimit::Limit;
 use crate::AppState;
 
@@ -34,13 +34,13 @@ const M0_ENDPOINTS: &[&str] = &[
 pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let Some(name) = path.strip_prefix("/api/") else {
-        return ApiError::unknown_endpoint().into_response();
+        return api_err(ApiError::unknown_endpoint());
     };
     let name = name.to_string();
     let method = req.method().clone();
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
-        return ApiError::unknown_endpoint().into_response();
+        return api_err(ApiError::unknown_endpoint());
     }
 
     let get_cache = GET_ALLOWED
@@ -62,11 +62,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         let bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
             Ok(b) => b,
             Err(_) => {
-                return ApiError::invalid_param(json!({
+                return api_err(ApiError::invalid_param(json!({
                     "param": "",
                     "reason": "body could not be read",
-                }))
-                .into_response()
+                })));
             }
         };
         if bytes.is_empty() {
@@ -75,11 +74,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(err) => {
-                    return ApiError::invalid_param(json!({
+                    return api_err(ApiError::invalid_param(json!({
                         "param": "",
                         "reason": err.to_string(),
-                    }))
-                    .into_response()
+                    })));
                 }
             }
         }

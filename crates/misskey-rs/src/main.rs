@@ -20,7 +20,7 @@ use crate::config::Config;
 pub struct AppState {
     pub config: Config,
     pub pool: Option<mk_db::sqlx::PgPool>,
-    pub rate_limiter: ratelimit::RateLimiter,
+    pub rate_limiter: std::sync::Arc<ratelimit::RateLimiter>,
 }
 
 #[tokio::main]
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         config,
         pool,
-        rate_limiter: ratelimit::RateLimiter::new(),
+        rate_limiter: std::sync::Arc::new(ratelimit::RateLimiter::new()),
     };
 
     let cors = CorsLayer::permissive();
