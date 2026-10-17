@@ -32,5 +32,9 @@ cd upstream
 pnpm --filter backend compile-config
 pnpm --filter backend migrate
 
-pg_dump --schema-only --no-owner --no-privileges -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE" > ../crates/mk-db/migrations/0001_init.sql
+pg_dump --schema-only --no-owner --no-privileges \
+    --exclude-table=public.migrations \
+    -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE" \
+    | awk 'substr($0,1,1) != "\\" { print }' \
+    > ../crates/mk-db/migrations/0001_init.sql
 echo "schema lines: $(wc -l < ../crates/mk-db/migrations/0001_init.sql)"
