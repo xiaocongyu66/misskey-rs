@@ -3,20 +3,24 @@
 //! Field-by-field port of `src/models/json-schema/user.ts`. Presence rules
 //! are load-bearing: e2e asserts exact field sets via deepStrictEqual.
 
-use mk_types::presence::{Nullable, Omit};
+use mk_types::presence::Nullable;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AvatarDecoration {
     pub id: String,
-    pub angle: Omit<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
     #[serde(rename = "flipH")]
-    pub flip_h: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flip_h: Option<bool>,
     pub url: String,
     #[serde(rename = "offsetX")]
-    pub offset_x: Omit<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_x: Option<f64>,
     #[serde(rename = "offsetY")]
-    pub offset_y: Omit<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -79,21 +83,28 @@ pub struct UserLite {
     #[serde(rename = "avatarDecorations")]
     pub avatar_decorations: Vec<AvatarDecoration>,
     #[serde(rename = "isBot")]
-    pub is_bot: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_bot: Option<bool>,
     #[serde(rename = "isCat")]
-    pub is_cat: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_cat: Option<bool>,
     #[serde(rename = "requireSigninToViewContents")]
-    pub require_signin_to_view_contents: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_signin_to_view_contents: Option<bool>,
     #[serde(rename = "makeNotesFollowersOnlyBefore")]
-    pub make_notes_followers_only_before: Omit<Nullable<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub make_notes_followers_only_before: Option<Nullable<i32>>,
     #[serde(rename = "makeNotesHiddenBefore")]
-    pub make_notes_hidden_before: Omit<Nullable<i32>>,
-    pub instance: Omit<FollowerInstance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub make_notes_hidden_before: Option<Nullable<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<FollowerInstance>,
     pub emojis: std::collections::BTreeMap<String, String>,
     #[serde(rename = "onlineStatus")]
     pub online_status: OnlineStatus,
     #[serde(rename = "badgeRoles")]
-    pub badge_roles: Omit<Vec<BadgeRole>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge_roles: Option<Vec<BadgeRole>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -164,37 +175,52 @@ pub struct UserDetailedNotMe {
     pub can_chat: bool,
     pub roles: Vec<RoleLiteValue>,
     #[serde(rename = "followedMessage")]
-    pub followed_message: Omit<Nullable<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followed_message: Option<Nullable<String>>,
     pub memo: Nullable<String>,
     #[serde(rename = "moderationNote")]
-    pub moderation_note: Omit<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation_note: Option<String>,
     // Overridden with always-present fields when packed as MeDetailed.
     #[serde(rename = "twoFactorEnabled")]
-    pub two_factor_enabled: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub two_factor_enabled: Option<bool>,
     #[serde(rename = "usePasswordLessLogin")]
-    pub use_password_less_login: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_password_less_login: Option<bool>,
     #[serde(rename = "securityKeys")]
-    pub security_keys: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_keys: Option<bool>,
     // Relation flags (present only when a me parameter is supplied).
     #[serde(rename = "isFollowing")]
-    pub is_following: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_following: Option<bool>,
     #[serde(rename = "isFollowed")]
-    pub is_followed: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_followed: Option<bool>,
     #[serde(rename = "hasPendingFollowRequestFromYou")]
-    pub has_pending_follow_request_from_you: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_pending_follow_request_from_you: Option<bool>,
     #[serde(rename = "hasPendingFollowRequestToYou")]
-    pub has_pending_follow_request_to_you: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_pending_follow_request_to_you: Option<bool>,
     #[serde(rename = "isBlocking")]
-    pub is_blocking: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_blocking: Option<bool>,
     #[serde(rename = "isBlocked")]
-    pub is_blocked: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_blocked: Option<bool>,
     #[serde(rename = "isMuted")]
-    pub is_muted: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_muted: Option<bool>,
     #[serde(rename = "isRenoteMuted")]
-    pub is_renote_muted: Omit<bool>,
-    pub notify: Omit<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_renote_muted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
     #[serde(rename = "withReplies")]
-    pub with_replies: Omit<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_replies: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -299,11 +325,14 @@ pub struct MeDetailed {
     #[serde(rename = "securityKeys")]
     pub security_keys_always: bool,
     // Secrets (includeSecrets only).
-    pub email: Omit<Nullable<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<Nullable<String>>,
     #[serde(rename = "emailVerified")]
-    pub email_verified: Omit<Nullable<bool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<Nullable<bool>>,
     #[serde(rename = "securityKeysList")]
-    pub security_keys_list: Omit<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_keys_list: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -328,15 +357,15 @@ mod tests {
             avatar_url: "http://x/identicon/alice".to_string(),
             avatar_blurhash: None,
             avatar_decorations: vec![],
-            is_bot: Omit(None),
-            is_cat: Omit(None),
-            require_signin_to_view_contents: Omit(Some(false)),
-            make_notes_followers_only_before: Omit(None),
-            make_notes_hidden_before: Omit(None),
-            instance: Omit(None),
+            is_bot: None,
+            is_cat: None,
+            require_signin_to_view_contents: Some(false),
+            make_notes_followers_only_before: None,
+            make_notes_hidden_before: None,
+            instance: None,
             emojis: Default::default(),
             online_status: OnlineStatus::Unknown,
-            badge_roles: Omit(None),
+            badge_roles: None,
         }
     }
 
