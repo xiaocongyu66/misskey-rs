@@ -511,8 +511,16 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
                 }
             };
             let is_me = me_id.as_deref() == Some(row.id.as_str());
+            let relation = match build_relation(pool, me_id.as_deref(), &row.id, is_me).await {
+                Ok(r) => r,
+                Err(resp) => return *resp,
+            };
             out.push(mk_core::services::user_pack::pack_inline(
-                &row, &profile, is_me, ctx,
+                &row,
+                &profile,
+                is_me,
+                relation.as_ref(),
+                ctx,
             ));
         }
         return (StatusCode::OK, Json(json!(out))).into_response();
@@ -552,14 +560,42 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
         }
     };
     let is_me = me_id.as_deref() == Some(row.id.as_str());
+    let relation = match build_relation(pool, me_id.as_deref(), &row.id, is_me).await {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
 
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, is_me, ctx,
+            &row,
+            &profile,
+            is_me,
+            relation.as_ref(),
+            ctx,
         )),
     )
         .into_response()
+}
+
+/// Relation lookup for the pack, mirroring upstream `getRelation` scope:
+/// only when a me is present AND the target is not me.
+async fn build_relation(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: Option<&str>,
+    target_id: &str,
+    is_me: bool,
+) -> Result<Option<mk_db::relation::UserRelation>, Box<Response>> {
+    if is_me || me_id.is_none() {
+        return Ok(None);
+    }
+    match mk_db::relation::get_relation(pool, me_id.unwrap(), target_id).await {
+        Ok(r) => Ok(Some(r)),
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "get_relation");
+            Err(Box::new(api_err(ApiError::internal_error())))
+        }
+    }
 }
 
 /// Shared me-id resolution from a token: only native user tokens (length 16,
@@ -703,7 +739,7 @@ async fn i_route(
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, ctx,
+            &row, &profile, true, None, ctx,
         )),
     )
         .into_response()
@@ -1027,7 +1063,7 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
     (
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, ctx,
+            &row, &profile, true, None, ctx,
         )),
     )
         .into_response()

@@ -92,7 +92,12 @@ fn avatar_url(row: &LocalUserRow, ctx: InstanceCtx<'_>) -> String {
     }
 }
 
-fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> UserDetailedNotMe {
+fn detailed(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    ctx: InstanceCtx<'_>,
+    relation: Option<&mk_db::relation::UserRelation>,
+) -> UserDetailedNotMe {
     let created_at = mk_types::id::parse_aid_date(&row.id).map(crate::services::signup::ms_to_iso);
     UserDetailedNotMe {
         lite_fields: crate::packers::user::UserLite {
@@ -152,22 +157,39 @@ fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> U
         chat_scope: chat_scope(&row.chat_scope),
         can_chat: true,
         roles: Vec::new(),
-        followed_message: Some(profile.followed_message.clone()),
+        followed_message: relation
+            .as_ref()
+            .filter(|r| r.is_following)
+            .map(|_| profile.followed_message.clone()),
         memo: None,
         moderation_note: None,
         two_factor_enabled: None,
         use_password_less_login: None,
         security_keys: None,
-        is_following: None,
-        is_followed: None,
-        has_pending_follow_request_from_you: None,
-        has_pending_follow_request_to_you: None,
-        is_blocking: None,
-        is_blocked: None,
-        is_muted: None,
-        is_renote_muted: None,
-        notify: None,
-        with_replies: None,
+        // `...(relation ? {...} : {})` in upstream pack: relation fields
+        // exist only when a me view targets another user.
+        is_following: relation.as_ref().map(|r| r.is_following),
+        is_followed: relation.as_ref().map(|r| r.is_followed),
+        has_pending_follow_request_from_you: relation
+            .as_ref()
+            .map(|r| r.has_pending_follow_request_from_you),
+        has_pending_follow_request_to_you: relation
+            .as_ref()
+            .map(|r| r.has_pending_follow_request_to_you),
+        is_blocking: relation.as_ref().map(|r| r.is_blocking),
+        is_blocked: relation.as_ref().map(|r| r.is_blocked),
+        is_muted: relation.as_ref().map(|r| r.is_muted),
+        is_renote_muted: relation.as_ref().map(|r| r.is_renote_muted),
+        notify: relation
+            .as_ref()
+            .map(|r| r.notify.clone().unwrap_or_else(|| "none".to_string())),
+        with_replies: relation.as_ref().map(|r| r.with_replies.unwrap_or(false)),
+        // followedMessage only on the relation view when isFollowing:
+        // schema-marked optional; upstream: isFollowing ? profile value : undefined
+        followed_message: relation
+            .as_ref()
+            .filter(|r| r.is_following)
+            .map(|_| profile.followed_message.clone()),
     }
 }
 
@@ -197,99 +219,33 @@ fn backup_stock(two_factor_backup_secret_len: Option<usize>) -> BackupCodesStock
     }
 }
 
-/// `pack(user, me, { schema: 'MeDetailed', includeSecrets: iAmOwner })`.
-pub fn pack_show(
-    row: &LocalUserRow,
-    profile: &ProfileRow,
-    me_id: Option<&str>,
-    ctx: InstanceCtx<'_>,
-) -> serde_json::Value {
-    let is_me = me_id.map(|me| me == row.id).unwrap_or(false);
-    if !is_me {
-        let d = detailed(row, profile, ctx);
-        return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
-    }
-
-    let d = detailed(row, profile, ctx);
-    let ach: Vec<serde_json::Value> = profile.achievements.as_array().cloned().unwrap_or_default();
-    let me = MeDetailed {
-        detailed: crate::packers::user::UserDetailedNotMe {
-            two_factor_enabled: Some(profile.two_factor_enabled),
-            use_password_less_login: Some(profile.use_password_less_login),
-            security_keys: Some(profile.security_keys_available),
-            ..d
-        },
-        avatar_id: row.avatar_id.clone(),
-        banner_id: row.banner_id.clone(),
-        followed_message_always: profile.followed_message.clone(),
-        is_moderator: false,
-        is_admin: false,
-        inject_featured_note: profile.inject_featured_note,
-        receive_announcement_email: profile.receive_announcement_email,
-        always_mark_nsfw: profile.always_mark_nsfw,
-        auto_sensitive: profile.auto_sensitive,
-        careful_bot: profile.careful_bot,
-        auto_accept_followed: profile.auto_accept_followed,
-        follow_approval_local_seconds: profile.follow_approval_local_seconds,
-        follow_approval_remote_seconds: profile.follow_approval_remote_seconds,
-        no_crawle: false,
-        prevent_ai_learning: profile.prevent_ai_learning,
-        is_explorable: row.is_explorable,
-        is_deleted: false,
-        two_factor_backup_codes_stock: backup_stock(None), // no backup secret col read yet
-        hide_online_status: false,
-        has_unread_specified_notes: false,
-        has_unread_mentions: false,
-        has_unread_announcement: false,
-        unread_announcements: Vec::new(),
-        has_unread_antenna: false,
-        has_unread_channel: false,
-        has_unread_chat_messages: false,
-        has_unread_notification: false,
-        has_pending_received_follow_request: false,
-        unread_notifications_count: 0,
-        muted_words: string_vec_vec(&profile.muted_words),
-        hard_muted_words: string_vec_vec(&profile.hard_muted_words),
-        muted_instances: string_vec(&profile.muted_instances),
-        notification_recieve_config: profile.notification_recieve_config.clone(),
-        email_notification_types: string_vec(&profile.email_notification_types),
-        achievements: ach,
-        logged_in_days: profile.logged_in_dates.len() as i64,
-        policies: serde_json::json!({}),
-        two_factor_enabled_always: profile.two_factor_enabled,
-        use_password_less_login_always: profile.use_password_less_login,
-        security_keys_always: profile.security_keys_available,
-        email: Some(profile.email.clone()),
-        email_verified: Some(Some(profile.email_verified)),
-        security_keys_list: Some(Vec::new()),
-    };
-    serde_json::to_value(&me).unwrap_or(serde_json::json!({}))
-}
-
-#[allow(dead_code)]
-fn _silence(_: fn(&serde_json::Value) -> Option<String>) -> Option<String> {
-    opt_json_string(&serde_json::json!(null))
-}
-
 /// One entrypoint for both DetailedNotMe (is_me=false) and MeDetailed
 /// (is_me=true) responses; returns serde_json::Value.
 pub fn pack_inline(
     row: &LocalUserRow,
     profile: &ProfileRow,
     is_me: bool,
+    relation: Option<&mk_db::relation::UserRelation>,
     ctx: InstanceCtx<'_>,
 ) -> serde_json::Value {
     if !is_me {
-        let d = detailed(row, profile, ctx);
+        let d = detailed(row, profile, ctx, relation);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
-    let me = detailed_as_me(row, profile, ctx);
+    // streamer self-view: no relation block (upstream relation is computed
+    // only for other-target views)
+    let me = detailed_as_me(row, profile, ctx, None);
     serde_json::to_value(&me).unwrap_or(serde_json::json!({}))
 }
 
 /// Me variant of the pack (detailed() + Me-only fields).
-fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> MeDetailed {
-    let d = detailed(row, profile, ctx);
+fn detailed_as_me(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    ctx: InstanceCtx<'_>,
+    relation: Option<&mk_db::relation::UserRelation>,
+) -> MeDetailed {
+    let d = detailed(row, profile, ctx, None);
     let ach = profile.achievements.as_array().cloned().unwrap_or_default();
     MeDetailed {
         detailed: crate::packers::user::UserDetailedNotMe {
