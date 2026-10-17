@@ -91,6 +91,12 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "notes/show" {
             return notes_show(&state, &body).await;
         }
+        if name == "users/search" {
+            return users_search(&state, &body, token).await;
+        }
+        if name == "users/search-by-username-and-host" {
+            return users_search_by_username_and_host(&state, &body, token).await;
+        }
         return users_show(&state, &body, token).await;
     }
 
@@ -1067,6 +1073,137 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         )),
     )
         .into_response()
+}
+
+/// Shared result packing for user-search endpoints (upstream packs with the
+/// requesting me; schema 'UserDetailed' by default).
+async fn pack_search_rows(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    rows: Vec<mk_db::user::LocalUserRow>,
+    me_id: Option<&str>,
+) -> Result<Vec<Value>, Box<Response>> {
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let is_me = me_id == Some(row.id.as_str());
+        let profile = match mk_db::user::find_profile(pool, &row.id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(target: "dbg_search", error = %e, "find_profile");
+                return Err(Box::new(api_err(ApiError::internal_error())));
+            }
+        };
+        let relation = match build_relation(pool, me_id, &row.id, is_me).await {
+            Ok(r) => r,
+            Err(resp) => return Err(resp),
+        };
+        out.push(mk_core::services::user_pack::pack_inline(
+            row,
+            &profile,
+            is_me,
+            relation.as_ref(),
+            ctx,
+        ));
+    }
+    Ok(out)
+}
+
+/// `POST /api/users/search-by-username-and-host`
+async fn users_search_by_username_and_host(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = resolve_me(pool, token.as_deref()).await;
+
+    let username = body.get("username").and_then(|v| v.as_str());
+    let host = body
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let own_host = state.config.host();
+
+    let rows = match mk_db::user::search_users_by_username_and_host(
+        pool,
+        username,
+        host.as_deref(),
+        &own_host,
+        limit,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "search_username_host");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(json!(packed))).into_response()
+}
+
+/// `POST /api/users/search`
+async fn users_search(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = resolve_me(pool, token.as_deref()).await;
+
+    let Some(query) = body.get("query").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "query",
+            "reason": "required",
+        })));
+    };
+    if query.is_empty() || query.chars().count() > 100 {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "query",
+            "reason": "1..100 chars",
+        })));
+    }
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let offset = body
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let origin = body.get("origin").and_then(|v| v.as_str());
+
+    let rows = match mk_db::user::search_users(pool, query, me_id.as_deref(), origin, limit, offset)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "search_users");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(json!(packed))).into_response()
 }
 
 /// Shared note-packing for the M1 slice: user row + profile → UserLite value.

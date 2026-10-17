@@ -512,3 +512,55 @@ async fn notes_create_requires_auth() {
         json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
     );
 }
+
+#[tokio::test]
+async fn users_search_family() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mksearch").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let a = signup(&app, "searchali").await;
+    let _b = signup(&app, "searchbob").await;
+    let token = a["token"].as_str().unwrap().to_string();
+
+    // set a description via i/update for description-pass coverage
+    let (s0, b0) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "description": "zetaomega", "i": token }),
+    )
+    .await;
+    assert_eq!(s0, StatusCode::OK, "b: {b0}");
+
+    // by-username-and-host: prefix, case-insensitive, local host only
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/users/search-by-username-and-host",
+        json!({ "username": "SEARCH", "host": null }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "b: {b1}");
+    let arr = b1.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "b: {b1}");
+    assert_eq!(arr[0]["username"], json!("searchali"));
+
+    // search by username token (@-prefix)
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/users/search",
+        json!({ "query": "@searchb" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "b: {b2}");
+    assert_eq!(b2.as_array().unwrap().len(), 1);
+    assert_eq!(b2[0]["username"], json!("searchbob"));
+
+    // search by description token
+    let (s3, b3) = post_json(app, "/api/users/search", json!({ "query": "zetaomega" })).await;
+    assert_eq!(s3, StatusCode::OK, "b: {b3}");
+    assert_eq!(b3.as_array().unwrap().len(), 1);
+    assert_eq!(b3[0]["username"], json!("searchali"));
+}

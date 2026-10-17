@@ -504,3 +504,126 @@ pub async fn insert_signin(
         .await?;
     Ok(())
 }
+
+/// `UserSearchService.searchByUsernameAndHost` — no-login variant collapsed to
+/// one query (fresh M2 instances hold no `updatedAt` rows, so the
+/// active/inactive split degenerates to the same ordering; `muting` exclusion
+/// is layered in by the caller when a me is present). Order: usernameLower ASC.
+pub async fn search_users_by_username_and_host(
+    pool: &PgPool,
+    username: Option<&str>,
+    host: Option<&str>,
+    own_host: &str,
+    limit: i64,
+) -> Result<Vec<LocalUserRow>, sqlx::Error> {
+    let pattern = format!(
+        "{}%",
+        username
+            .unwrap_or("")
+            .to_lowercase()
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    sqlx::query_as::<_, LocalUserRow>(&format!(
+        r#"SELECT {} FROM "user"
+           WHERE "usernameLower" LIKE $1
+             AND "isSuspended" = FALSE
+             AND CASE
+                   WHEN $2 = '.' OR $2 = $3 THEN "host" IS NULL
+                   ELSE "host" ILIKE $2
+                 END
+           ORDER BY "usernameLower" ASC
+           LIMIT {}"#,
+        LOCAL_USER_COLS, limit
+    ))
+    .bind(pattern)
+    .bind(host)
+    .bind(own_host)
+    .fetch_all(pool)
+    .await
+}
+
+fn sql_like_escape(q: &str) -> String {
+    q.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// `UserSearchService.search` — name/username pass, then a description-pass
+/// only when fewer than limit rows were found (exclusions + origins per pass).
+pub async fn search_users(
+    pool: &PgPool,
+    query: &str,
+    me_id: Option<&str>,
+    origin: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LocalUserRow>, sqlx::Error> {
+    let like = format!("%{}%", sql_like_escape(query));
+    let muted_clause = if me_id.is_some() {
+        " AND \"user\".\"id\" NOT IN (SELECT \"muteeId\" FROM \"muting\" WHERE \"muterId\" = $5)"
+    } else {
+        ""
+    };
+    let origin_clause = match origin {
+        Some("local") => " AND \"user\".\"host\" IS NULL",
+        Some("remote") => " AND \"user\".\"host\" IS NOT NULL",
+        _ => "",
+    };
+
+    // pass 1: name / username (a token that starts with '@' prefixes the
+    // username match; any valid-local-username token also matches mid-string)
+    let uname_sub: String = if query.starts_with('@') {
+        sql_like_escape(query.trim_start_matches('@').to_lowercase())
+    } else {
+        sql_like_escape(query.to_lowercase())
+    };
+    let uname_pattern = if query.starts_with('@') {
+        format!("{}%", uname_sub)
+    } else {
+        format!("%{}%", uname_sub)
+    };
+
+    let rows = sqlx::query_as::<_, LocalUserRow>(&format!(
+        r#"SELECT {} FROM "user"
+           WHERE ("name" ILIKE $1 OR "usernameLower" LIKE $2)
+             AND ("user"."updatedAt" IS NULL OR "user"."updatedAt" > now() - interval '30 days')
+             AND "isSuspended" = FALSE{}{}
+           ORDER BY "updatedAt" DESC NULLS LAST
+           LIMIT {} OFFSET {}"#,
+        LOCAL_USER_COLS, muted_clause, origin_clause, limit, offset
+    ))
+    .bind(&like)
+    .bind(&uname_pattern)
+    .bind(me_id)
+    .fetch_all(pool)
+    .await?;
+
+    if (rows.len() as i64) >= limit {
+        return Ok(rows);
+    }
+
+    // pass 2: profile description, passive users left in (upstream keeps the
+    // active gate; the offset is applied to the description pass independently)
+    let desc_rows = sqlx::query_as::<_, LocalUserRow>(&format!(
+        r#"SELECT {} FROM "user" LEFT JOIN "user_profile" ON "user"."id" = "user_profile"."userId"
+           WHERE "user_profile"."description" ILIKE $1
+             AND ("user"."updatedAt" IS NULL OR "user"."updatedAt" > now() - interval '30 days')
+             AND "user"."isSuspended" = FALSE{}{}
+           ORDER BY "user"."updatedAt" DESC NULLS LAST
+           LIMIT {} OFFSET {}"#,
+        LOCAL_USER_COLS, muted_clause, origin_clause, limit, offset
+    ))
+    .bind(&like)
+    .bind(me_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut seen = rows;
+    for r in desc_rows {
+        if !seen.iter().any(|x| x.id == r.id) {
+            seen.push(r);
+        }
+    }
+    Ok(seen)
+}
