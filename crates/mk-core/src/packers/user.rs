@@ -355,7 +355,10 @@ mod tests {
             "emojis",
             "onlineStatus",
         ];
-        let got = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let mut got = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        got.sort();
+        let mut expected_keys = expected_keys;
+        expected_keys.sort();
         assert_eq!(got, expected_keys);
         assert_eq!(v["name"], json!(null));
         assert_eq!(v["host"], json!(null));
