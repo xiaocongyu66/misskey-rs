@@ -919,7 +919,14 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     .unwrap();
 
     // Default ordering is id DESC (newest first): follow, renote, mention.
-    let (s, list4) = post_json(app.clone(), "/api/notifications", json!({ "i": token_b })).await;
+    // markAsRead:false keeps rows unread for the later unreadOnly asserts
+    // (upstream default is true — the final block exercises that path).
+    let (s, list4) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "markAsRead": false }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "body: {list4}");
     let arr4 = list4.as_array().unwrap();
     assert_eq!(arr4.len(), 3, "body: {list4}");
@@ -935,7 +942,7 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     let (s, list5) = post_json(
         app.clone(),
         "/api/notifications",
-        json!({ "i": token_b, "untilId": renote_id }),
+        json!({ "i": token_b, "untilId": renote_id, "markAsRead": false }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list5}");
@@ -947,7 +954,7 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     let (s, list6) = post_json(
         app.clone(),
         "/api/notifications",
-        json!({ "i": token_b, "sinceId": mention_id }),
+        json!({ "i": token_b, "sinceId": mention_id, "markAsRead": false }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list6}");
@@ -1011,4 +1018,133 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert_eq!(arr9[0]["type"], "reaction");
     assert_eq!(arr9[0]["reaction"], ":custom_grin:");
     assert_eq!(arr9[0]["note"]["id"], note_id.as_str());
+}
+
+// ============================================================================
+// admin/* family (M2 slice, api/admin.rs): suspend/unsuspend (+moderation
+// log + follow-request purge + list exclusion), show-user / show-users, and
+// the meta/server-info/stats facades. Auth: e2e upstream signs `root` first
+// and calls admin/* with it — mirrored here via the documented username
+// shortcut (signup does not stamp meta.rootUserId yet).
+// ============================================================================
+
+/// GET probe (admin/* endpoints are POST-only; allowGet is false).
+async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+async fn seed_follow_request(pool: &mk_db::sqlx::PgPool, followee: &str, follower: &str) {
+    mk_db::sqlx::query(
+        r#"INSERT INTO "follow_request" ("id", "followeeId", "followerId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(mk_types::id::gen_aid_now())
+    .bind(followee)
+    .bind(follower)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn admin_suspend_unsuspend_family() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_suspend").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // upstream users.ts fixture order: root first, then the roles/suspended
+    // cast; admin/suspend-user is invoked with root's token.
+    let root = signup(&app, "root").await;
+    let root_id = root["id"].as_str().unwrap().to_string();
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let victim = signup(&app, "victimsus1").await;
+    let victim_id = victim["id"].as_str().unwrap().to_string();
+    let plain = signup(&app, "plainmod").await;
+    let plain_token = plain["token"].as_str().unwrap().to_string();
+
+    // follow requests on both sides of the victim (UserSuspendService.postSuspend purge)
+    seed_follow_request(&pool, &victim_id, &root_id).await;
+    seed_follow_request(&pool, &root_id, &victim_id).await;
+
+    // (a) no credential → 401 CREDENTIAL_REQUIRED (call() gate)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": victim_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // (b) unresolved native token → 401 AUTHENTICATION_FAILED
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": victim_id, "i": "0123456789abcdef" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
+    );
+
+    // (c) missing userId → 400 INVALID_PARAM
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+
+    // (d) non-moderator credential → 403 ROLE_PERMISSION_DENIED (moderator gate)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": victim_id, "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
+
+    // (e) root suspends the victim (legacy alias name) → 204 void
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend",
+        json!({ "userId": victim_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    assert_eq!(b, Value::Null);
+
+    // DB effects: isSuspended flip + updatedAt bump + moderation log
+    let (suspended, updated_at): (bool, Option<chrono_compat()>) = unreachable!();
 }

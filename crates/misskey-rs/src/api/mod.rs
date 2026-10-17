@@ -118,6 +118,16 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return users_show(&state, &body, token).await;
     }
 
+    // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
+    // Single arm routing every `admin/*` name into api::admin so the mod.rs
+    // surface stays one hunk (rebase-trivial per the slice plan). Method
+    // checks, body parsing, token resolution and the credential/role gates
+    // all live inside the admin module.
+    if name.starts_with("admin/") {
+        return admin::handle(&state, &name, req).await;
+    }
+    // ==== END ADMIN DISPATCH ARM ====
+
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
     }
@@ -1716,3 +1726,10 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
 
 #[cfg(test)]
 mod tests;
+
+/// `/api/admin/*` family (M2 slice). Module file `api/admin.rs` owns the
+/// endpoint table, the ApiCallService-style auth chain (credential gate →
+/// suspended gate → requireModerator/requireAdmin ROLE_PERMISSION_DENIED
+/// gates with the meta.rootUserId bypass) and every admin handler; mod.rs
+/// only registers the module and the single `admin/*` dispatch arm above.
+mod admin;

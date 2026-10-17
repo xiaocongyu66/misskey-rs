@@ -287,177 +287,18 @@ pub async fn user_signins(pool: &PgPool, user_id: &str) -> Result<Vec<SigninRow>
     .await
 }
 
-/// `metasRepository` single row for `admin/meta` (MetaService.fetch(true) on
-/// our columns — no row on a fresh instance → the handler composes defaults).
-#[derive(Debug, sqlx::FromRow)]
-pub struct MetaRow {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    #[sqlx(rename = "maintainerName")]
-    pub maintainer_name: Option<String>,
-    #[sqlx(rename = "maintainerEmail")]
-    pub maintainer_email: Option<String>,
-    #[sqlx(rename = "disableRegistration")]
-    pub disable_registration: bool,
-    pub langs: Vec<String>,
-    #[sqlx(rename = "emailRequiredForSignup")]
-    pub email_required_for_signup: bool,
-    pub email: Option<String>,
-    #[sqlx(rename = "enableEmail")]
-    pub enable_email: bool,
-    #[sqlx(rename = "smtpSecure")]
-    pub smtp_secure: bool,
-    #[sqlx(rename = "smtpHost")]
-    pub smtp_host: Option<String>,
-    #[sqlx(rename = "smtpPort")]
-    pub smtp_port: Option<i32>,
-    #[sqlx(rename = "smtpUser")]
-    pub smtp_user: Option<String>,
-    #[sqlx(rename = "smtpPass")]
-    pub smtp_pass: Option<String>,
-    #[sqlx(rename = "enableServiceWorker")]
-    pub enable_service_worker: bool,
-    #[sqlx(rename = "swPublicKey")]
-    pub sw_public_key: Option<String>,
-    #[sqlx(rename = "swPrivateKey")]
-    pub sw_private_key: Option<String>,
-    #[sqlx(rename = "pinnedUsers")]
-    pub pinned_users: Vec<String>,
-    #[sqlx(rename = "termsOfServiceUrl")]
-    pub terms_of_service_url: Option<String>,
-    #[sqlx(rename = "repositoryUrl")]
-    pub repository_url: Option<String>,
-    #[sqlx(rename = "feedbackUrl")]
-    pub feedback_url: Option<String>,
-    #[sqlx(rename = "impressumUrl")]
-    pub impressum_url: Option<String>,
-    #[sqlx(rename = "privacyPolicyUrl")]
-    pub privacy_policy_url: Option<String>,
-    #[sqlx(rename = "inquiryUrl")]
-    pub inquiry_url: Option<String>,
-    #[sqlx(rename = "themeColor")]
-    pub theme_color: Option<String>,
-    #[sqlx(rename = "mascotImageUrl")]
-    pub mascot_image_url: Option<String>,
-    #[sqlx(rename = "bannerUrl")]
-    pub banner_url: Option<String>,
-    #[sqlx(rename = "serverErrorImageUrl")]
-    pub server_error_image_url: Option<String>,
-    #[sqlx(rename = "infoImageUrl")]
-    pub info_image_url: Option<String>,
-    #[sqlx(rename = "notFoundImageUrl")]
-    pub not_found_image_url: Option<String>,
-    #[sqlx(rename = "iconUrl")]
-    pub icon_url: Option<String>,
-    #[sqlx(rename = "backgroundImageUrl")]
-    pub background_image_url: Option<String>,
-    #[sqlx(rename = "logoImageUrl")]
-    pub logo_image_url: Option<String>,
-    #[sqlx(rename = "defaultLightTheme")]
-    pub default_light_theme: Option<String>,
-    #[sqlx(rename = "defaultDarkTheme")]
-    pub default_dark_theme: Option<String>,
-    #[sqlx(rename = "hiddenTags")]
-    pub hidden_tags: Vec<String>,
-    #[sqlx(rename = "blockedHosts")]
-    pub blocked_hosts: Vec<String>,
-    #[sqlx(rename = "silencedHosts")]
-    pub silenced_hosts: Vec<String>,
-    #[sqlx(rename = "mediaSilencedHosts")]
-    pub media_silenced_hosts: Vec<String>,
-    #[sqlx(rename = "sensitiveWords")]
-    pub sensitive_words: Vec<String>,
-    #[sqlx(rename = "prohibitedWords")]
-    pub prohibited_words: Vec<String>,
-    #[sqlx(rename = "prohibitedWordsForNameOfUser")]
-    pub prohibited_words_for_name_of_user: Vec<String>,
-    #[sqlx(rename = "preservedUsernames")]
-    pub preserved_usernames: Vec<String>,
-    #[sqlx(rename = "serverRules")]
-    pub server_rules: Vec<String>,
-    #[sqlx(rename = "bannedEmailDomains")]
-    pub banned_email_domains: Vec<String>,
-    pub federation: String,
-    #[sqlx(rename = "federationHosts")]
-    pub federation_hosts: Vec<String>,
-    #[sqlx(rename = "ugcVisibilityForVisitor")]
-    pub ugc_visibility_for_visitor: String,
-    #[sqlx(rename = "singleUserMode")]
-    pub single_user_mode: bool,
-    #[sqlx(rename = "manifestJsonOverride")]
-    pub manifest_json_override: Option<String>,
-    #[sqlx(rename = "clientOptions")]
-    pub client_options: serde_json::Value,
-    #[sqlx(rename = "notesPerOneAd")]
-    pub notes_per_one_ad: i32,
-    pub policies: serde_json::Value,
-    #[sqlx(rename = "enableRecaptcha")]
-    pub enable_recaptcha: bool,
-    #[sqlx(rename = "recaptchaSiteKey")]
-    pub recaptcha_site_key: Option<String>,
-    #[sqlx(rename = "recaptchaSecretKey")]
-    pub recaptcha_secret_key: Option<String>,
-    #[sqlx(rename = "enableHcaptcha")]
-    pub enable_hcaptcha: bool,
-    #[sqlx(rename = "hcaptchaSiteKey")]
-    pub hcaptcha_site_key: Option<String>,
-    #[sqlx(rename = "hcaptchaSecretKey")]
-    pub hcaptcha_secret_key: Option<String>,
-    #[sqlx(rename = "useObjectStorage")]
-    pub use_object_storage: bool,
-    #[sqlx(rename = "objectStorageBaseUrl")]
-    pub object_storage_base_url: Option<String>,
-    #[sqlx(rename = "objectStorageBucket")]
-    pub object_storage_bucket: Option<String>,
-    #[sqlx(rename = "objectStoragePrefix")]
-    pub object_storage_prefix: Option<String>,
-    #[sqlx(rename = "objectStorageEndpoint")]
-    pub object_storage_endpoint: Option<String>,
-    #[sqlx(rename = "objectStorageRegion")]
-    pub object_storage_region: Option<String>,
-    #[sqlx(rename = "objectStorageAccessKey")]
-    pub object_storage_access_key: Option<String>,
-    #[sqlx(rename = "objectStorageSecretKey")]
-    pub object_storage_secret_key: Option<String>,
-    #[sqlx(rename = "objectStoragePort")]
-    pub object_storage_port: Option<i32>,
-    #[sqlx(rename = "objectStorageUseSSL")]
-    pub object_storage_use_ssl: bool,
-    #[sqlx(rename = "objectStorageUseProxy")]
-    pub object_storage_use_proxy: bool,
-    #[sqlx(rename = "objectStorageSetPublicRead")]
-    pub object_storage_set_public_read: bool,
-}
-
-pub async fn fetch_meta_row(pool: &PgPool) -> Result<Option<MetaRow>, sqlx::Error> {
-    sqlx::query_as::<_, MetaRow>(
-        r#"
-        SELECT "name", "description", "maintainerName", "maintainerEmail",
-               "disableRegistration", "langs", "emailRequiredForSignup", "email",
-               "enableEmail", "smtpSecure", "smtpHost", "smtpPort", "smtpUser",
-               "smtpPass", "enableServiceWorker", "swPublicKey", "swPrivateKey",
-               "pinnedUsers", "termsOfServiceUrl", "repositoryUrl", "feedbackUrl",
-               "impressumUrl", "privacyPolicyUrl", "inquiryUrl", "themeColor",
-               "mascotImageUrl", "bannerUrl", "serverErrorImageUrl", "infoImageUrl",
-               "notFoundImageUrl", "iconUrl", "backgroundImageUrl", "logoImageUrl",
-               "defaultLightTheme", "defaultDarkTheme", "hiddenTags", "blockedHosts",
-               "silencedHosts", "mediaSilencedHosts", "sensitiveWords",
-               "prohibitedWords", "prohibitedWordsForNameOfUser",
-               "preservedUsernames", "serverRules", "bannedEmailDomains",
-               "federation", "federationHosts", "ugcVisibilityForVisitor",
-               "singleUserMode", "manifestJsonOverride", "clientOptions",
-               "notesPerOneAd", "policies", "enableRecaptcha", "recaptchaSiteKey",
-               "recaptchaSecretKey", "enableHcaptcha", "hcaptchaSiteKey",
-               "hcaptchaSecretKey", "useObjectStorage", "objectStorageBaseUrl",
-               "objectStorageBucket", "objectStoragePrefix", "objectStorageEndpoint",
-               "objectStorageRegion", "objectStorageAccessKey",
-               "objectStorageSecretKey", "objectStoragePort", "objectStorageUseSSL",
-               "objectStorageUseProxy", "objectStorageSetPublicRead"
-        FROM "meta" LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await
+/// One meta row as a JSON object — `SELECT to_jsonb(m)`: every `meta`
+/// column with its schema (camelCase) name, for the admin/meta facade
+/// composition (MetaService.fetch(true); a fresh instance has no row → None
+/// and the handler applies the schema/defaults).
+pub async fn fetch_meta_row_json(
+    pool: &PgPool,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let v: Option<serde_json::Value> =
+        sqlx::query_scalar(r#"SELECT to_jsonb(m) FROM "meta" m LIMIT 1"#)
+            .fetch_optional(pool)
+            .await?;
+    Ok(v)
 }
 
 /// Honest M2-row counts for the stats facades. `local_only` = host IS NULL /
