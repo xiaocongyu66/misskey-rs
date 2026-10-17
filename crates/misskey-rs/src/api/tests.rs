@@ -47,12 +47,11 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
 
 #[tokio::test]
 async fn signup_roundtrip() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    if std::env::var("DATABASE_URL").is_err() {
         return;
-    };
-    let pool = mk_db::connect(&url).await.unwrap();
+    }
+    let pool = mk_db::test_support::fresh_db("mksignup_roundtrip").await;
     mk_db::run_migrations(&pool).await.unwrap();
-    mk_db::user::truncate_all(&pool).await.unwrap();
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool));
@@ -100,12 +99,11 @@ async fn signup_roundtrip() {
 
 #[tokio::test]
 async fn signup_duplicated_username() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    if std::env::var("DATABASE_URL").is_err() {
         return;
-    };
-    let pool = mk_db::connect(&url).await.unwrap();
+    }
+    let pool = mk_db::test_support::fresh_db("mksignup_dup").await;
     mk_db::run_migrations(&pool).await.unwrap();
-    mk_db::user::truncate_all(&pool).await.unwrap();
 
     let username = format!("bob{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool));
