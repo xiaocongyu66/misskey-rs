@@ -787,3 +787,228 @@ async fn hashtags_users_tag_normalization_and_sort() {
         .collect();
     assert_eq!(ids, vec![b_id.as_str()], "body: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// notifications slice (M2) — appended tests; keep at file end so co-agent
+// appends rebase trivially.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn notifications_mention_reaction_and_mark_as_read() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotifications").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let username_a = format!("na{}", mk_types::id::gen_aid_now());
+    let username_b = format!("nb{}", mk_types::id::gen_aid_now());
+    let a = signup(&app, &username_a).await;
+    let b = signup(&app, &username_b).await;
+    let token_a = a["token"].as_str().unwrap().to_string();
+    let token_b = b["token"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+
+    // requireCredential: no token → CREDENTIAL_REQUIRED (401)
+    let (s, err) = post_json(app.clone(), "/api/notifications", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+
+    // A posts the mention text. M1 notes/create has no mention parsing, so
+    // the notification row is inserted through the truthful mk-db path
+    // (the same INSERT upstream NotificationService lands in).
+    let (s, nb) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": token_a, "text": format!("@{} hello", username_b) }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {nb}");
+    let note_id = nb["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let mention_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_notification(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &mention_id,
+            r#type: "mention",
+            user_id: &b_id,
+            notifier_id: Some(a["id"].as_str().unwrap()),
+            note_id: Some(&note_id),
+            reaction: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // First read: unreadOnly + default markAsRead=true → mention packed
+    // (type/userId/user/note), then everything marked read.
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {list}");
+    let n = &arr[0];
+    assert_eq!(n["id"], mention_id.as_str());
+    assert_eq!(n["type"], "mention");
+    assert!(n["createdAt"].as_str().is_some());
+    assert_eq!(n["userId"], a["id"]);
+    assert_eq!(n["user"]["username"], username_a.as_str());
+    assert!(n["user"]["avatarUrl"]
+        .as_str()
+        .unwrap()
+        .contains("/identicon/"));
+    assert_eq!(n["note"]["id"], note_id.as_str());
+    assert_eq!(n["note"]["text"], format!("@{} hello", username_b));
+
+    // unreadOnly again → empty: the previous call's markAsRead default fired.
+    let (s, list2) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(list2.as_array().unwrap().is_empty(), "body: {list2}");
+
+    // Full list still shows the (now read) mention; includeTypes filters.
+    let (s, list3) = post_json(app.clone(), "/api/notifications", json!({ "i": token_b })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list3}");
+    assert_eq!(list3.as_array().unwrap().len(), 1, "body: {list3}");
+    let (s, list3b) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "includeTypes": ["follow"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list3b}");
+    assert!(list3b.as_array().unwrap().is_empty(), "body: {list3b}");
+
+    // renote (note-bound) + follow (no note) from A.
+    let renote_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_notification(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &renote_id,
+            r#type: "renote",
+            user_id: &b_id,
+            notifier_id: Some(a["id"].as_str().unwrap()),
+            note_id: Some(&note_id),
+            reaction: None,
+        },
+    )
+    .await
+    .unwrap();
+    let follow_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_notification(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &follow_id,
+            r#type: "follow",
+            user_id: &b_id,
+            notifier_id: Some(a["id"].as_str().unwrap()),
+            note_id: None,
+            reaction: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Default ordering is id DESC (newest first): follow, renote, mention.
+    let (s, list4) = post_json(app.clone(), "/api/notifications", json!({ "i": token_b })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list4}");
+    let arr4 = list4.as_array().unwrap();
+    assert_eq!(arr4.len(), 3, "body: {list4}");
+    assert_eq!(arr4[0]["type"], "follow");
+    // follow carries no note field (upstream drops undefined)
+    assert!(!arr4[0].as_object().unwrap().contains_key("note"));
+    assert_eq!(arr4[0]["userId"], a["id"]);
+    assert_eq!(arr4[1]["type"], "renote");
+    assert_eq!(arr4[1]["note"]["id"], note_id.as_str());
+    assert_eq!(arr4[2]["type"], "mention");
+
+    // untilId is EXCLUSIVE (misc/id.ts aid monotonic string compare).
+    let (s, list5) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "untilId": renote_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list5}");
+    let arr5 = list5.as_array().unwrap();
+    assert_eq!(arr5.len(), 1, "body: {list5}");
+    assert_eq!(arr5[0]["type"], "mention");
+
+    // sinceId-only flips to oldest-first ASC: mention comes after renote.
+    let (s, list6) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "sinceId": mention_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list6}");
+    let arr6 = list6.as_array().unwrap();
+    assert_eq!(arr6.len(), 2, "body: {list6}");
+    assert_eq!(arr6[0]["type"], "renote");
+    assert_eq!(arr6[1]["type"], "follow");
+
+    // markAsRead:false leaves rows unread.
+    let (s, list7) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "markAsRead": false, "unreadOnly": true, "includeTypes": ["renote", "follow"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list7}");
+    let arr7 = list7.as_array().unwrap();
+    assert_eq!(arr7.len(), 2, "body: {list7}");
+
+    // Then a default call (markAsRead=true) clears them.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, list8) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(list8.as_array().unwrap().is_empty(), "body: {list8}");
+
+    // Reaction notifications carry the reaction string.
+    let reaction_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_notification(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &reaction_id,
+            r#type: "reaction",
+            user_id: &b_id,
+            notifier_id: Some(a["id"].as_str().unwrap()),
+            note_id: Some(&note_id),
+            reaction: Some(":custom_grin:"),
+        },
+    )
+    .await
+    .unwrap();
+    let (s, list9) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": token_b, "includeTypes": ["reaction"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list9}");
+    let arr9 = list9.as_array().unwrap();
+    assert_eq!(arr9.len(), 1, "body: {list9}");
+    assert_eq!(arr9[0]["type"], "reaction");
+    assert_eq!(arr9[0]["reaction"], ":custom_grin:");
+    assert_eq!(arr9[0]["note"]["id"], note_id.as_str());
+}

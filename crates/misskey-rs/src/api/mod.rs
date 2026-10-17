@@ -69,6 +69,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "users/search-by-username-and-host"
         || name == "hashtags/users"
         || name == "users"
+        // -- notifications slice (M2): param line + arm kept at the END of
+        // -- the dispatch group so co-agent rebases stay trivial
+        || name == "notifications"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -107,6 +110,11 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "users" {
             return users_list(&state, &body, token).await;
         }
+        // -- notifications slice (M2) — added lines; keep at END of group --
+        if name == "notifications" {
+            return notifications_route(&state, &body, token).await;
+        }
+        // -- end notifications slice --
         return users_show(&state, &body, token).await;
     }
 
@@ -531,12 +539,13 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
                 Ok(r) => r,
                 Err(resp) => return *resp,
             };
-            out.push(mk_core::services::user_pack::pack_inline(
+            out.push(mk_core::services::user_pack::pack_inline_opts(
                 &row,
                 &profile,
                 is_me,
                 relation.as_ref(),
                 ctx,
+                false, // users/show: secrets stay hidden even for self
             ));
         }
         return (StatusCode::OK, Json(json!(out))).into_response();
@@ -583,12 +592,13 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
 
     (
         StatusCode::OK,
-        Json(mk_core::services::user_pack::pack_inline(
+        Json(mk_core::services::user_pack::pack_inline_opts(
             &row,
             &profile,
             is_me,
             relation.as_ref(),
             ctx,
+            false, // users/show: secrets stay hidden even for self
         )),
     )
         .into_response()
@@ -1055,6 +1065,17 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         return api_err(ApiError::internal_error());
     }
 
+    // i/update.ts L483-531: hashtags from the new description join user.tags
+    // (normalized lowercase, capped at 32; de-dup in SQL).
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        let tags = mk_core::services::misc::extract_hashtags(desc);
+        if !tags.is_empty() {
+            if let Err(e) = mk_db::user::merge_user_tags(pool, &me_id, &tags).await {
+                tracing::error!(target: "dbg_i_update", error = %e, "merge_user_tags");
+            }
+        }
+    }
+
     // Fresh persist + pack (MeDetailed, includeSecrets path).
     let row = match mk_db::user::find_user_by_id(pool, &me_id).await {
         Ok(r) => r,
@@ -1212,12 +1233,13 @@ async fn pack_search_rows(
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
-        out.push(mk_core::services::user_pack::pack_inline(
+        out.push(mk_core::services::user_pack::pack_inline_opts(
             row,
             &profile,
             is_me,
             relation.as_ref(),
             ctx,
+            false,
         ));
     }
     Ok(out)
@@ -1477,6 +1499,207 @@ async fn notes_show(state: &AppState, body: &Value) -> Response {
         Ok(n) => (StatusCode::OK, Json(n)).into_response(),
         Err(r) => *r,
     }
+}
+
+// ---------------------------------------------------------------------------
+// notifications slice (M2) — truthful subset of upstream
+// endpoints/i/notifications.ts (pinned upstream keeps the `i/` namespacing;
+// the coordinator-facing name is `notifications`) + NotificationEntityService.
+// ---------------------------------------------------------------------------
+
+/// Optional nullable integer param (`{ type: 'integer' }`).
+fn opt_int_param(body: &Value, key: &str) -> Result<Option<i64>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_i64() {
+            Some(n) => Ok(Some(n)),
+            None => Err(invalid_param(key, "expected an integer")),
+        },
+    }
+}
+
+/// Optional nullable string param for misskey:id Cursors.
+fn opt_id_param<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(invalid_param(key, "expected a string")),
+    }
+}
+
+/// `POST /api/notifications` — requireCredential list + mark-as-read flow.
+/// Upstream order: fetch → `readAllNotification` when `markAsRead` (default
+/// true) → pack. Params: limit (1..=100, default 10), sinceId/untilId
+/// (exclusive aid cursors), markAsRead, unreadOnly, includeTypes ([] → []
+/// short-circuit BEFORE marking read; unknown type strings tolerated as
+/// no-ops in the pinned upstream). `following` not ported (TODO(M2+):
+/// needs a following-table join). Stored types outside this slice's
+/// producible set (mention/reply/renote/reaction/follow) degrade to the
+/// id/createdAt/type/userId/user shape.
+async fn notifications_route(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+
+    // requireCredential chain, mirrors i_route's call() order.
+    let Some(token) = token else {
+        return api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CREDENTIAL_REQUIRED",
+            "1384574d-a912-4b81-8601-c7b1c4085df1",
+            "Credential required.",
+        ));
+    };
+    if token.len() != 16 {
+        return authentication_failed();
+    }
+    let Some(me_id) = resolve_me(pool, Some(token.as_str())).await else {
+        return authentication_failed();
+    };
+    match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(Some(row)) => {
+            if row.is_suspended {
+                return api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_SUSPENDED",
+                    "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                    "Your account has been suspended.",
+                ));
+            }
+        }
+        Ok(None) => return authentication_failed(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notifications", error = %e, "find_user_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    }
+
+    // paramDef: limit minimum 1, maximum 100, default 10.
+    let limit = opt_int_param(body, "limit")?.unwrap_or(10).clamp(1, 100);
+    let since_id = opt_id_param(body, "sinceId")?;
+    let until_id = opt_id_param(body, "untilId")?;
+    let mark_as_read = opt_bool(body, "markAsRead")?.unwrap_or(true);
+    let unread_only = opt_bool(body, "unreadOnly")?.unwrap_or(false);
+    let include_types: Vec<String> = match body.get("includeTypes") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        Some(_) => return invalid_param("includeTypes", "expected an array of strings"),
+    };
+
+    // upstream: empty includeTypes queries nothing and skips mark-as-read.
+    if body
+        .get("includeTypes")
+        .is_some_and(|v| v.as_array().is_some_and(|a| a.is_empty()))
+    {
+        return (StatusCode::OK, Json(json!([]))).into_response();
+    }
+
+    let rows = match mk_db::notification::list_notifications(
+        pool,
+        &me_id,
+        since_id,
+        until_id,
+        limit,
+        unread_only,
+        &include_types,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_notifications", error = %e, "list_notifications");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    if mark_as_read {
+        if let Err(e) = mk_db::notification::mark_as_read_all(pool, &me_id).await {
+            tracing::error!(target: "dbg_notifications", error = %e, "mark_as_read_all");
+        }
+    }
+
+    let cfg_url = state.config.url.clone();
+    let cfg_host = state.config.host();
+
+    let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+    for n in &rows {
+        // Note-bound types: a deleted note hides the notification (upstream
+        // #packInternal "if the note has been deleted, don't show this").
+        let note_val = if mk_core::services::notification_pack::is_note_bound(&n.r#type) {
+            let Some(note_id) = n.note_id.as_deref() else {
+                continue;
+            };
+            let Some(nrow) = (match mk_db::note::find_note_by_id(pool, note_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notifications", error = %e, "find_note_by_id");
+                    return api_err(ApiError::internal_error());
+                }
+            }) else {
+                continue;
+            };
+            let Ok(lite) = note_user_lite(state, pool, &nrow.user_id).await else {
+                // deleted author → pack null upstream → notification dropped
+                continue;
+            };
+            let note_created = mk_types::id::parse_aid_date(&nrow.id)
+                .map(mk_core::services::signup::ms_to_iso)
+                .unwrap_or_default();
+            Some(mk_core::packers::note::note_pack_min(
+                &nrow,
+                lite,
+                note_created,
+                &nrow.mentions,
+                &nrow.tags,
+                json!({}),
+            ))
+        } else {
+            None
+        };
+
+        // Notifier: deleted or suspended users hide the notification
+        // (upstream #validateNotifier: isSuspended → false).
+        let lite_val = if let Some(notifier_id) = n.notifier_id.as_deref() {
+            let Some(urow) = (match mk_db::user::find_user_by_id(pool, notifier_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notifications", error = %e, "find_user_by_id[notifier]");
+                    return api_err(ApiError::internal_error());
+                }
+            }) else {
+                continue;
+            };
+            if urow.is_suspended {
+                continue;
+            }
+            let Ok(profile) = mk_db::user::find_profile(pool, notifier_id).await else {
+                continue;
+            };
+            let ctx = mk_core::services::user_pack::InstanceCtx {
+                url: &cfg_url,
+                host: &cfg_host,
+            };
+            Some(mk_core::services::user_pack::user_lite_value(
+                &urow, &profile, ctx,
+            ))
+        } else {
+            None
+        };
+
+        let created_at = mk_types::id::parse_aid_date(&n.id)
+            .map(mk_core::services::signup::ms_to_iso)
+            .unwrap_or_default();
+        out.push(mk_core::services::notification_pack::pack_notification(
+            n, lite_val, note_val, created_at,
+        ));
+    }
+
+    (StatusCode::OK, Json(json!(out))).into_response()
 }
 
 #[cfg(test)]

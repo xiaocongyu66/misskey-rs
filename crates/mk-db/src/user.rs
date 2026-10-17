@@ -776,3 +776,23 @@ pub async fn users_explore(
         .fetch_all(pool)
         .await
 }
+
+/// `i/update.ts` L483-531: description/body hashtags merge into `user.tags`
+/// (normalized upstream-side; our extractor lowercases; caller caps at 32).
+pub async fn merge_user_tags(
+    pool: &PgPool,
+    user_id: &str,
+    tags: &[String],
+) -> Result<(), sqlx::Error> {
+    for tag in tags.iter().take(32) {
+        sqlx::query(
+            r#"UPDATE "user" SET "tags" = array_append("tags", $2)
+               WHERE "id" = $1 AND NOT ($2 = ANY("tags"))"#,
+        )
+        .bind(user_id)
+        .bind(tag)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
