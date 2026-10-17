@@ -63,7 +63,7 @@ pub fn note_pack_min(
     o.insert(
         "reactionAcceptance".into(),
         row.reaction_acceptance
-            .as_str()
+            .as_deref()
             .map(|s| json!(s))
             .unwrap_or(Value::Null),
     );
