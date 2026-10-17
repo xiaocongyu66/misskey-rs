@@ -228,7 +228,7 @@ pub struct ProfileRow {
     pub auto_sensitive: bool,
     pub achievements: serde_json::Value,
     #[sqlx(rename = "loggedInDates")]
-    pub logged_in_dates: serde_json::Value,
+    pub logged_in_dates: Vec<String>,
     #[sqlx(rename = "preventAiLearning")]
     pub prevent_ai_learning: bool,
     #[sqlx(rename = "notificationRecieveConfig")]
@@ -254,6 +254,7 @@ pub struct ProfileRow {
 pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", "followingVisibility", "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds""#;
 
 pub async fn find_profile(pool: &PgPool, user_id: &str) -> Result<ProfileRow, sqlx::Error> {
+    // (column-array decode: Vec<String> is required for varchar[] columns)
     sqlx::query_as::<_, ProfileRow>(&format!(
         r#"SELECT {} FROM "user_profile" WHERE "userId" = $1"#,
         PROFILE_COLS

@@ -254,11 +254,7 @@ pub fn pack_show(
         notification_recieve_config: profile.notification_recieve_config.clone(),
         email_notification_types: string_vec(&profile.email_notification_types),
         achievements: ach,
-        logged_in_days: profile
-            .logged_in_dates
-            .as_array()
-            .map(|a| a.len() as i64)
-            .unwrap_or(0),
+        logged_in_days: profile.logged_in_dates.len() as i64,
         policies: serde_json::json!({}),
         two_factor_enabled_always: profile.two_factor_enabled,
         use_password_less_login_always: profile.use_password_less_login,
@@ -337,11 +333,7 @@ fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>
         notification_recieve_config: profile.notification_recieve_config.clone(),
         email_notification_types: string_vec(&profile.email_notification_types),
         achievements: ach,
-        logged_in_days: profile
-            .logged_in_dates
-            .as_array()
-            .map(|a| a.len() as i64)
-            .unwrap_or(0),
+        logged_in_days: profile.logged_in_dates.len() as i64,
         policies: serde_json::json!({}),
         two_factor_enabled_always: profile.two_factor_enabled,
         use_password_less_login_always: profile.use_password_less_login,
