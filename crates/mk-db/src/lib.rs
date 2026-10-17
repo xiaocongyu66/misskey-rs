@@ -6,6 +6,7 @@ use sqlx::PgPool;
 
 pub use sqlx;
 
+pub mod admin;
 pub mod note;
 pub mod notification;
 pub mod relation;

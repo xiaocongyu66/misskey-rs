@@ -82,15 +82,17 @@ pub(super) async fn handle(state: &AppState, name: &str, req: Request) -> Respon
     };
 
     let result = match name {
-        "admin/suspend-user" | "admin/suspend" => suspend(state, &body, token.as_deref(), true),
-        "admin/unsuspend-user" | "admin/unsuspend" => {
-            suspend(state, &body, token.as_deref(), false)
+        "admin/suspend-user" | "admin/suspend" => {
+            suspend(state, &body, token.as_deref(), true).await
         }
-        "admin/show-user" => show_user(state, &body, token.as_deref()),
-        "admin/show-users" => show_users(state, &body, token.as_deref()),
-        "admin/meta" => admin_meta(state, token.as_deref()),
-        "admin/server-info" => server_info(state, token.as_deref()),
-        "admin/stats" => stats(state, token.as_deref()),
+        "admin/unsuspend-user" | "admin/unsuspend" => {
+            suspend(state, &body, token.as_deref(), false).await
+        }
+        "admin/show-user" => show_user(state, &body, token.as_deref()).await,
+        "admin/show-users" => show_users(state, &body, token.as_deref()).await,
+        "admin/meta" => admin_meta(state, token.as_deref()).await,
+        "admin/server-info" => server_info(state, token.as_deref()).await,
+        "admin/stats" => stats(state, token.as_deref()).await,
         _ => unreachable!("checked against ENDPOINTS above"),
     };
     match result {
@@ -331,13 +333,6 @@ fn parse_offset(body: &Value) -> Result<i64, Response> {
     }
 }
 
-fn pack_ctx(state: &AppState) -> mk_core::services::user_pack::InstanceCtx<'_> {
-    mk_core::services::user_pack::InstanceCtx {
-        url: &state.config.url,
-        host: &state.config.host(),
-    }
-}
-
 fn role_value(r: &mk_db::role::AssignedRole) -> Value {
     // RoleEntityService.pack fields asserted by upstream e2e.
     json!({
@@ -472,7 +467,10 @@ async fn show_user(state: &AppState, body: &Value, token: Option<&str>) -> ApiRe
         &profile,
         is_me,
         relation.as_ref(),
-        pack_ctx(state),
+        mk_core::services::user_pack::InstanceCtx {
+            url: &state.config.url,
+            host: &state.config.host(),
+        },
     );
     if secrets_allowed && !is_me {
         // UserEntityService.pack `opts.includeSecrets` spread.

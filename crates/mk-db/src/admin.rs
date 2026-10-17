@@ -291,9 +291,7 @@ pub async fn user_signins(pool: &PgPool, user_id: &str) -> Result<Vec<SigninRow>
 /// column with its schema (camelCase) name, for the admin/meta facade
 /// composition (MetaService.fetch(true); a fresh instance has no row → None
 /// and the handler applies the schema/defaults).
-pub async fn fetch_meta_row_json(
-    pool: &PgPool,
-) -> Result<Option<serde_json::Value>, sqlx::Error> {
+pub async fn fetch_meta_row_json(pool: &PgPool) -> Result<Option<serde_json::Value>, sqlx::Error> {
     let v: Option<serde_json::Value> =
         sqlx::query_scalar(r#"SELECT to_jsonb(m) FROM "meta" m LIMIT 1"#)
             .fetch_optional(pool)
@@ -304,7 +302,11 @@ pub async fn fetch_meta_row_json(
 /// Honest M2-row counts for the stats facades. `local_only` = host IS NULL /
 /// userHost IS NULL (the `original*` variants).
 pub async fn count_users(pool: &PgPool, local_only: bool) -> Result<i64, sqlx::Error> {
-    let cond = if local_only { r#" WHERE "host" IS NULL"# } else { "" };
+    let cond = if local_only {
+        r#" WHERE "host" IS NULL"#
+    } else {
+        ""
+    };
     let v: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "user"{cond}"#))
         .fetch_one(pool)
         .await?;
