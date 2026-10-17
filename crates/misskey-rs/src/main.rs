@@ -1,3 +1,6 @@
+// Large `json!` literals (endpoint response bodies) blow past the default 128.
+#![recursion_limit = "512"]
+
 mod api;
 mod config;
 mod error;
