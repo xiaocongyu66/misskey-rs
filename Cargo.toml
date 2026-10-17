@@ -27,6 +27,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+bcrypt = "0.15"
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"
 
 mk-types = { path = "crates/mk-types" }
 mk-jsonschema = { path = "crates/mk-jsonschema" }

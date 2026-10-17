@@ -14,13 +14,23 @@ use axum::routing::{any, get};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use crate::config::Config;
+pub use config::Config;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub pool: Option<mk_db::sqlx::PgPool>,
     pub rate_limiter: std::sync::Arc<ratelimit::RateLimiter>,
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let cors = CorsLayer::permissive();
+    Router::new()
+        .route("/api/{*name}", any(api::dispatch))
+        .route("/healthz", get(healthz))
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -58,19 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: std::sync::Arc::new(ratelimit::RateLimiter::new()),
     };
 
-    let cors = CorsLayer::permissive();
-
-    let app = Router::new()
-        .route("/api/{*name}", any(api::dispatch))
-        .route("/healthz", get(healthz))
-        .layer(cors)
-        .layer(DefaultBodyLimit::max(1024 * 1024))
-        .with_state(state);
-
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving at {} (listening on {})", url, addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, build_router(state)).await?;
     Ok(())
 }
 

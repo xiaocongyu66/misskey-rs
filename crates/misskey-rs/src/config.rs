@@ -84,6 +84,18 @@ fn default_redis_port() -> u16 {
     6379
 }
 
+impl Config {
+    /// JS `new URL(config.url).host` — scheme stripped, port kept.
+    pub fn host(&self) -> String {
+        let rest = self
+            .url
+            .split_once("://")
+            .map(|(_, r)| r)
+            .unwrap_or(&self.url);
+        rest.split('/').next().unwrap_or(rest).to_string()
+    }
+}
+
 pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     let config = serde_yaml::from_str(&raw)?;

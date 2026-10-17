@@ -4,3 +4,4 @@
 //! Must stay independent of axum so queue workers can reuse it.
 
 pub mod packers;
+pub mod services;
