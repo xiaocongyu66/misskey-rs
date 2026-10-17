@@ -67,6 +67,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/show"
         || name == "users/search"
         || name == "users/search-by-username-and-host"
+        || name == "hashtags/users"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
