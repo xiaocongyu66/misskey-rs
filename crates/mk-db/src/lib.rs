@@ -6,6 +6,7 @@ use sqlx::PgPool;
 
 pub use sqlx;
 
+pub mod note;
 pub mod user;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {

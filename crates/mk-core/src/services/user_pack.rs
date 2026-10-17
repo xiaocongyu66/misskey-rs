@@ -343,3 +343,28 @@ fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>
         security_keys_list: Some(Vec::new()),
     }
 }
+
+/// Lite view of a local user used inside note packs (`pack`, lite: true).
+pub fn user_lite_value(row: &LocalUserRow, _profile: &ProfileRow, ctx: InstanceCtx<'_>) -> serde_json::Value {
+    let _ = _profile;
+    use crate::packers::user::UserLite;
+    let lite = UserLite {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        username: row.username.clone(),
+        host: None,
+        avatar_url: avatar_url(row, ctx),
+        avatar_blurhash: row.avatar_blurhash.clone(),
+        avatar_decorations: decorations(&row.avatar_decorations),
+        is_bot: None,
+        is_cat: None,
+        require_signin_to_view_contents: Some(false),
+        make_notes_followers_only_before: None,
+        make_notes_hidden_before: None,
+        instance: None,
+        emojis: Default::default(),
+        online_status: OnlineStatus::Unknown,
+        badge_roles: Some(Vec::new()),
+    };
+    serde_json::to_value(&lite).unwrap_or(serde_json::json!({}))
+}

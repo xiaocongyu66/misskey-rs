@@ -59,7 +59,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
 
     // Registry endpoints that need a JSON body parsed before dispatch.
-    if name == "users/show" || name == "signin" || name == "i" || name == "i/update" {
+    if name == "users/show" || name == "signin" || name == "i" || name == "i/update" || name == "notes/create" || name == "notes/show" {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
@@ -78,6 +78,12 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "i/update" {
             return i_update(&state, &body, token).await;
+        }
+        if name == "notes/create" {
+            return notes_create(&state, &body, token).await;
+        }
+        if name == "notes/show" {
+            return notes_show(&state, &body).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -991,6 +997,158 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         )),
     )
         .into_response()
+}
+
+
+/// Shared note-packing for the M1 slice: user row + profile → UserLite value.
+async fn note_user_lite(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    user_id: &str,
+) -> Result<Value, Response> {
+    let row = match mk_db::user::find_user_by_id(pool, user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "note find_user_by_id");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    };
+    let Some(row) = row else {
+        return Err(api_err(ApiError::new(
+            404,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_USER",
+            "4362f8dc-731f-4ad8-a694-be5a88922a24",
+            "No such user.",
+        )));
+    };
+    let profile = match mk_db::user::find_profile(pool, user_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "note find_profile");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    };
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+    Ok(mk_core::services::user_pack::user_lite_value(&row, &profile, ctx))
+}
+
+/// `POST /api/notes/create` — M1 subset: text (+optional visibility/replyId),
+/// credential required (401 shapes shared with i_route flow via resolve_me).
+async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let Some(me_id) = resolve_me(pool, token.as_deref()).await else {
+        return api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "AUTHENTICATION_FAILED",
+            "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
+            "Authentication failed. Please ensure your token is correct.",
+        ));
+    };
+
+    let text = match body.get("text").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() && t.chars().count() <= 3000 => t,
+        _ => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "text",
+                "reason": "required, 1..3000 chars in M1 (poll/file notes land in M2)",
+            })));
+        }
+    };
+    let visibility = match body.get("visibility").and_then(|v| v.as_str()) {
+        None | Some("public") => "public",
+        Some(v @ ("home" | "followers" | "specified")) => v,
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "visibility",
+                "reason": "must be one of public/home/followers/specified",
+            })));
+        }
+    };
+    let reply_id = body.get("replyId").and_then(|v| v.as_str());
+
+    let id = mk_types::id::gen_aid_now();
+    if let Err(e) = mk_db::note::insert_note(
+        pool,
+        &mk_db::note::NewNote {
+            id: &id,
+            text: Some(text),
+            user_id: &me_id,
+            visibility,
+            reply_id,
+        },
+    )
+    .await
+    {
+        tracing::error!(target: "dbg_notes", error = %e, "insert_note");
+        return api_err(ApiError::internal_error());
+    }
+
+    let note = match pack_note(state, pool, &id).await {
+        Ok(n) => n,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
+}
+
+/// M1 note packing pipeline (row + author lite + derived createdAt).
+async fn pack_note(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    note_id: &str,
+) -> Result<Value, Box<Response>> {
+    let row = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "find_note_by_id");
+            return Err(Box::new(api_err(ApiError::internal_error())));
+        }
+    };
+    let Some(row) = row else {
+        return Err(Box::new(api_err(ApiError::new(
+            404,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_NOTE",
+            "24fcbfc6-2e37-42b6-8388-c29b3861a08d",
+            "No such note.",
+        ))));
+    };
+    let user_lite = match note_user_lite(state, pool, &row.user_id).await {
+        Ok(v) => v,
+        Err(r) => return Err(Box::new(r)),
+    };
+    let created_at = mk_types::id::parse_aid_date(&row.id)
+        .map(mk_core::services::signup::ms_to_iso)
+        .unwrap_or_default();
+    let mentions = row.mentions.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    let tags = row.tags.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    let emojis = if row.emojis.is_object() { row.emojis.clone() } else { json!({}) };
+    Ok(mk_core::packers::note::note_pack_min(
+        &row, user_lite, created_at, &mentions, &tags, emojis,
+    ))
+}
+
+/// `POST /api/notes/show` — noteId lookup.
+async fn notes_show(state: &AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let Some(note_id) = body.get("noteId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "noteId",
+            "reason": "required",
+        })));
+    };
+    match pack_note(state, pool, note_id).await {
+        Ok(n) => (StatusCode::OK, Json(n)).into_response(),
+        Err(r) => *r,
+    }
 }
 
 #[cfg(test)]

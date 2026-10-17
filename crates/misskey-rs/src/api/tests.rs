@@ -421,3 +421,63 @@ async fn i_update_requires_native_token() {
     assert_eq!(s2, StatusCode::UNAUTHORIZED, "body: {b2}");
     assert_eq!(b2["error"]["code"], json!("AUTHENTICATION_FAILED"));
 }
+
+#[tokio::test]
+async fn notes_create_and_show() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotes1").await;
+    let username = format!("noter{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let token = me["token"].as_str().unwrap().to_string();
+
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hello e2e", "i": token }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    let note = &b1["createdNote"];
+    assert_eq!(note["text"], json!("hello e2e"));
+    assert_eq!(note["visibility"], json!("public"));
+    assert_eq!(note["userId"], me["id"]);
+    assert_eq!(note["user"]["username"], username.as_str());
+    assert_eq!(note["repliesCount"], json!(0));
+
+    // e2e asserts exact field sets — optional-absent fields must be missing
+    let got = note.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    for absent in ["deletedAt", "cw", "replyId", "renoteId", "reply", "renote", "poll", "channelId", "myReaction", "clippedCount"] {
+        assert!(!got.contains(absent), "{absent} must be absent");
+    }
+    for present in ["mentions", "fileIds", "files", "tags", "emojis", "reactions", "reactionEmojis", "localOnly", "reactionCount", "renoteCount", "visibleUserIds"] {
+        assert!(got.contains(present), "{present} must be present");
+    }
+
+    // notes/show roundtrip
+    let nid = note["id"].as_str().unwrap().to_string();
+    let (s2, b2) = post_json(app, "/api/notes/show", json!({ "noteId": nid })).await;
+    assert_eq!(s2, StatusCode::OK, "b: {b2}");
+    assert_eq!(b2["id"], json!(nid));
+    assert_eq!(b2["text"], json!("hello e2e"));
+}
+
+#[tokio::test]
+async fn notes_create_requires_auth() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotes2").await;
+    let app = crate::build_router(test_state(pool));
+    let (s, b) = post_json(app, "/api/notes/create", json!({ "text": "x" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        b["error"]["id"],
+        json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
+    );
+}
