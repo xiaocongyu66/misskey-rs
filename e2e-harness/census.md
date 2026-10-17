@@ -7,8 +7,8 @@ harness：`vitest.e2e-rs.config.ts` + `global-setup.mts`（spawn misskey-rs + /e
 ```
 Test Files  1 failed (1)
     Tests  100 failed | 79 passed | 1 skipped | 10 todo (190)
-latest: run 39071401252 (users/search + search-by-username-and-host)
-history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations) → 93 (search family)
+latest: run 39073236799 (hashtags/users + note credits: notesCount bump, user.tags merge)
+history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations) → 93 (search) → 100 (hashtags+credits)
 ```
 ```
 （第 9-14 轮的线下教训：无真实关系数据时硬编码 relations=false 组会倒退 73 例；
@@ -29,7 +29,7 @@ followedMessage 仅 Me 视图。M2 用真实 getRelation + 条件展开一次性
 - `users` 列表 + getFrequentlyRepliedUsers 列表族 23（依赖 M2 note 生态排序）
 - **`users/show` deepStrictEqual 23**（缺 unreadAnnouncements/verifiedLinks/
   followingCount 等字段出处——非列表端点问题，pack 细节缺口）
-- `hashtags/users` 15
+- `hashtags/users` 15（7 已转绿；余 8 依赖 sort 链路细节/一致性 dict）
 - i/update each 残余 10（isBot:true 等字段不在 22 字段子集——M2）
 - admin/roles + suspend/delete 2+（BLOCKED）
 
