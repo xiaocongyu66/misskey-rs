@@ -1553,7 +1553,7 @@ async fn social_mute_flow_and_search_exclusion() {
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
     assert_eq!(body, Value::Null);
-    let (expires_at,): (Option<bool>,) = mk_db::sqlx::query_as(
+    let (expires_at,): (bool,) = mk_db::sqlx::query_as(
         r#"SELECT ("expiresAt" IS NULL) FROM "muting" WHERE "muterId" = $1 AND "muteeId" = $2"#,
     )
     .bind(a_id)
@@ -1918,15 +1918,15 @@ async fn social_renote_flow() {
         "incRenoteCount on the target"
     );
     assert_eq!(
-        scalar_i64(
+        count_rows(
             &pool,
-            r#"SELECT count(*) FROM "note" WHERE "id" = $1 AND "renoteId" = $2 AND "text" IS NULL AND "renoteUserId" = $3"#,
-            &renote_id,
+            r#"SELECT count(*) FROM "note" WHERE "renoteId" = $1 AND "renoteUserId" = $2 AND "text" IS NULL"#,
             &target_id,
             b_id
         )
         .await,
-        1
+        1,
+        "textless renote row with denormalized renoteUserId"
     );
     // notesCount incremented for the renote author (incNotesCount)
     assert_eq!(

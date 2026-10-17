@@ -741,9 +741,10 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
     // text presence makes it a quote (upstream passes both into one create);
     // textNullable paramDef still enforces 1..3000 when a string is present.
     let text: Option<&str> = match body.get("text").and_then(|v| v.as_str()) {
-        None | Some(Value::Null) => None,
         Some(t) if !t.is_empty() && t.chars().count() <= 3000 => Some(t),
         Some(_) => return super::invalid_param("text", "1..3000 chars when present"),
+        // absent or explicit null → pure renote (paramDef text nullable)
+        None => None,
     };
     if let Err(e) =
         mk_db::social::insert_renote_note(pool, &id, me_id, &target, text, visibility, local_only)
