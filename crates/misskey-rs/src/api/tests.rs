@@ -7,7 +7,7 @@ use axum::http::Request;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-fn test_state(pool: sqlx::PgPool) -> crate::AppState {
+fn test_state(pool: mk_db::sqlx::PgPool) -> crate::AppState {
     crate::AppState {
         config: crate::config::Config {
             port: 0,
