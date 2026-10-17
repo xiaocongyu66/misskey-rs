@@ -180,9 +180,21 @@ pub struct LocalUserRow {
     pub avatar_id: Option<String>,
     #[sqlx(rename = "bannerId")]
     pub banner_id: Option<String>,
+    // pack-fed counters/flags (upstream UserEntityService.pack reads
+    // user.followersCount / followingCount / notesCount / isBot / isCat)
+    #[sqlx(rename = "followersCount")]
+    pub followers_count: i32,
+    #[sqlx(rename = "followingCount")]
+    pub following_count: i32,
+    #[sqlx(rename = "notesCount")]
+    pub notes_count: i32,
+    #[sqlx(rename = "isBot")]
+    pub is_bot: bool,
+    #[sqlx(rename = "isCat")]
+    pub is_cat: bool,
 }
 
-pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId""#;
+pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat""#;
 
 pub async fn find_local_user_by_username(
     pool: &PgPool,
@@ -270,9 +282,12 @@ pub struct ProfileRow {
     pub follow_approval_local_seconds: Option<i32>,
     #[sqlx(rename = "followApprovalRemoteSeconds")]
     pub follow_approval_remote_seconds: Option<i32>,
+    // varchar[]; drives twoFactorBackupCodesStock (UserEntityService.pack)
+    #[sqlx(rename = "twoFactorBackupSecret")]
+    pub two_factor_backup_secret: Option<Vec<String>>,
 }
 
-pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "noCrawle", "verifiedLinks", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", ("followingVisibility"::text) AS "followingVisibility", ("followersVisibility"::text) AS "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds""#;
+pub const PROFILE_COLS: &str = r#""userId", "location", "birthday", "description", "lang", "fields", "url", "email", "emailVerified", "twoFactorEnabled", "password", "autoAcceptFollowed", "alwaysMarkNsfw", "carefulBot", "securityKeysAvailable", "usePasswordLessLogin", "injectFeaturedNote", "receiveAnnouncementEmail", "emailNotificationTypes", "publicReactions", "autoSensitive", "achievements", "loggedInDates", "preventAiLearning", "noCrawle", "verifiedLinks", "notificationRecieveConfig", "hardMutedWords", "mutedWords", "mutedInstances", ("followingVisibility"::text) AS "followingVisibility", ("followersVisibility"::text) AS "followersVisibility", "followedMessage", "followApprovalLocalSeconds", "followApprovalRemoteSeconds", "twoFactorBackupSecret""#;
 
 pub struct ProfileUpdate {
     // "user" table columns

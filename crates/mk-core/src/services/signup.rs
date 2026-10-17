@@ -217,7 +217,8 @@ pub fn me_detailed_fresh(
         prevent_ai_learning: true, // profile column default
         is_explorable: true,       // user column default
         is_deleted: false,
-        two_factor_backup_codes_stock: BackupCodesStock::Full,
+        // profile.twoFactorBackupSecret is null for a fresh user (pack L603)
+        two_factor_backup_codes_stock: BackupCodesStock::None_,
         hide_online_status: false,
         has_unread_specified_notes: false,
         has_unread_mentions: false,

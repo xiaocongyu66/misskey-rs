@@ -238,6 +238,8 @@ pub enum ChatScope {
     Following,
     Followers,
     Mutual,
+    // `lowercase` would render the trailing underscore; upstream emits 'none'.
+    #[serde(rename = "none")]
     None_,
 }
 
@@ -340,6 +342,9 @@ pub struct MeDetailed {
 pub enum BackupCodesStock {
     Full,
     Partial,
+    // `lowercase` would render the trailing underscore; upstream emits 'none'
+    // (UserEntityService.pack: `... : 'none'`).
+    #[serde(rename = "none")]
     None_,
 }
 
@@ -392,5 +397,23 @@ mod tests {
         assert_eq!(got, expected_keys);
         assert_eq!(v["name"], json!(null));
         assert_eq!(v["host"], json!(null));
+    }
+
+    #[test]
+    fn snake_case_one_word_enums_use_upstream_labels() {
+        // `lowercase` would render `None_` as "none_"; upstream emits 'none'
+        // for both (UserEntityService.pack L603, chatScope param enum).
+        assert_eq!(
+            serde_json::to_value(BackupCodesStock::None_).unwrap(),
+            json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(BackupCodesStock::Full).unwrap(),
+            json!("full")
+        );
+        assert_eq!(
+            serde_json::to_value(ChatScope::None_).unwrap(),
+            json!("none")
+        );
     }
 }

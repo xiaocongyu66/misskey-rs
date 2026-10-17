@@ -92,13 +92,36 @@ fn avatar_url(row: &LocalUserRow, ctx: InstanceCtx<'_>) -> String {
     }
 }
 
+/// followersCount/followingCount visibility gate (UserEntityService.pack
+/// ~L465-473): public always shows the real count; `followers` shows it for
+/// me or a follower; `private` only for me; otherwise the pack emits 0
+/// (`followersCount ?? 0`). M1 has no moderator/moderator-role concept, so
+/// the iAmModerator term is always false.
+fn gated_count(
+    real: i32,
+    visibility: VisibilityLevel,
+    me_view: bool,
+    relation_is_following: bool,
+) -> i64 {
+    if me_view
+        || visibility == VisibilityLevel::Public
+        || (visibility == VisibilityLevel::Followers && relation_is_following)
+    {
+        real as i64
+    } else {
+        0
+    }
+}
+
 fn detailed(
     row: &LocalUserRow,
     profile: &ProfileRow,
     ctx: InstanceCtx<'_>,
+    me_view: bool,
     relation: Option<&mk_db::relation::UserRelation>,
 ) -> UserDetailedNotMe {
     let created_at = mk_types::id::parse_aid_date(&row.id).map(crate::services::signup::ms_to_iso);
+    let relation_is_following = relation.as_ref().map(|r| r.is_following).unwrap_or(false);
     UserDetailedNotMe {
         lite_fields: crate::packers::user::UserLite {
             id: row.id.clone(),
@@ -108,11 +131,11 @@ fn detailed(
             avatar_url: avatar_url(row, ctx),
             avatar_blurhash: row.avatar_blurhash.clone(),
             avatar_decorations: decorations(&row.avatar_decorations),
-            is_bot: Some(false),
-            is_cat: Some(false),
+            is_bot: Some(row.is_bot), // user.isBot, always present
+            is_cat: Some(row.is_cat), // user.isCat, always present
             require_signin_to_view_contents: None, // upstream: ===false ? undefined : true
             make_notes_followers_only_before: None, // ?? undefined → DB null omits
-            make_notes_hidden_before: None,        // ?? undefined → DB null omits
+            make_notes_hidden_before: None, // ?? undefined → DB null omits
             instance: None,
             emojis: Default::default(),
             online_status: online_status(row),
@@ -143,10 +166,20 @@ fn detailed(
         birthday: profile.birthday.clone(),
         lang: profile.lang.clone(),
         fields: fields_vec(&profile.fields),
-        verified_links: Vec::new(),
-        followers_count: 0,
-        following_count: 0,
-        notes_count: 0,
+        verified_links: profile.verified_links.clone(), // profile.verifiedLinks
+        followers_count: gated_count(
+            row.followers_count,
+            visibility(&profile.followers_visibility),
+            me_view,
+            relation_is_following,
+        ),
+        following_count: gated_count(
+            row.following_count,
+            visibility(&profile.following_visibility),
+            me_view,
+            relation_is_following,
+        ),
+        notes_count: row.notes_count as i64, // user.notesCount
         pinned_note_ids: Vec::new(),
         pinned_notes: Vec::new(),
         pinned_page_id: None,
@@ -215,6 +248,13 @@ fn backup_stock(two_factor_backup_secret_len: Option<usize>) -> BackupCodesStock
 
 /// One entrypoint for both DetailedNotMe (is_me=false) and MeDetailed
 /// (is_me=true) responses; returns serde_json::Value.
+///
+/// Secrets (`email`/`emailVerified`/`securityKeysList`) follow the upstream
+/// opts.includeSecrets switch (UserEntityService.pack L626): it is an
+/// endpoint-level choice, not a property of the me view — upstream
+/// `i`/`i/update` pack with includeSecrets: true, while `users/show` keeps
+/// the default false even when the viewer is the target. Use
+/// `pack_inline_opts` for the false case.
 pub fn pack_inline(
     row: &LocalUserRow,
     profile: &ProfileRow,
@@ -222,13 +262,24 @@ pub fn pack_inline(
     relation: Option<&mk_db::relation::UserRelation>,
     ctx: InstanceCtx<'_>,
 ) -> serde_json::Value {
+    pack_inline_opts(row, profile, is_me, relation, ctx, true)
+}
+
+pub fn pack_inline_opts(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    is_me: bool,
+    relation: Option<&mk_db::relation::UserRelation>,
+    ctx: InstanceCtx<'_>,
+    include_secrets: bool,
+) -> serde_json::Value {
     if !is_me {
-        let d = detailed(row, profile, ctx, relation);
+        let d = detailed(row, profile, ctx, false, relation);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
-    // streamer self-view: no relation block (upstream relation is computed
-    // only for other-target views)
-    let me = detailed_as_me(row, profile, ctx, None);
+    // me view: no relation block (upstream relation is computed only for
+    // other-target views)
+    let me = detailed_as_me(row, profile, ctx, include_secrets);
     serde_json::to_value(&me).unwrap_or(serde_json::json!({}))
 }
 
@@ -237,9 +288,9 @@ fn detailed_as_me(
     row: &LocalUserRow,
     profile: &ProfileRow,
     ctx: InstanceCtx<'_>,
-    relation: Option<&mk_db::relation::UserRelation>,
+    include_secrets: bool,
 ) -> MeDetailed {
-    let d = detailed(row, profile, ctx, None);
+    let d = detailed(row, profile, ctx, true, None);
     let ach = profile.achievements.as_array().cloned().unwrap_or_default();
     MeDetailed {
         detailed: crate::packers::user::UserDetailedNotMe {
@@ -261,11 +312,17 @@ fn detailed_as_me(
         auto_accept_followed: profile.auto_accept_followed,
         follow_approval_local_seconds: profile.follow_approval_local_seconds,
         follow_approval_remote_seconds: profile.follow_approval_remote_seconds,
-        no_crawle: false,
+        no_crawle: profile.no_crawle, // profile.noCrawle (pack L599)
         prevent_ai_learning: profile.prevent_ai_learning,
         is_explorable: row.is_explorable,
         is_deleted: false,
-        two_factor_backup_codes_stock: backup_stock(None),
+        // profile.twoFactorBackupSecret?.length (pack L603)
+        two_factor_backup_codes_stock: backup_stock(
+            profile
+                .two_factor_backup_secret
+                .as_ref()
+                .map(|codes| codes.len()),
+        ),
         hide_online_status: row.hide_online_status,
         has_unread_specified_notes: false,
         has_unread_mentions: false,
@@ -288,9 +345,23 @@ fn detailed_as_me(
         two_factor_enabled_always: profile.two_factor_enabled,
         use_password_less_login_always: profile.use_password_less_login,
         security_keys_always: profile.security_keys_available,
-        email: Some(profile.email.clone()),
-        email_verified: Some(Some(profile.email_verified)),
-        security_keys_list: Some(Vec::new()),
+        // Secret fields, gated on opts.includeSecrets (upstream is a
+        // per-endpoint switch; see pack_inline_opts).
+        email: if include_secrets {
+            Some(profile.email.clone())
+        } else {
+            None
+        },
+        email_verified: if include_secrets {
+            Some(Some(profile.email_verified))
+        } else {
+            None
+        },
+        security_keys_list: if include_secrets {
+            Some(Vec::new())
+        } else {
+            None
+        },
     }
 }
 
@@ -310,15 +381,168 @@ pub fn user_lite_value(
         avatar_url: avatar_url(row, ctx),
         avatar_blurhash: row.avatar_blurhash.clone(),
         avatar_decorations: decorations(&row.avatar_decorations),
-        is_bot: Some(false),
-        is_cat: Some(false),
-        require_signin_to_view_contents: None, // upstream: ===false ? undefined : true
+        is_bot: Some(row.is_bot),               // user.isBot, always present
+        is_cat: Some(row.is_cat),               // user.isCat, always present
+        require_signin_to_view_contents: None,  // upstream: ===false ? undefined : true
         make_notes_followers_only_before: None, // ?? undefined → DB null omits
-        make_notes_hidden_before: None,        // ?? undefined → DB null omits
+        make_notes_hidden_before: None,         // ?? undefined → DB null omits
         instance: None,
         emojis: Default::default(),
         online_status: OnlineStatus::Unknown,
         badge_roles: Some(Vec::new()),
     };
     serde_json::to_value(&lite).unwrap_or(serde_json::json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packers::user::BackupCodesStock;
+    use serde_json::json;
+
+    fn row() -> LocalUserRow {
+        LocalUserRow {
+            id: "9testuser0001".to_string(),
+            username: "TestUser".to_string(),
+            username_lower: "testuser".to_string(),
+            name: None,
+            token: "0123456789abcdef".to_string(),
+            is_suspended: false,
+            is_locked: false,
+            is_explorable: true,
+            hide_online_status: false,
+            chat_scope: "mutual".to_string(),
+            avatar_url: None,
+            avatar_blurhash: None,
+            avatar_decorations: json!([]),
+            banner_url: None,
+            banner_blurhash: None,
+            avatar_id: None,
+            banner_id: None,
+            followers_count: 7,
+            following_count: 5,
+            notes_count: 3,
+            is_bot: false,
+            is_cat: false,
+        }
+    }
+
+    fn profile() -> ProfileRow {
+        ProfileRow {
+            user_id: "9testuser0001".to_string(),
+            location: None,
+            birthday: None,
+            description: None,
+            lang: None,
+            fields: json!([]),
+            url: None,
+            email: Some("t@example.com".to_string()),
+            email_verified: false,
+            two_factor_enabled: false,
+            password: None,
+            auto_accept_followed: true,
+            always_mark_nsfw: false,
+            careful_bot: false,
+            security_keys_available: false,
+            use_password_less_login: false,
+            inject_featured_note: true,
+            receive_announcement_email: true,
+            email_notification_types: json!(["follow"]),
+            public_reactions: true,
+            auto_sensitive: false,
+            achievements: json!([]),
+            logged_in_dates: vec![],
+            prevent_ai_learning: true,
+            no_crawle: true,
+            verified_links: vec!["https://example.com".to_string()],
+            notification_recieve_config: json!({}),
+            hard_muted_words: json!([]),
+            muted_words: json!([]),
+            muted_instances: json!([]),
+            following_visibility: "public".to_string(),
+            followers_visibility: "public".to_string(),
+            followed_message: None,
+            follow_approval_local_seconds: None,
+            follow_approval_remote_seconds: None,
+            two_factor_backup_secret: None,
+        }
+    }
+
+    fn ctx() -> InstanceCtx<'static> {
+        InstanceCtx {
+            url: "http://127.0.0.1:3000",
+            host: "127.0.0.1:3000",
+        }
+    }
+
+    #[test]
+    fn gated_count_follows_visibility_rules() {
+        let r = row();
+        // public: everyone sees the real count
+        assert_eq!(
+            gated_count(r.followers_count, VisibilityLevel::Public, false, false),
+            7
+        );
+        // private: only the me view
+        assert_eq!(
+            gated_count(r.followers_count, VisibilityLevel::Private, false, false),
+            0
+        );
+        assert_eq!(
+            gated_count(r.followers_count, VisibilityLevel::Private, true, false),
+            7
+        );
+        // followers: me or an actual follower
+        assert_eq!(
+            gated_count(r.followers_count, VisibilityLevel::Followers, false, false),
+            0
+        );
+        assert_eq!(
+            gated_count(r.followers_count, VisibilityLevel::Followers, false, true),
+            7
+        );
+    }
+
+    #[test]
+    fn backup_stock_levels_mirror_upstream() {
+        // UserEntityService.pack L603: length === 5 ? 'full' : length > 0 ?
+        // 'partial' : 'none'
+        assert_eq!(backup_stock(None), BackupCodesStock::None_);
+        assert_eq!(backup_stock(Some(0)), BackupCodesStock::None_);
+        assert_eq!(backup_stock(Some(3)), BackupCodesStock::Partial);
+        assert_eq!(backup_stock(Some(5)), BackupCodesStock::Full);
+    }
+
+    #[test]
+    fn me_pack_gates_secrets_on_include_secrets() {
+        let ctx = ctx();
+        // users/show packs self without secrets (upstream default false)
+        let no_secrets = pack_inline_opts(&row(), &profile(), true, None, ctx, false);
+        assert!(no_secrets.get("email").is_none());
+        assert!(no_secrets.get("emailVerified").is_none());
+        assert!(no_secrets.get("securityKeysList").is_none());
+        // i/i-update pack with includeSecrets: true
+        let secrets = pack_inline_opts(&row(), &profile(), true, None, ctx, true);
+        assert_eq!(secrets["email"], json!("t@example.com"));
+        assert_eq!(secrets["emailVerified"], json!(false));
+        assert_eq!(secrets["securityKeysList"], json!([]));
+        // twoFactorBackupCodesStock serializes with the upstream label
+        assert_eq!(secrets["twoFactorBackupCodesStock"], json!("none"));
+    }
+
+    #[test]
+    fn detailed_pack_wires_user_and_profile_columns() {
+        let no_secrets = pack_inline(&row(), &profile(), false, None, ctx());
+        // user row: isBot/isCat exist and feed the pack (always present)
+        assert_eq!(no_secrets["isBot"], json!(false));
+        assert_eq!(no_secrets["isCat"], json!(false));
+        // user_profile row: verifiedLinks + noCrawle no longer hardcoded
+        assert_eq!(no_secrets["verifiedLinks"], json!(["https://example.com"]));
+        // counts: public visibility keeps the real user-row counter
+        assert_eq!(no_secrets["followersCount"], json!(7));
+        assert_eq!(no_secrets["followingCount"], json!(5));
+        assert_eq!(no_secrets["notesCount"], json!(3));
+        // no secrets leak on the not-me shape
+        assert!(no_secrets.get("email").is_none());
+    }
 }
