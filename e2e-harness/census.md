@@ -6,8 +6,13 @@ harness：`vitest.e2e-rs.config.ts` + `global-setup.mts`（spawn misskey-rs + /e
 
 ```
 Test Files  1 failed (1)
-    Tests  104 failed | 75 passed | 1 skipped | 10 todo (190)
+    Tests  100 failed | 79 passed | 1 skipped | 10 todo (190)
+latest: run 39070136324 (commit 799736a~: real getRelation over 5 tables)
+history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations)
 ```
+```
+（第 9-14 轮的线下教训：无真实关系数据时硬编码 relations=false 组会倒退 73 例；
+followedMessage 仅 Me 视图。M2 用真实 getRelation + 条件展开一次性解决。）
 
 ## 关键解锁史
 | 修复 | 收益 |
