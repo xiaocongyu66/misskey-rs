@@ -152,7 +152,7 @@ fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> U
         chat_scope: chat_scope(&row.chat_scope),
         can_chat: true,
         roles: Vec::new(),
-        followed_message: None,
+        followed_message: Some(profile.followed_message.clone()),
         memo: None,
         moderation_note: None,
         two_factor_enabled: None,

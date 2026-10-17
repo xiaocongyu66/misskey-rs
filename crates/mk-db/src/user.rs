@@ -299,6 +299,13 @@ pub struct ProfileUpdate {
     pub following_visibility: Option<String>,
     /// PG enum `user_profile_followersvisibility_enum`; bound as plain string.
     pub followers_visibility: Option<String>,
+    // e2e-parity subset additions (users.ts を書き換える family)
+    pub followed_message: Option<Option<String>>,
+    pub muted_words: Option<serde_json::Value>,
+    pub hard_muted_words: Option<serde_json::Value>,
+    pub muted_instances: Option<serde_json::Value>,
+    pub email_notification_types: Option<serde_json::Value>,
+    pub notification_recieve_config: Option<serde_json::Value>,
 }
 
 /// One dynamically-built SET assignment value. Text/Json/Bool values become
@@ -378,9 +385,9 @@ pub async fn update_profile_subset(
     if let Some(v) = &u.location {
         push_set!("\"location\"", bound SetVal::Text(v.clone()));
     }
-    // birthday is always written: JSON string → value, absent/null → NULL
-    let birthday = u.birthday.clone().unwrap_or_default();
-    push_set!("\"birthday\"", bound SetVal::Text(birthday));
+    if let Some(v) = &u.birthday {
+        push_set!("\"birthday\"", bound SetVal::Text(v.clone()));
+    }
     if let Some(v) = &u.lang {
         push_set!("\"lang\"", bound SetVal::Text(v.clone()));
     }
@@ -394,6 +401,23 @@ pub async fn update_profile_subset(
         // ::text keeps the declared param type string; PG then does the
         // explicit text→jsonb I/O-conversion input.
         sets.push(format!("\"fields\" = ${}::jsonb", vals.len() + 1));
+    }
+    if let Some(v) = &u.followed_message {
+        push_set!("\"followedMessage\"", bound SetVal::Text(v.clone()));
+    }
+    for (col, val) in [
+        ("mutedWords", &u.muted_words),
+        ("hardMutedWords", &u.hard_muted_words),
+        ("mutedInstances", &u.muted_instances),
+        ("emailNotificationTypes", &u.email_notification_types),
+        ("notificationRecieveConfig", &u.notification_recieve_config),
+    ] {
+        if let Some(v) = val {
+            vals.push(SetVal::JsonText(
+                serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
+            ));
+            sets.push(format!("\"{}\" = ${}::jsonb", col, vals.len() + 1));
+        }
     }
     if let Some(v) = u.no_crawle {
         push_set!("\"noCrawle\"", bound SetVal::Bool(v));

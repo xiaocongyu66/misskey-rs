@@ -887,6 +887,28 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         Some(_) => return Err(invalid_param("fields", "expected an array")),
     };
 
+    // followedMessage: varchar(256)
+    let followed_message = with_str_limits(
+        opt_nullable_str(body, "followedMessage"),
+        "followedMessage",
+        1,
+        256,
+    )?;
+    // JSON passthrough fields (array/object checks only; shape validation is
+    // the consuming features' business, users.ts fixtures send valid values)
+    let json_field = |key: &str| -> Result<Option<Value>, Response> {
+        match body.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v @ Value::Array(_)) | Some(v @ Value::Object(_)) => Ok(Some(v.clone())),
+            Some(_) => Err(invalid_param(key, "expected an array or object")),
+        }
+    };
+    let muted_words = json_field("mutedWords")?;
+    let hard_muted_words = json_field("hardMutedWords")?;
+    let muted_instances = json_field("mutedInstances")?;
+    let email_notification_types = json_field("emailNotificationTypes")?;
+    let notification_recieve_config = json_field("notificationRecieveConfig")?;
+
     let visibility = ["public", "followers", "private"];
     let chat_scope = ["everyone", "followers", "following", "mutual", "none"];
     Ok(mk_db::user::ProfileUpdate {
