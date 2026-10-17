@@ -2027,6 +2027,7 @@ async fn social_renote_flow() {
 }
 
 // ============================================================================
+// ============================================================================
 // admin/* family (M2 slice, api/admin.rs): suspend/unsuspend (+moderation
 // log + follow-request purge + list exclusion), show-user / show-users, and
 // the meta/server-info/stats facades. Auth: e2e upstream signs `root` first
@@ -2151,15 +2152,470 @@ async fn admin_suspend_unsuspend_family() {
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
     assert_eq!(b, Value::Null);
 
-    // DB effects: isSuspended flip + moderation log entry ([repair:
-    // social-agent] the inherited tail was a non-compiling placeholder —
-    // `chrono_compat()` — swapped for the truthful DB asserts the comment
-    // describes; original agent, please extend with updatedAt/log details).
+    // DB effects: isSuspended flip + updatedAt bump + follow-request purge
+    let (suspended, has_updated_at): (bool, bool) = mk_db::sqlx::query_as(
+        r#"SELECT "isSuspended", "updatedAt" IS NOT NULL FROM "user" WHERE "id" = $1"#,
+    )
+    .bind(&victim_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((suspended, has_updated_at), (true, true));
+
+    let fr: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "follow_request" WHERE "followeeId" = $1 OR "followerId" = $1"#,
+    )
+    .bind(&victim_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fr, 0, "postSuspend purges follow requests both directions");
+
+    let logs: Vec<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "type" FROM "moderation_log" WHERE "userId" = $1"#)
+            .bind(&root_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(logs, vec!["suspend".to_string()]);
+
+    // (f) users/show by id still returns the suspended user, flag visible
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": victim_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["isSuspended"], json!(true));
+
+    // (g) list gates hide the suspended user (e2e users.ts exclusion-cases)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/search",
+        json!({ "query": "victimsus1" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b.as_array().unwrap().is_empty(), "body: {b}");
+
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/search-by-username-and-host",
+        json!({ "username": "victimsus1", "host": null }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b.as_array().unwrap().is_empty(), "body: {b}");
+
+    let (s, b) = post_json(app.clone(), "/api/users", json!({ "limit": 100 })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(
+        !b.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"].as_str() == Some(victim_id.as_str())),
+        "suspended user excluded from the explore list: {b}"
+    );
+
+    // (h) the root user cannot be suspended (isModerator guard → the plain
+    // Error path becomes 500 INTERNAL_ERROR)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": root_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("5d37dbcb-891e-41ca-a3d6-e690c97775ac")
+    );
+
+    // (i) unsuspend via the canonical name → 204 and state restored
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/unsuspend-user",
+        json!({ "userId": victim_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
     let suspended: bool =
         mk_db::sqlx::query_scalar(r#"SELECT "isSuspended" FROM "user" WHERE "id" = $1"#)
             .bind(&victim_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(suspended);
+    assert!(!suspended);
+    let logs: Vec<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "type" FROM "moderation_log" WHERE "userId" = $1"#)
+            .bind(&root_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(logs, vec!["suspend".to_string(), "unsuspend".to_string()]);
+
+    // search finds the unsuspended user again (fresh updatedAt from the suspend bump)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/search",
+        json!({ "query": "victimsus1" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(
+        b.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"].as_str() == Some(victim_id.as_str())),
+        "body: {b}"
+    );
+
+    // (j) unknown admin name → UNKNOWN_API_ENDPOINT; GET on admin/* → 405
+    // empty (no admin meta allows GET)
+    let (s, b) = post_json(app.clone(), "/api/admin/definitely-not-real", json!({})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("2ca3b769-540a-4f08-9dd5-b5a825b6d0f1")
+    );
+    let (s, b) = get_json(&app, "/api/admin/meta").await;
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED, "body: {b}");
+    assert_eq!(b, Value::Null);
+}
+
+#[tokio::test]
+async fn admin_show_user_and_show_users() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_show").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let vic_a = signup(&app, "showvica").await;
+    let vic_a_id = vic_a["id"].as_str().unwrap().to_string();
+    let vic_b = signup(&app, "showvicb").await;
+    let vic_b_id = vic_b["id"].as_str().unwrap().to_string();
+    let plain = signup(&app, "plainview").await;
+    let plain_token = plain["token"].as_str().unwrap().to_string();
+
+    // follower ordering inputs (direct SQL, like the hashtags fixture)
+    for (uid, n) in [(&vic_a_id, 3i64), (&vic_b_id, 5i64)] {
+        mk_db::sqlx::query(r#"UPDATE "user" SET "followersCount" = $1 WHERE "id" = $2"#)
+            .bind(n)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // --- admin/show-user ---
+    // missing userId → 400 INVALID_PARAM
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-user",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+
+    // unknown target → the plain Error('user not found') path → 500
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-user",
+        json!({ "userId": "zzzzzzzzzzzz", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+
+    // non-moderator caller → 403 (role gate fires before the handler)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-user",
+        json!({ "userId": vic_a_id, "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+
+    // root view: moderation-data keys + the packed user
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-user",
+        json!({ "userId": vic_a_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["user"]["id"], json!(vic_a_id));
+    assert_eq!(b["user"]["username"], json!("showvica"));
+    assert_eq!(b["isSuspended"], json!(false));
+    assert_eq!(b["isModerator"], json!(false));
+    assert_eq!(b["isSilenced"], json!(false));
+    assert_eq!(b["isHibernated"], json!(false));
+    assert_eq!(b["lastActiveDate"], Value::Null);
+    assert_eq!(b["moderationNote"], json!(""));
+    assert_eq!(b["signins"], json!([]));
+    assert_eq!(b["roleAssigns"], json!([]));
+    assert_eq!(b["roles"], json!([]));
+    assert_eq!(b["policies"]["canPublicNote"], json!(true));
+    // secrets flat copies gated off without includeSecrets
+    assert_eq!(b["email"], Value::Null);
+    assert_eq!(b["emailVerified"], json!(false));
+    let user_obj = b["user"].as_object().unwrap();
+    assert!(!user_obj.contains_key("securityKeysList"), "{b}");
+    assert!(!user_obj.contains_key("email"), "{b}");
+
+    // includeSecrets + isAdministrator → upstream pack secrets spread lands
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-user",
+        json!({ "userId": vic_a_id, "i": root_token, "includeSecrets": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let user_obj = b["user"].as_object().unwrap();
+    assert!(user_obj.contains_key("email"), "{b}");
+    assert!(user_obj.contains_key("emailVerified"), "{b}");
+    assert!(user_obj.contains_key("securityKeysList"), "{b}");
+
+    // --- admin/show-users ---
+    // default sort = id ASC; username prefix filter
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "username": "showvic" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![vic_a_id.as_str(), vic_b_id.as_str()], "body: {b}");
+
+    // +follower / -follower sort
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "username": "showvic", "sort": "+follower" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![vic_b_id.as_str(), vic_a_id.as_str()], "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "username": "showvic", "sort": "-follower", "limit": 1, "offset": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![vic_a_id.as_str()], "body: {b}");
+
+    // no suspended users yet → state gate empty
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "state": "suspended" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b.as_array().unwrap().is_empty());
+
+    // state admin/moderator resolve via role assignments only — the root user
+    // is NOT included (upstream getAdministratorIds TODO comment) and fresh
+    // instances have no roles → []
+    for state in ["admin", "moderator", "adminOrModerator"] {
+        let (s, b) = post_json(
+            app.clone(),
+            "/api/admin/show-users",
+            json!({ "i": root_token, "state": state }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {b}");
+        assert!(b.as_array().unwrap().is_empty(), "state {state}: {b}");
+    }
+
+    // suspend vic_b via the admin endpoint, then the state gates split
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": vic_b_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "state": "suspended" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![vic_b_id.as_str()], "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "state": "available", "username": "showvic" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(
+        !b.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"].as_str() == Some(vic_b_id.as_str())),
+        "body: {b}"
+    );
+
+    // non-moderator caller → 403 moderator gate
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
+
+    // invalid sort/limit → 400
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "sort": "+bogus" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/show-users",
+        json!({ "i": root_token, "limit": 0 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_meta_server_info_stats() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_facades").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let _plain = signup(&app, "plainfacade").await;
+
+    // --- admin/meta (requireAdmin) ---
+    // no credential → 401 CREDENTIAL_REQUIRED
+    let (s, b) = post_json(app.clone(), "/api/admin/meta", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("1384574d-a912-4b81-8601-c7b1c4085df1")
+    );
+
+    // unresolved token → 401 AUTHENTICATION_FAILED (before the role gates)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/meta",
+        json!({ "i": "0123456789abcdef" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
+    );
+
+    // fresh instance: schema defaults without a meta row
+    let (s, b) = post_json(app.clone(), "/api/admin/meta", json!({ "i": root_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["disableRegistration"], json!(true));
+    assert_eq!(b["maintainerName"], Value::Null);
+    assert_eq!(b["mascotImageUrl"], json!("/assets/ai.png"));
+    assert_eq!(b["pinnedUsers"], json!([]));
+    assert_eq!(b["enableEmail"], json!(false));
+    assert_eq!(b["notesPerOneAd"], json!(20));
+    assert_eq!(b["policies"]["canPublicNote"], json!(true));
+    // admin-only secret fields are present (the requireAdmin gate is the seal)
+    assert_eq!(b["hcaptchaSecretKey"], Value::Null);
+    assert_eq!(b["swPrivateKey"], Value::Null);
+
+    // plain (non-admin) caller on requireAdmin meta → 403 with the
+    // administrator-gate id (distinct from the moderator-gate id)
+    let plain_token = signup(&app, "plainmeta").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b) = post_json(app.clone(), "/api/admin/meta", json!({ "i": plain_token })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61")
+    );
+
+    // --- admin/server-info (requireModerator) ---
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/server-info",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b["psql"].as_str().unwrap().starts_with("1"), "body: {b}");
+    assert_eq!(b["os"], json!(std::env::consts::OS));
+    assert!(b["mem"]["total"].as_i64().unwrap() > 0, "body: {b}");
+    assert!(
+        b["net"]["interface"].as_str().unwrap().len() > 0,
+        "body: {b}"
+    );
+
+    // --- admin/stats (moderator-gated facade over real row counts) ---
+    let (s, b) = post_json(app.clone(), "/api/admin/stats", json!({ "i": root_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["usersCount"], json!(3));
+    assert_eq!(b["originalUsersCount"], json!(3));
+    assert_eq!(b["notesCount"], json!(0));
+    assert_eq!(b["reactionsCount"], json!(0));
+    assert_eq!(b["driveUsageLocal"], json!(0));
+    assert_eq!(b["instances"], json!(0));
+
+    // plain user on a moderator-gated facade → 403 moderator gate
+    let plain_token = signup(&app, "plainstats").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b) = post_json(app.clone(), "/api/admin/stats", json!({ "i": plain_token })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
 }
