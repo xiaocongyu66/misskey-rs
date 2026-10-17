@@ -48,6 +48,12 @@ jobs:
       - name: Build backend
         run: pnpm --filter backend build
         working-directory: upstream
+      - name: Create built/meta.json (normally from build-pre)
+        run: |
+          mkdir -p built
+          node -e "console.log(JSON.stringify({ version: require('./package.json').version }))" > built/meta.json
+          cat built/meta.json
+        working-directory: upstream
       - name: Run upstream migrations and dump schema
         env:
           PGPASSWORD: postgres
