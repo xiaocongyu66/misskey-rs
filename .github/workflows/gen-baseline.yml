@@ -1,0 +1,58 @@
+name: gen-baseline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: misskey-dev/misskey
+          ref: ea2c3aedc70ac87db3720a58f990dfaf301de6d9
+          path: upstream
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+        working-directory: upstream
+      - name: Install deps
+        run: pnpm install
+        working-directory: upstream
+      - name: Build backend
+        run: pnpm --filter backend build
+        working-directory: upstream
+      - name: Run upstream migrations and dump schema
+        env:
+          PGPASSWORD: postgres
+        run: bash tools/gen-baseline.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baseline-schema
+          path: crates/mk-db/migrations/0001_init.sql
