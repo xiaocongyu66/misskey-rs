@@ -179,16 +179,6 @@ fn detailed(
         two_factor_enabled: None,
         use_password_less_login: None,
         security_keys: None,
-        is_following: None,
-        is_followed: None,
-        has_pending_follow_request_from_you: None,
-        has_pending_follow_request_to_you: None,
-        is_blocking: None,
-        is_blocked: None,
-        is_muted: None,
-        is_renote_muted: None,
-        notify: None,
-        with_replies: None,
     }
 }
 
