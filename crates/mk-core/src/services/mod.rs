@@ -2,6 +2,7 @@
 
 pub mod misc;
 pub mod role;
+pub mod search_bridge;
 pub mod signup;
 pub mod user_pack;
 
