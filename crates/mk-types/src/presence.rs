@@ -18,6 +18,7 @@ pub type Nullable<T> = Option<T>;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use serde::Serialize;
     use serde_json::json;
 
