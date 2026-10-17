@@ -105,10 +105,13 @@ async fn signup_roundtrip() {
     }
     assert_eq!(body["email"], Value::Null);
     assert_eq!(body["emailVerified"], json!(false));
-    for absent in ["isBot", "instance", "isFollowing"] {
+    for absent in ["instance", "isFollowing"] {
         assert!(!obj.contains_key(absent), "{absent} must be absent");
     }
     assert!(body["avatarUrl"].as_str().unwrap().contains("/identicon/"));
+    assert_eq!(body["isBot"], json!(false));
+    assert_eq!(body["isCat"], json!(false));
+    assert!(body.as_object().unwrap().contains_key("avatarBlurhash"));
     assert_eq!(body["isExplorable"], json!(true));
     assert_eq!(body["autoAcceptFollowed"], json!(true));
 }

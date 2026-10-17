@@ -103,11 +103,11 @@ fn detailed(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>) -> U
             avatar_url: avatar_url(row, ctx),
             avatar_blurhash: row.avatar_blurhash.clone(),
             avatar_decorations: decorations(&row.avatar_decorations),
-            is_bot: None,
-            is_cat: None,
-            require_signin_to_view_contents: Some(false),
-            make_notes_followers_only_before: None,
-            make_notes_hidden_before: None,
+            is_bot: Some(false),
+            is_cat: Some(false),
+            require_signin_to_view_contents: None, // upstream: ===false ? undefined : true
+            make_notes_followers_only_before: None, // ?? undefined → DB null omits
+            make_notes_hidden_before: None,        // ?? undefined → DB null omits
             instance: None,
             emojis: Default::default(),
             online_status: online_status(row),
@@ -360,11 +360,11 @@ pub fn user_lite_value(
         avatar_url: avatar_url(row, ctx),
         avatar_blurhash: row.avatar_blurhash.clone(),
         avatar_decorations: decorations(&row.avatar_decorations),
-        is_bot: None,
-        is_cat: None,
-        require_signin_to_view_contents: Some(false),
-        make_notes_followers_only_before: None,
-        make_notes_hidden_before: None,
+        is_bot: Some(false),
+        is_cat: Some(false),
+        require_signin_to_view_contents: None, // upstream: ===false ? undefined : true
+        make_notes_followers_only_before: None, // ?? undefined → DB null omits
+        make_notes_hidden_before: None,        // ?? undefined → DB null omits
         instance: None,
         emojis: Default::default(),
         online_status: OnlineStatus::Unknown,

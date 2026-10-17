@@ -134,13 +134,13 @@ pub fn me_detailed_fresh(
         username: outcome.username.clone(),
         host: None,
         avatar_url,
-        avatar_blurhash: None,
+        avatar_blurhash: Some(None),
         avatar_decorations: Vec::new(),
-        is_bot: None,
-        is_cat: None,
-        require_signin_to_view_contents: Some(false),
-        make_notes_followers_only_before: None,
-        make_notes_hidden_before: None,
+        is_bot: Some(false),
+        is_cat: Some(false),
+        require_signin_to_view_contents: None, // upstream: ===false ? undefined : true
+        make_notes_followers_only_before: None, // ?? undefined → DB null omits
+        make_notes_hidden_before: None,        // ?? undefined → DB null omits
         instance: None,
         emojis: Default::default(),
         online_status: OnlineStatus::Unknown,
