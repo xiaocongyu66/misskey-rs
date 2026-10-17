@@ -671,3 +671,119 @@ async fn signup_ignores_bot_and_cat_params() {
             .unwrap();
     assert_eq!((is_bot, is_cat), (false, false));
 }
+/// hashtags/users (upstream endpoints/hashtags/users.ts + e2e users.ts
+/// ハッシュタグ family): hashtags posted in note text are harvested into
+/// user.tags (lowercased, extract_hashtags), the queried tag is normalized
+/// case-insensitively (normalizeForSearch), sort '+follower' orders by
+/// followersCount DESC (and '-follower' ASC), and origin defaults to 'local'.
+#[tokio::test]
+async fn hashtags_users_tag_normalization_and_sort() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkhashtagsusers").await;
+    let suffix = mk_types::id::gen_aid_now().to_lowercase();
+    let uname_a = format!("htaga{suffix}");
+    let uname_b = format!("htagb{suffix}");
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let a = signup(&app, &uname_a).await;
+    let b = signup(&app, &uname_b).await;
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let b_token = b["token"].as_str().unwrap().to_string();
+
+    // followersCount inputs (following/create lands later); set directly like
+    // signin_flow's direct SQL access.
+    for (uid, n) in [(&a_id, 2i64), (&b_id, 1i64)] {
+        mk_db::sqlx::query(r#"UPDATE "user" SET "followersCount" = $1 WHERE "id" = $2"#)
+            .bind(n)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Notes carry hashtags into user.tags. b's tag text is mixed-case on
+    // purpose: storage must store 'htagtwo' normalized.
+    for (token, text) in [
+        (a["token"].as_str().unwrap(), "#htagone tail"),
+        (&b_token, "#htagtWO x"),
+        (&b_token, "#htagone more"),
+    ] {
+        let (s, body) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": text, "i": token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {body}");
+    }
+    // tags persisted, normalized (a: htagone; b: htagtwo then htagone)
+    let rows: Vec<(String, Vec<String>)> =
+        mk_db::sqlx::query_as(r#"SELECT "id", "tags" FROM "user" WHERE "id" = ANY($1::varchar[])"#)
+            .bind(vec![a_id.clone(), b_id.clone()])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    let mut tags_by_id = std::collections::BTreeMap::new();
+    for (id, tags) in rows {
+        tags_by_id.insert(id, tags);
+    }
+    assert_eq!(tags_by_id[&a_id], vec!["htagone".to_string()]);
+    assert_eq!(
+        tags_by_id[&b_id],
+        vec!["htagtwo".to_string(), "htagone".to_string()]
+    );
+
+    // ?tag normalized case-insensitively ('HTAGONE' ~ 'htagone'); both users
+    // carry it; '+follower' = followersCount DESC → [a(2), b(1)]
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/hashtags/users",
+        json!({ "tag": "HTAGONE", "sort": "+follower", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![a_id.as_str(), b_id.as_str()], "body: {body}");
+
+    // '-follower' = followersCount ASC → reversed
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/hashtags/users",
+        json!({ "tag": "htagone", "sort": "-follower", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![b_id.as_str(), a_id.as_str()], "body: {body}");
+
+    // mixed-case query hits the normalized stored tag 'htagtwo' → only b
+    let (s, body) = post_json(
+        app,
+        "/api/hashtags/users",
+        json!({ "tag": "htagtWO", "sort": "+follower", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![b_id.as_str()], "body: {body}");
+}

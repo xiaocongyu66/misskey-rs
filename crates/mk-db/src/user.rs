@@ -642,7 +642,14 @@ pub async fn search_users(
 }
 
 /// `endpoints/hashtags/users.ts`: tag membership via array containment.
-/// sort signs mirror upstream's switch (column + direction).
+/// The queried tag is normalized like upstream `normalizeForSearch`
+/// (NFKC + lowercase; we apply lowercase, matching how tags are stored —
+/// `extract_hashtags` lowercases on the note path). Sort signs mirror
+/// upstream's switch, including `+updatedAt`/`-updatedAt` ordering by the
+/// `updatedAt` column (PG default NULLS placement, like TypeORM's plain
+/// ORDER BY). `state: alive` is upstream's plain `updatedAt > now - 5d` —
+/// NULL updatedAt fails that comparison, so those rows are excluded.
+/// `origin` defaults to 'local' per the upstream paramDef.
 pub async fn users_by_tag(
     pool: &PgPool,
     tag: &str,
@@ -655,11 +662,13 @@ pub async fn users_by_tag(
     let (col, dir) = match sort {
         "+follower" => ("followersCount", "DESC"),
         "-follower" => ("followersCount", "ASC"),
-        "+createdAt" | "-createdAt" | "+updatedAt" | "-updatedAt" => {
-            ("id", if sort.starts_with('+') { "DESC" } else { "ASC" })
-        }
+        "+createdAt" => ("id", "DESC"),
+        "-createdAt" => ("id", "ASC"),
+        "+updatedAt" => ("updatedAt", "DESC"),
+        "-updatedAt" => ("updatedAt", "ASC"),
         _ => ("id", "DESC"),
     };
+    let tag = tag.to_lowercase();
     let mut sql = format!(
         r#"SELECT {} FROM "user"
            WHERE "tags" @> ARRAY[$1::varchar]
@@ -667,12 +676,13 @@ pub async fn users_by_tag(
         LOCAL_USER_COLS
     );
     if state == Some("alive") {
-        sql.push_str(r#" AND ("user"."updatedAt" > now() - interval '5 days' OR "user"."updatedAt" IS NULL)"#);
+        sql.push_str(r#" AND "user"."updatedAt" > now() - interval '5 days'"#);
     }
     sql.push_str(match origin {
-        Some("local") => r#" AND "host" IS NULL"#,
         Some("remote") => r#" AND "host" IS NOT NULL"#,
-        _ => "",
+        Some("combined") => "",
+        // paramDef default: origin: 'local'
+        _ => r#" AND "host" IS NULL"#,
     });
     sql.push_str(&format!(
         r#" ORDER BY "{}" {} LIMIT {} OFFSET {}"#,
