@@ -14,7 +14,7 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     sqlx::query(
         r#"
         INSERT INTO "note" ("id", "text", "userId", "localOnly", "renoteCount", "repliesCount", "reactions", "visibility", "fileIds", "attachedFileTypes", "visibleUserIds", "mentions", "emojis", "tags", "hasPoll", "pageCount")
-        VALUES ($1, $2, $3, FALSE, 0, 0, '{}'::jsonb, $4::note_visibility_enum, '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::jsonb, '{}'::varchar[], FALSE, 0)
+        VALUES ($1, $2, $3, FALSE, 0, 0, '{}'::jsonb, $4::note_visibility_enum, '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], FALSE, 0)
         "#,
     )
     .bind(n.id)
