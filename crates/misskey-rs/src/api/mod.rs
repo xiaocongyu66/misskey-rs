@@ -68,6 +68,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "users/search"
         || name == "users/search-by-username-and-host"
         || name == "hashtags/users"
+        || name == "users"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -102,6 +103,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "hashtags/users" {
             return hashtags_users(&state, &body, token).await;
+        }
+        if name == "users" {
+            return users_list(&state, &body, token).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -1079,6 +1083,59 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         )),
     )
         .into_response()
+}
+
+/// `POST /api/users` — explorable-user list with the sort/state/origin matrix.
+async fn users_list(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = resolve_me(pool, token.as_deref()).await;
+    let sort = body.get("sort").and_then(|v| v.as_str());
+    let state_p = body.get("state").and_then(|v| v.as_str());
+    let origin = body
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .or(Some("local"));
+    let hostname = body
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 100);
+    let offset = body
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+
+    let rows = match mk_db::user::users_explore(
+        pool,
+        sort,
+        state_p,
+        origin,
+        hostname.as_deref(),
+        me_id.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "users_explore");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(json!(packed))).into_response()
 }
 
 /// `POST /api/hashtags/users` — tag membership + sort/state/origin switch.

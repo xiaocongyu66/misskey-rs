@@ -671,3 +671,71 @@ pub async fn users_by_tag(
         .fetch_all(pool)
         .await
 }
+
+/// `endpoints/users.ts` (explore list). Mirrors the sort/state/origin switch,
+/// `isExplorable` + not-suspended gates, hostname exact match, and the
+/// nested-per-user exclusions for muted/blocking relations when a me is set.
+pub async fn users_explore(
+    pool: &PgPool,
+    sort: Option<&str>,
+    state: Option<&str>,
+    origin: Option<&str>,
+    hostname: Option<&str>,
+    me_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LocalUserRow>, sqlx::Error> {
+    let (col, dir) = match sort {
+        Some("+follower") => ("followersCount", "DESC"),
+        Some("-follower") => ("followersCount", "ASC"),
+        Some("+createdAt") => ("id", "DESC"),
+        Some("-createdAt") => ("id", "ASC"),
+        Some("+updatedAt") | Some("-updatedAt") => (
+            "updatedAt",
+            if sort == Some("+updatedAt") {
+                "DESC"
+            } else {
+                "ASC"
+            },
+        ),
+        _ => ("id", "ASC"),
+    };
+    let updated_at_gate = matches!(sort, Some("+updatedAt") | Some("-updatedAt"));
+    let mut sql = format!(
+        r#"SELECT {} FROM "user"
+           WHERE "isExplorable" = TRUE
+             AND "isSuspended" = FALSE"#,
+        LOCAL_USER_COLS
+    );
+    if updated_at_gate {
+        sql.push_str(r#" AND "user"."updatedAt" IS NOT NULL"#);
+    }
+    if state == Some("alive") {
+        sql.push_str(r#" AND "user"."updatedAt" > now() - interval '5 days'"#);
+    }
+    sql.push_str(match origin {
+        Some("local") => r#" AND "host" IS NULL"#,
+        Some("remote") => r#" AND "host" IS NOT NULL"#,
+        _ => "",
+    });
+    // $1 = hostname (null ⇒ no filter), $2 = me (null ⇒ no exclusions);
+    // both bound, never interpolated — hostname is user input.
+    sql.push_str(r#" AND ($1::text IS NULL OR "host" = lower($1))"#);
+    sql.push_str(
+        r#" AND ($2::text IS NULL OR "user"."id" NOT IN
+              (SELECT "muteeId" FROM "muting" WHERE "muterId" = $2))"#,
+    );
+    sql.push_str(
+        r#" AND ($2::text IS NULL OR "user"."id" NOT IN
+              (SELECT "blockeeId" FROM "blocking" WHERE "blockerId" = $2))"#,
+    );
+    sql.push_str(&format!(
+        r#" ORDER BY "{}" {} LIMIT {} OFFSET {}"#,
+        col, dir, limit, offset
+    ));
+    sqlx::query_as::<_, LocalUserRow>(&sql)
+        .bind(hostname)
+        .bind(me_id)
+        .fetch_all(pool)
+        .await
+}
