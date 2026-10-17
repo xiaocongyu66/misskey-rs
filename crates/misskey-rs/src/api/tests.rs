@@ -2426,7 +2426,8 @@ async fn admin_show_user_and_show_users() {
         .iter()
         .map(|u| u["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec![vic_a_id.as_str()], "body: {b}");
+    // followersCount ASC over [a(3), b(5)]; offset 1 skips a → b
+    assert_eq!(ids, vec![vic_b_id.as_str()], "body: {b}");
 
     // no suspended users yet → state gate empty
     let (s, b) = post_json(
