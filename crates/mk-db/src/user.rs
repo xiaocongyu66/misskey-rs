@@ -574,9 +574,9 @@ pub async fn search_users(
     // pass 1: name / username (a token that starts with '@' prefixes the
     // username match; any valid-local-username token also matches mid-string)
     let uname_sub: String = if query.starts_with('@') {
-        sql_like_escape(query.trim_start_matches('@').to_lowercase())
+        sql_like_escape(query.trim_start_matches('@').to_lowercase().as_str())
     } else {
-        sql_like_escape(query.to_lowercase())
+        sql_like_escape(query.to_lowercase().as_str())
     };
     let uname_pattern = if query.starts_with('@') {
         format!("{}%", uname_sub)
