@@ -111,6 +111,23 @@ pub async fn touch_token_last_used(pool: &PgPool, token: &str) -> Result<(), sql
     Ok(())
 }
 
+/// endpoints/i.ts: `loggedInDates` gains today's date (`y/m/d`, once per day)
+/// before the profile is packed.
+pub async fn append_logged_in_date(
+    pool: &PgPool,
+    user_id: &str,
+    today: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "user_profile" SET "loggedInDates" = array_append("loggedInDates", $1::varchar) WHERE "userId" = $2"#,
+    )
+    .bind(today)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// e2e harness reset: truncate every public table (incl. identities) but
 /// keep the schema (and sqlx's migration bookkeeping state semantics: the
 /// bookkeeping table is truncated too — migrations are already applied).

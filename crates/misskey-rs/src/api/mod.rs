@@ -59,7 +59,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
 
     // Registry endpoints that need a JSON body parsed before dispatch.
-    if name == "users/show" || name == "signin" {
+    if name == "users/show" || name == "signin" || name == "i" {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
@@ -72,6 +72,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "signin" {
             let _ = token;
             return signin_route(&state, &body).await;
+        }
+        if name == "i" {
+            return i_route(&state, &body, &headers, token).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -456,19 +459,7 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
         return api_err(ApiError::internal_error());
     };
 
-    let me_id: Option<String> = match token.as_deref() {
-        Some(t) if t.len() == 16 => {
-            let r = mk_db::user::find_local_user_id_by_token(pool, t).await;
-            match r {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(target: "dbg_users_show", error = %e, "find_local_user_id_by_token");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
+    let me_id: Option<String> = resolve_me(pool, token.as_deref()).await;
 
     let ctx = mk_core::services::user_pack::InstanceCtx {
         url: &state.config.url,
@@ -554,6 +545,175 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
         )),
     )
         .into_response()
+}
+
+/// Shared me-id resolution from a token: only native user tokens (length 16,
+/// `misc/token.ts isNativeUserToken`) are matched against `user.token` for
+/// local users; anything else resolves to "not me" (DB errors are logged).
+async fn resolve_me(pool: &mk_db::sqlx::PgPool, token: Option<&str>) -> Option<String> {
+    let Some(t) = token else {
+        return None;
+    };
+    if t.len() != 16 {
+        return None;
+    }
+    match mk_db::user::find_local_user_id_by_token(pool, t).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_resolve_me", error = %e, "find_local_user_id_by_token");
+            None
+        }
+    }
+}
+
+/// `POST /api/i` — requireCredential endpoint returning the caller's
+/// MeDetailed. Auth gating mirrors `ApiCallService.call()`: no token →
+/// CREDENTIAL_REQUIRED (401); unresolvable token → AUTHENTICATION_FAILED
+/// (401, from AuthenticateService's AuthenticationError); suspended →
+/// YOUR_ACCOUNT_SUSPENDED (403). The endpoint body is `endpoints/i.ts`.
+async fn i_route(
+    state: &AppState,
+    body: &Value,
+    headers: &axum::http::HeaderMap,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+
+    // Upstream handleRequest: a non-string `i` (with no Bearer taking
+    // precedence) → `reply.code(400)` with an empty body.
+    let has_bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.starts_with("Bearer "))
+        .unwrap_or(false);
+    if !has_bearer {
+        if let Some(v) = body.get("i") {
+            if v.as_str().is_none() {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    }
+
+    let credential_required = || {
+        api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CREDENTIAL_REQUIRED",
+            "1384574d-a912-4b81-8601-c7b1c4085df1",
+            "Credential required.",
+        ))
+    };
+    let auth_failed = || {
+        api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "AUTHENTICATION_FAILED",
+            "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
+            "Authentication failed. Please ensure your token is correct.",
+        ))
+    };
+
+    // AuthenticateService: token absent → [null, null] user; present token
+    // that matches no user (native shape) → AuthenticationError.
+    let Some(token) = token else {
+        return credential_required();
+    };
+    if token.len() != 16 {
+        // Non-native tokens go through the access-token/app lookup, which M1
+        // does not implement — same 401 as upstream's invalid signature path.
+        return auth_failed();
+    }
+    let Some(me_id) = resolve_me(pool, Some(token.as_str())).await else {
+        return auth_failed();
+    };
+
+    let row = match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_i", error = %e, "find_user_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let Some(row) = row else {
+        return auth_failed();
+    };
+
+    // call(): requireCredential suspended gate.
+    if row.is_suspended {
+        return api_err(ApiError::new(
+            403,
+            mk_types::api_error::ApiErrorKind::Permission,
+            "YOUR_ACCOUNT_SUSPENDED",
+            "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+            "Your account has been suspended.",
+        ));
+    }
+
+    let mut profile = match mk_db::user::find_profile(pool, &row.id).await {
+        Ok(p) => p,
+        Err(mk_db::sqlx::Error::RowNotFound) => {
+            // endpoint body: userProfile == null → USER_IS_DELETED
+            return api_err(ApiError::new(
+                403,
+                mk_types::api_error::ApiErrorKind::Permission,
+                "USER_IS_DELETED",
+                "e5b3b9f0-2b8f-4b9f-9c1f-8c5c1b2e1b1a",
+                "User is deleted.",
+            ));
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_i", error = %e, "find_profile");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    // i.ts: append today to loggedInDates (once per day) before packing.
+    let today = js_today();
+    if !profile.logged_in_dates.contains(&today) {
+        profile.logged_in_dates.push(today.clone());
+        // Upstream awaits this update inside the handler; a failure is logged
+        // and the response still reflects the in-memory append.
+        if let Err(err) = mk_db::user::append_logged_in_date(pool, &row.id, &today).await {
+            tracing::error!(target: "dbg_i", error = %err, "append_logged_in_date");
+        }
+    }
+
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(mk_core::services::user_pack::pack_inline(
+            &row, &profile, true, ctx,
+        )),
+    )
+        .into_response()
+}
+
+/// i.ts `today`: `${getFullYear()}/${getMonth() + 1}/${getDate()}` (unpadded).
+/// JS `Date` uses server-local time; we use UTC (civil_from_days, the same
+/// Howard Hinnant algorithm as `ms_to_iso`).
+fn js_today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}/{m}/{d}")
 }
 
 #[cfg(test)]

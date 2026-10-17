@@ -272,3 +272,55 @@ async fn users_show_variant() {
         json!("4362f8dc-731f-4ad8-a694-be5a88922a24")
     );
 }
+
+#[tokio::test]
+async fn i_endpoint() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_endpoint").await;
+    let username = format!("erin{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_id = me["id"].as_str().unwrap().to_string();
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    // valid token → MeDetailed for the caller
+    let (s1, b1) = post_json(app.clone(), "/api/i", json!({ "i": my_token })).await;
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    assert_eq!(b1["id"], json!(my_id));
+    assert_eq!(b1["username"], username.as_str());
+    assert_eq!(b1["avatarId"], Value::Null);
+    assert_eq!(b1["twoFactorEnabled"], json!(false));
+    assert_eq!(b1["email"], Value::Null);
+    // includeSecrets (native token, no app) → secrets present
+    assert_eq!(b1["emailVerified"], json!(false));
+    assert!(b1.as_object().unwrap().contains_key("securityKeysList"));
+    // loggedInDates gained today (upstream i.ts side effect)
+    assert_eq!(b1["loggedInDays"], json!(1));
+
+    // missing `i` → 401 CREDENTIAL_REQUIRED (call() credential gate)
+    let (s2, b2) = post_json(app.clone(), "/api/i", json!({})).await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED);
+    assert_eq!(b2["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+    assert_eq!(
+        b2["error"]["id"],
+        json!("1384574d-a912-4b81-8601-c7b1c4085df1")
+    );
+
+    // garbage native-shaped token (len 16, no user) → 401 AUTHENTICATION_FAILED
+    let (s3, b3) = post_json(app.clone(), "/api/i", json!({ "i": "0123456789abcdef" })).await;
+    assert_eq!(s3, StatusCode::UNAUTHORIZED);
+    assert_eq!(b3["error"]["code"], json!("AUTHENTICATION_FAILED"));
+    assert_eq!(
+        b3["error"]["id"],
+        json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
+    );
+
+    // non-string `i` → 400 with an empty body (upstream handleRequest)
+    let (s4, b4) = post_json(app, "/api/i", json!({ "i": 42 })).await;
+    assert_eq!(s4, StatusCode::BAD_REQUEST);
+    assert_eq!(b4, Value::Null);
+}
