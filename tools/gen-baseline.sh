@@ -36,6 +36,6 @@ pg_dump --schema-only --no-owner --no-privileges \
     --exclude-table=public.migrations \
     --exclude-table=public.migrations_id_seq \
     -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE" \
-    | awk 'substr($0,1,1) != "\\" { print }' \
+    | awk 'substr($0,1,1) != "\\" && index($0, "set_config(\'search_path\'") == 0 { print }' \
     > ../crates/mk-db/migrations/0001_init.sql
 echo "schema lines: $(wc -l < ../crates/mk-db/migrations/0001_init.sql)"
