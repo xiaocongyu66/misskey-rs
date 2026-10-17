@@ -1133,7 +1133,7 @@ async fn pack_note(
     let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
-    let mentions = row
+    let mentions: Vec<String> = row
         .mentions
         .as_array()
         .map(|a| {
@@ -1142,7 +1142,7 @@ async fn pack_note(
                 .collect()
         })
         .unwrap_or_default();
-    let tags = row
+    let tags: Vec<String> = row
         .tags
         .as_array()
         .map(|a| {
