@@ -726,6 +726,19 @@ async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
         v
     };
 
+    // json! handles `{ ... }` in value position as a JSON object, so Rust
+    // block expressions must be computed BEFORE the macro.
+    let mascot_image_url = {
+        // upstream default '/assets/ai.png' (MiMeta column default)
+        let v = col("mascotImageUrl");
+        if v.is_null() {
+            json!("/assets/ai.png")
+        } else {
+            v
+        }
+    };
+    let translator_available = !col("deeplAuthKey").is_null(); // deeplAuthKey != null
+
     let resp = json!({
         "maintainerName": col("maintainerName"),
         "maintainerEmail": col("maintainerEmail"),
@@ -756,15 +769,7 @@ async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
         "googleAnalyticsMeasurementId": col("googleAnalyticsMeasurementId"),
         "swPublickey": col("swPublicKey"),
         "themeColor": col("themeColor"),
-        "mascotImageUrl": {
-            // upstream default '/assets/ai.png' (MiMeta column default)
-            let v = col("mascotImageUrl");
-            if v.is_null() {
-                json!("/assets/ai.png")
-            } else {
-                v
-            }
-        },
+        "mascotImageUrl": mascot_image_url,
         "bannerUrl": col("bannerUrl"),
         "serverErrorImageUrl": col("serverErrorImageUrl"),
         "infoImageUrl": col("infoImageUrl"),
@@ -779,10 +784,7 @@ async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
         "clientOptions": col_or("clientOptions", json!({})),
         "enableEmail": col_or("enableEmail", json!(false)),
         "enableServiceWorker": col_or("enableServiceWorker", json!(false)),
-        "translatorAvailable": {
-            // deeplAuthKey != null
-            !col("deeplAuthKey").is_null()
-        },
+        "translatorAvailable": translator_available,
         "cacheRemoteFiles": col_or("cacheRemoteFiles", json!(false)),
         "cacheRemoteSensitiveFiles": col_or("cacheRemoteSensitiveFiles", json!(false)),
         "pinnedUsers": col_or("pinnedUsers", json!([])),
