@@ -81,10 +81,16 @@ async fn signup_roundtrip() {
         "createdAt",
         "isExplorable",
         "chatScope",
+        // includeSecrets: true on the signup path
+        "email",
+        "emailVerified",
+        "securityKeysList",
     ] {
         assert!(obj.contains_key(required), "{required} must be present");
     }
-    for absent in ["isBot", "instance", "isFollowing", "email"] {
+    assert_eq!(body["email"], Value::Null);
+    assert_eq!(body["emailVerified"], json!(false));
+    for absent in ["isBot", "instance", "isFollowing"] {
         assert!(!obj.contains_key(absent), "{absent} must be absent");
     }
     assert!(body["avatarUrl"].as_str().unwrap().contains("/identicon/"));
