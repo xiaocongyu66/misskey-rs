@@ -1596,11 +1596,12 @@ async fn social_mute_flow_and_search_exclusion() {
         json!("7e7359cb-160c-4956-b08f-4d1c653cd007")
     );
 
-    // past expiresAt → silent no-op (204, no row)
+    // past expiresAt → silent no-op (204, no row): b mutes a with a stale
+    // timestamp
     let (s, _) = post_json(
         app.clone(),
         "/api/mute/create",
-        json!({ "userId": b_id, "i": b_token, "expiresAt": 1 }),
+        json!({ "userId": a_id, "i": b_token, "expiresAt": 1 }),
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
