@@ -1577,11 +1577,19 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
     }
 
     // paramDef: limit minimum 1, maximum 100, default 10.
-    let limit = opt_int_param(body, "limit")?.unwrap_or(10).clamp(1, 100);
-    let since_id = opt_id_param(body, "sinceId")?;
-    let until_id = opt_id_param(body, "untilId")?;
-    let mark_as_read = opt_bool(body, "markAsRead")?.unwrap_or(true);
-    let unread_only = opt_bool(body, "unreadOnly")?.unwrap_or(false);
+    // Helpers return Result<_, Response>; this handler returns Response, so
+    // parse in a scoped block and match.
+    let (limit, since_id, until_id, mark_as_read, unread_only) = {
+        let limit = opt_int_param(body, "limit").map(|v| v.unwrap_or(10).clamp(1, 100));
+        let since_id = opt_id_param(body, "sinceId").map(|v| v.map(String::from));
+        let until_id = opt_id_param(body, "untilId").map(|v| v.map(String::from));
+        let mark_as_read = opt_bool(body, "markAsRead").map(|v| v.unwrap_or(true));
+        let unread_only = opt_bool(body, "unreadOnly").map(|v| v.unwrap_or(false));
+        match (limit, since_id, until_id, mark_as_read, unread_only) {
+            (Ok(l), Ok(s), Ok(u), Ok(m), Ok(r)) => (l, s, u, m, r),
+            (Err(resp), ..) | (.., Err(resp)) => return *resp,
+        }
+    };
     let include_types: Vec<String> = match body.get("includeTypes") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a
