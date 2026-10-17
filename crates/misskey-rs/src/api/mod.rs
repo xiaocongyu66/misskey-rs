@@ -1578,7 +1578,7 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
 
     // paramDef: limit minimum 1, maximum 100, default 10.
     // Helpers return Result<_, Response>; this handler returns Response, so
-    // parse in a scoped block and match.
+    // parse in a scoped block and unwrap the first error (lease-safe: no `?`).
     let (limit, since_id, until_id, mark_as_read, unread_only) = {
         let limit = opt_int_param(body, "limit").map(|v| v.unwrap_or(10).clamp(1, 100));
         let since_id = opt_id_param(body, "sinceId").map(|v| v.map(String::from));
@@ -1587,7 +1587,11 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
         let unread_only = opt_bool(body, "unreadOnly").map(|v| v.unwrap_or(false));
         match (limit, since_id, until_id, mark_as_read, unread_only) {
             (Ok(l), Ok(s), Ok(u), Ok(m), Ok(r)) => (l, s, u, m, r),
-            (Err(resp), ..) | (.., Err(resp)) => return *resp,
+            (Err(resp), _, _, _, _)
+            | (_, Err(resp), _, _, _)
+            | (_, _, Err(resp), _, _)
+            | (_, _, _, Err(resp), _)
+            | (_, _, _, _, Err(resp)) => return resp,
         }
     };
     let include_types: Vec<String> = match body.get("includeTypes") {
@@ -1610,8 +1614,8 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
     let rows = match mk_db::notification::list_notifications(
         pool,
         &me_id,
-        since_id,
-        until_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
         limit,
         unread_only,
         &include_types,
