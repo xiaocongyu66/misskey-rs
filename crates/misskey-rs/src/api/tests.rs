@@ -236,7 +236,12 @@ async fn users_show_variant() {
     assert_eq!(b2["injectFeaturedNote"], json!(true));
 
     // by username, unauthenticated
-    let (s3, b3) = post_json(app, "/api/users/show", json!({ "username": username })).await;
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "username": username }),
+    )
+    .await;
     assert_eq!(s3, StatusCode::OK);
     assert_eq!(b3["id"], json!(my_id));
 
