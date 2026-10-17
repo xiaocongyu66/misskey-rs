@@ -134,7 +134,7 @@ pub fn me_detailed_fresh(
         username: outcome.username.clone(),
         host: None,
         avatar_url,
-        avatar_blurhash: Some(None),
+        avatar_blurhash: None,
         avatar_decorations: Vec::new(),
         is_bot: Some(false),
         is_cat: Some(false),

@@ -355,7 +355,7 @@ mod tests {
             username: "alice".to_string(),
             host: None,
             avatar_url: "http://x/identicon/alice".to_string(),
-            avatar_blurhash: Some(None),
+            avatar_blurhash: None,
             avatar_decorations: vec![],
             is_bot: Some(false),
             is_cat: Some(false),
