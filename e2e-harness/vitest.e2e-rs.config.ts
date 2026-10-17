@@ -13,8 +13,8 @@ const backendDir = resolve(import.meta.dirname, '..');
 export default defineConfig({
 	test: {
 		dir: backendDir,
-		include: [process.env.E2E_INCLUDE ?? './test/e2e/users.ts'],
-		globalSetup: resolve(import.meta.dirname, './global-setup.mts'),
+		include: [process.env.E2E_INCLUDE ?? 'test/e2e/users.ts'],
+		globalSetup: resolve(backendDir, './global-setup.mts'),
 		setupFiles: ['./test/setup.e2e.ts'],
 		testTimeout: 60_000,
 		maxWorkers: 1,

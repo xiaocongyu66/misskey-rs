@@ -76,7 +76,7 @@ jobs:
         working-directory: upstream
       - name: Install harness
         run: |
-          cp e2e-harness/global-setup.mts upstream/packages/backend/global-setup-rs.mts
+          cp e2e-harness/global-setup.mts upstream/packages/backend/global-setup.mts
           cp e2e-harness/vitest.e2e-rs.config.ts upstream/packages/backend/vitest.e2e-rs.config.ts
       - name: Run upstream users.ts e2e against misskey-rs
         working-directory: upstream/packages/backend
