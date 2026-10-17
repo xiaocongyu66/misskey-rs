@@ -125,7 +125,7 @@ async fn signup_duplicated_username() {
     assert_eq!(s2, StatusCode::BAD_REQUEST, "body: {b2}");
 }
 
-async fn fresh_pool(db: &str) -> sqlx::PgPool {
+async fn fresh_pool(db: &str) -> mk_db::sqlx::PgPool {
     let pool = mk_db::test_support::fresh_db(db).await;
     mk_db::run_migrations(&pool).await.unwrap();
     pool

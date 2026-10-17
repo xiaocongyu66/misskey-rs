@@ -93,15 +93,6 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // Read endpoints in M0 are unauthenticated; the auth chain drops in at M1
     // here, in ApiCallService order.
 
-    let body: Value = if method == Method::POST {
-        match parse_json_body(req).await {
-            Ok(b) => b,
-            Err(resp) => return resp,
-        }
-    } else {
-        json!({})
-    };
-
     let result: Value = match name.as_str() {
         "ping" => json!({ "pong": now_ms() }),
         "meta" => meta(&state),
