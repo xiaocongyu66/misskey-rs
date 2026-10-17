@@ -18,6 +18,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// In CI (DATABASE_URL provided), verifies the committed baseline applies
     /// cleanly and is idempotent. Locally (no DATABASE_URL) it is a no-op.
     #[tokio::test]

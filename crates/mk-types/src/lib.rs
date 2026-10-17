@@ -4,3 +4,4 @@
 pub mod acct;
 pub mod api_error;
 pub mod id;
+pub mod presence;
