@@ -281,6 +281,10 @@ pub struct ProfileUpdate {
     pub is_explorable: Option<bool>,
     pub hide_online_status: Option<bool>,
     pub chat_scope: Option<String>,
+    /// "user" table booleans (upstream i/update.ts
+    /// `updates.isBot = ps.isBot` / `updates.isCat = ps.isCat`).
+    pub is_bot: Option<bool>,
+    pub is_cat: Option<bool>,
     // "user_profile" table columns
     pub description: Option<Option<String>>,
     pub location: Option<Option<String>>,
@@ -328,7 +332,7 @@ pub async fn update_profile_subset(
     u: &ProfileUpdate,
 ) -> Result<(), sqlx::Error> {
     // --- "user" table: name / isLocked / isExplorable / hideOnlineStatus /
-    // chatScope (upstream `updates`) ---
+    // chatScope / isBot / isCat (upstream `updates`) ---
     let mut cols: Vec<&'static str> = Vec::new();
     let mut vals: Vec<SetVal> = Vec::new();
     if let Some(v) = &u.name {
@@ -350,6 +354,14 @@ pub async fn update_profile_subset(
     if let Some(v) = &u.chat_scope {
         cols.push("\"chatScope\"");
         vals.push(SetVal::Text(Some(v.clone())));
+    }
+    if let Some(v) = u.is_bot {
+        cols.push("\"isBot\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.is_cat {
+        cols.push("\"isCat\"");
+        vals.push(SetVal::Bool(v));
     }
     if !cols.is_empty() {
         let sets: Vec<String> = cols

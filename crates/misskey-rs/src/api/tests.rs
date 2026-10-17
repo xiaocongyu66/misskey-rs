@@ -564,3 +564,113 @@ async fn users_search_family() {
     assert_eq!(b3.as_array().unwrap().len(), 1);
     assert_eq!(b3[0]["username"], json!("searchali"));
 }
+
+// `isBot`/`isCat` are upstream i/update.ts paramDef booleans
+// (`isBot: { type: 'boolean' }, isCat: { type: 'boolean' }`) applied to the
+// "user" table via `updates.isBot = ps.isBot` / `updates.isCat = ps.isCat`
+// (users.ts を書き換えることができる cases with parameters isBot: true/false,
+// isCat: true/false).
+//
+// NOTE(pack): this pins the persist layer only. /api/i still reports
+// isBot/isCat as false because mk-core hardcodes `is_bot: Some(false),
+// is_cat: Some(false)` (packers/user.rs + services/user_pack.rs) and
+// LocalUserRow (mk-db/src/user.rs, another agent's hunk) does not carry the
+// columns yet. Once the pack layer reads "isBot"/"isCat" from the row, the
+// census each-cases pass end-to-end via the already-persisted values.
+#[tokio::test]
+async fn i_update_persists_is_bot_and_is_cat() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_botcat").await;
+    let username = format!("botcat{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_id = me["id"].as_str().unwrap().to_string();
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    let persisted = |pool: &mk_db::sqlx::PgPool, id: &str| {
+        let id = id.to_string();
+        async move {
+            let (is_bot, is_cat): (bool, bool) =
+                mk_db::sqlx::query_as(r#"SELECT "isBot", "isCat" FROM "user" WHERE "id" = $1"#)
+                    .bind(&id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            (is_bot, is_cat)
+        }
+    };
+
+    // fresh signup defaults (signup upstream ignores isBot/isCat outright)
+    assert_eq!(persisted(&pool, &my_id).await, (false, false));
+
+    // set both via i/update → persisted on the "user" table
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "isBot": true, "isCat": true }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    assert_eq!(b1["id"], json!(my_id));
+    assert_eq!(persisted(&pool, &my_id).await, (true, true));
+
+    // partial update: omitted key untouched (upstream `if typeof ps.isBot ===
+    // 'boolean'` guards each assignment)
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "isBot": false }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(persisted(&pool, &my_id).await, (false, true));
+
+    // explicit false roundtrips for isCat too
+    let (s3, b3) = post_json(
+        app,
+        "/api/i/update",
+        json!({ "i": my_token, "isCat": false }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "body: {b3}");
+    assert_eq!(persisted(&pool, &my_id).await, (false, false));
+}
+
+// Upstream signup truth: SignupApiService.signup reads only
+// username/password(+host/invitationCode/emailAddress/captcha) from the body —
+// isBot/isCat are NOT accepted (there is no paramDef; extra keys are dropped),
+// and e2e users.ts asserts fresh signups report isBot === false, isCat ===
+// false. Mirrored here: extra params must be ignored, not rejected nor applied.
+#[tokio::test]
+async fn signup_ignores_bot_and_cat_params() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mksignup_botcat").await;
+    let username = format!("zebot{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test", "isBot": true, "isCat": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["isBot"], json!(false));
+    assert_eq!(body["isCat"], json!(false));
+
+    let my_id = body["id"].as_str().unwrap().to_string();
+    let (is_bot, is_cat): (bool, bool) =
+        mk_db::sqlx::query_as(r#"SELECT "isBot", "isCat" FROM "user" WHERE "id" = $1"#)
+            .bind(&my_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((is_bot, is_cat), (false, false));
+}

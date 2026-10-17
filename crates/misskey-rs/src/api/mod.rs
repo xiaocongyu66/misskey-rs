@@ -968,6 +968,8 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         is_locked: opt_bool(body, "isLocked")?,
         is_explorable: opt_bool(body, "isExplorable")?,
         hide_online_status: opt_bool(body, "hideOnlineStatus")?,
+        is_bot: opt_bool(body, "isBot")?,
+        is_cat: opt_bool(body, "isCat")?,
         chat_scope: opt_enum(body, "chatScope", &chat_scope)?,
         description,
         location,
@@ -997,8 +999,9 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
 
 /// `POST /api/i/update` — requireCredential profile update, M1 subset of
 /// upstream `endpoints/i/update.ts` (name/description/location/birthday/lang/
-/// url/fields + the boolean/visibility switch set; avatar, banner, decorations,
-/// mutedWords, room, pinnedPageId, alsoKnownAs etc. are TODO).
+/// url/fields + the boolean/visibility switch set incl. isBot/isCat; avatar,
+/// banner, decorations, mutedWords, room, pinnedPageId, alsoKnownAs etc. are
+/// TODO).
 async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Response {
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
