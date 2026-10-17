@@ -184,12 +184,6 @@ fn detailed(
             .as_ref()
             .map(|r| r.notify.clone().unwrap_or_else(|| "none".to_string())),
         with_replies: relation.as_ref().map(|r| r.with_replies.unwrap_or(false)),
-        // followedMessage only on the relation view when isFollowing:
-        // schema-marked optional; upstream: isFollowing ? profile value : undefined
-        followed_message: relation
-            .as_ref()
-            .filter(|r| r.is_following)
-            .map(|_| profile.followed_message.clone()),
     }
 }
 
