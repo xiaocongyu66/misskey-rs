@@ -283,6 +283,9 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
 
     if let Some(pool) = &state.pool {
         let username_lower = username.to_lowercase();
+        if let Err(e) = mk_db::user::username_exists_local(pool, &username_lower).await {
+            tracing::error!(target: "dbg_signup", error = %e, "username_exists_local");
+        }
         if let Ok(true) = mk_db::user::username_exists_local(pool, &username_lower).await {
             return reply_plain(400, "DUPLICATED_USERNAME");
         }
@@ -310,7 +313,7 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
             private_key: &outcome.private_key,
         };
         if let Err(err) = mk_db::user::insert_new_user(pool, &new_user).await {
-            tracing::error!(%err, "signup insert failed");
+            tracing::error!(target: "dbg_signup", %err, "signup insert failed");
             return api_err(ApiError::internal_error());
         }
     }
@@ -404,8 +407,12 @@ async fn signin_route(state: &AppState, body: &Value) -> Response {
         return reply_error(403, "e03a5f46-d309-4865-9b69-56282d94e1eb");
     }
 
-    let Ok(profile) = mk_db::user::find_profile(pool, &user.id).await else {
-        return api_err(ApiError::internal_error());
+    let profile = match mk_db::user::find_profile(pool, &user.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_signin", error = %e, "find_profile");
+            return api_err(ApiError::internal_error());
+        }
     };
 
     // password flow: SigninFlowResponse { finished } variants
@@ -450,10 +457,16 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     };
 
     let me_id: Option<String> = match token.as_deref() {
-        Some(t) if t.len() == 16 => mk_db::user::find_local_user_id_by_token(pool, t)
-            .await
-            .ok()
-            .flatten(),
+        Some(t) if t.len() == 16 => {
+            let r = mk_db::user::find_local_user_id_by_token(pool, t).await;
+            match r {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(target: "dbg_users_show", error = %e, "find_local_user_id_by_token");
+                    None
+                }
+            }
+        }
         _ => None,
     };
 
@@ -476,11 +489,20 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     if let Some(ids) = body.get("userIds").and_then(|v| v.as_array()) {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids.iter().filter_map(|v| v.as_str()) {
-            let Some(row) = mk_db::user::find_user_by_id(pool, id).await.ok().flatten() else {
-                continue;
+            let row = match mk_db::user::find_user_by_id(pool, id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(target: "dbg_users_show", error = %e, "find_user_by_id[userIds]");
+                    continue;
+                }
             };
-            let Ok(profile) = mk_db::user::find_profile(pool, &row.id).await else {
-                continue;
+            let Some(row) = row else { continue };
+            let profile = match mk_db::user::find_profile(pool, &row.id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(target: "dbg_users_show", error = %e, "find_profile[userIds]");
+                    continue;
+                }
             };
             let is_me = me_id.as_deref() == Some(row.id.as_str());
             out.push(mk_core::services::user_pack::pack_inline(
@@ -491,12 +513,21 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     }
 
     let row = if let Some(id) = body.get("userId").and_then(|v| v.as_str()) {
-        mk_db::user::find_user_by_id(pool, id).await.ok().flatten()
+        match mk_db::user::find_user_by_id(pool, id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_users_show", error = %e, "find_user_by_id");
+                None
+            }
+        }
     } else if let Some(username) = body.get("username").and_then(|v| v.as_str()) {
-        mk_db::user::find_local_user_by_username(pool, &username.to_lowercase())
-            .await
-            .ok()
-            .flatten()
+        match mk_db::user::find_local_user_by_username(pool, &username.to_lowercase()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_users_show", error = %e, "find_local_user_by_username");
+                None
+            }
+        }
     } else {
         return api_err(ApiError::invalid_param(json!({
             "param": "userId",
@@ -507,8 +538,12 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     let Some(row) = row else {
         return no_such_user();
     };
-    let Ok(profile) = mk_db::user::find_profile(pool, &row.id).await else {
-        return no_such_user();
+    let profile = match mk_db::user::find_profile(pool, &row.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "find_profile");
+            return no_such_user();
+        }
     };
     let is_me = me_id.as_deref() == Some(row.id.as_str());
 
