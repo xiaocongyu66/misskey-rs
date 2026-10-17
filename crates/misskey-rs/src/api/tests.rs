@@ -272,3 +272,99 @@ async fn users_show_variant() {
         json!("4362f8dc-731f-4ad8-a694-be5a88922a24")
     );
 }
+
+#[tokio::test]
+async fn i_update_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate").await;
+    let username = format!("erin{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_id = me["id"].as_str().unwrap().to_string();
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({
+            "description": "hello bio",
+            "location": "Kyoto",
+            "birthday": "2000-01-31",
+            "fields": [{ "name": "site", "value": "https://example.com" }],
+            "followingVisibility": "followers",
+            "chatScope": "following",
+        }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    assert_eq!(b1["id"], json!(my_id));
+    assert_eq!(b1["description"], json!("hello bio"));
+    assert_eq!(b1["location"], json!("Kyoto"));
+    assert_eq!(b1["birthday"], json!("2000-01-31"));
+    assert_eq!(b1["fields"][0]["name"], json!("site"));
+    assert_eq!(b1["fields"][0]["value"], json!("https://example.com"));
+    assert_eq!(b1["followingVisibility"], json!("followers"));
+    assert_eq!(b1["chatScope"], json!("following"));
+
+    // persisted: users/show with the same token (me view) sees the new values
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": my_id, "i": my_token }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["description"], json!("hello bio"));
+    assert_eq!(b2["location"], json!("Kyoto"));
+    assert_eq!(b2["birthday"], json!("2000-01-31"));
+    assert_eq!(b2["fields"][0]["name"], json!("site"));
+    assert_eq!(b2["fields"][0]["value"], json!("https://example.com"));
+    assert_eq!(b2["followingVisibility"], json!("followers"));
+    assert_eq!(b2["chatScope"], json!("following"));
+
+    // explicit null birthday → NULL persisted (character(10) column)
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "birthday": null, "i": my_token }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "body: {b3}");
+    assert_eq!(b3["birthday"], Value::Null);
+
+    // fields omitted → previously stored fields left untouched
+    assert_eq!(b3["fields"][0]["value"], json!("https://example.com"));
+}
+
+#[tokio::test]
+async fn i_update_requires_native_token() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_auth").await;
+    let app = crate::build_router(test_state(pool));
+
+    // no credential at all → 401 AUTHENTICATION_FAILED
+    let (s1, b1) = post_json(app.clone(), "/api/i/update", json!({ "description": "x" })).await;
+    assert_eq!(s1, StatusCode::UNAUTHORIZED, "body: {b1}");
+    assert_eq!(b1["error"]["code"], json!("AUTHENTICATION_FAILED"));
+    assert_eq!(
+        b1["error"]["id"],
+        json!("b0a7f5f8-dc2f-4171-b91f-de88ad238e14")
+    );
+
+    // present but unknown 16-char token → same 401
+    let (s2, b2) = post_json(
+        app,
+        "/api/i/update",
+        json!({ "description": "x", "i": "0123456789abcdef" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED, "body: {b2}");
+    assert_eq!(b2["error"]["code"], json!("AUTHENTICATION_FAILED"));
+}

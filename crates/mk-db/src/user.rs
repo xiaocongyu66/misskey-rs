@@ -280,3 +280,198 @@ pub async fn insert_signin(
         .await?;
     Ok(())
 }
+
+/// `i/update` M1 subset: every field is `Option` and `None` means "not
+/// provided". Provided keys only — mirrors typeorm `update()` writing just
+/// the given columns (upstream builds `updates` / `profileUpdates` from
+/// `if (ps.x !== undefined)` guards in `endpoints/i/update.ts`).
+#[derive(Debug, Default)]
+pub struct ProfileUpdate {
+    // "user" table columns
+    pub name: Option<Option<String>>,
+    pub is_locked: Option<bool>,
+    pub is_explorable: Option<bool>,
+    pub hide_online_status: Option<bool>,
+    pub chat_scope: Option<String>,
+    // "user_profile" table columns
+    pub description: Option<Option<String>>,
+    pub location: Option<Option<String>>,
+    pub birthday: Option<Option<String>>,
+    pub lang: Option<Option<String>>,
+    pub url: Option<Option<String>>,
+    /// jsonb; stored via `$n::jsonb` from its JSON text.
+    pub fields: Option<serde_json::Value>,
+    pub no_crawle: Option<bool>,
+    pub prevent_ai_learning: Option<bool>,
+    pub inject_featured_note: Option<bool>,
+    pub receive_announcement_email: Option<bool>,
+    pub always_mark_nsfw: Option<bool>,
+    pub auto_sensitive: Option<bool>,
+    pub careful_bot: Option<bool>,
+    pub auto_accept_followed: Option<bool>,
+    pub public_reactions: Option<bool>,
+    /// PG enum `user_profile_followingvisibility_enum`; the plain string value
+    /// is bound and PG casts it on UPDATE (column type is the enum).
+    pub following_visibility: Option<String>,
+    /// PG enum `user_profile_followersvisibility_enum`; bound as plain string.
+    pub followers_visibility: Option<String>,
+}
+
+/// One dynamically-built SET assignment value. The corresponding placeholder
+/// type is inferred by PG from the assignment target.
+enum SetVal {
+    Text(Option<String>),
+    Bool(bool),
+    JsonText(String),
+}
+
+pub async fn update_profile_subset(
+    pool: &PgPool,
+    user_id: &str,
+    u: &ProfileUpdate,
+) -> Result<(), sqlx::Error> {
+    // --- "user" table: name / isLocked / isExplorable / hideOnlineStatus /
+    // chatScope (upstream `updates`) ---
+    let mut cols: Vec<&'static str> = Vec::new();
+    let mut vals: Vec<SetVal> = Vec::new();
+    if let Some(v) = &u.name {
+        cols.push("\"name\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    if let Some(v) = u.is_locked {
+        cols.push("\"isLocked\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.is_explorable {
+        cols.push("\"isExplorable\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.hide_online_status {
+        cols.push("\"hideOnlineStatus\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = &u.chat_scope {
+        cols.push("\"chatScope\"");
+        vals.push(SetVal::Text(Some(v.clone())));
+    }
+    if !cols.is_empty() {
+        let sets: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} = ${}", c, i + 2))
+            .collect();
+        let sql = format!(r#"UPDATE "user" SET {} WHERE "id" = $1"#, sets.join(", "));
+        let mut q = sqlx::query(&sql).bind(user_id);
+        for v in &vals {
+            q = match v {
+                SetVal::Text(t) => q.bind(t.as_ref()),
+                SetVal::Bool(b) => q.bind(*b),
+                SetVal::JsonText(_) => unreachable!(),
+            };
+        }
+        q.execute(pool).await?;
+    }
+
+    // --- "user_profile" table (upstream `profileUpdates`) ---
+    let mut cols: Vec<&'static str> = Vec::new();
+    let mut vals: Vec<SetVal> = Vec::new();
+    if let Some(v) = &u.description {
+        cols.push("\"description\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.location {
+        cols.push("\"location\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    // birthday is always written: JSON string → value, absent/null → NULL
+    let birthday = u.birthday.clone().unwrap_or_default();
+    cols.push("\"birthday\"");
+    vals.push(SetVal::Text(birthday));
+    if let Some(v) = &u.lang {
+        cols.push("\"lang\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.url {
+        cols.push("\"url\"");
+        vals.push(SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.fields {
+        cols.push("\"fields\"");
+        vals.push(SetVal::JsonText(
+            serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
+        ));
+    }
+    if let Some(v) = u.no_crawle {
+        cols.push("\"noCrawle\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.prevent_ai_learning {
+        cols.push("\"preventAiLearning\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.inject_featured_note {
+        cols.push("\"injectFeaturedNote\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.receive_announcement_email {
+        cols.push("\"receiveAnnouncementEmail\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.always_mark_nsfw {
+        cols.push("\"alwaysMarkNsfw\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.auto_sensitive {
+        cols.push("\"autoSensitive\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.careful_bot {
+        cols.push("\"carefulBot\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.auto_accept_followed {
+        cols.push("\"autoAcceptFollowed\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = u.public_reactions {
+        cols.push("\"publicReactions\"");
+        vals.push(SetVal::Bool(v));
+    }
+    if let Some(v) = &u.following_visibility {
+        cols.push("\"followingVisibility\"");
+        vals.push(SetVal::Text(Some(v.clone())));
+    }
+    if let Some(v) = &u.followers_visibility {
+        cols.push("\"followersVisibility\"");
+        vals.push(SetVal::Text(Some(v.clone())));
+    }
+    if !cols.is_empty() {
+        let sets: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let cast = if matches!(vals[i], SetVal::JsonText(_)) {
+                    "::jsonb"
+                } else {
+                    ""
+                };
+                format!("{} = ${}{}", c, i + 2, cast)
+            })
+            .collect();
+        let sql = format!(
+            r#"UPDATE "user_profile" SET {} WHERE "userId" = $1"#,
+            sets.join(", ")
+        );
+        let mut q = sqlx::query(&sql).bind(user_id);
+        for v in &vals {
+            q = match v {
+                SetVal::Text(t) => q.bind(t.as_ref()),
+                SetVal::Bool(b) => q.bind(*b),
+                SetVal::JsonText(s) => q.bind(s),
+            };
+        }
+        q.execute(pool).await?;
+    }
+
+    Ok(())
+}

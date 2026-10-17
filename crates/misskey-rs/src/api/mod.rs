@@ -59,7 +59,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
 
     // Registry endpoints that need a JSON body parsed before dispatch.
-    if name == "users/show" || name == "signin" {
+    if name == "users/show" || name == "signin" || name == "i/update" {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
@@ -72,6 +72,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "signin" {
             let _ = token;
             return signin_route(&state, &body).await;
+        }
+        if name == "i/update" {
+            return i_update(&state, &body, token).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -551,6 +554,280 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
         StatusCode::OK,
         Json(mk_core::services::user_pack::pack_inline(
             &row, &profile, is_me, ctx,
+        )),
+    )
+        .into_response()
+}
+
+/// Upstream `ApiCallService.#sendAuthenticationError`: 401 with the stable
+/// AUTHENTICATION_FAILED error (plus a WWW-Authenticate header, which the
+/// `api_err` envelope cannot carry yet).
+fn authentication_failed() -> Response {
+    api_err(ApiError::new(
+        401,
+        mk_types::api_error::ApiErrorKind::Client,
+        "AUTHENTICATION_FAILED",
+        "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
+        "Authentication failed. Please ensure your token is correct.",
+    ))
+}
+
+fn invalid_param(param: &str, reason: &str) -> Response {
+    api_err(ApiError::invalid_param(json!({
+        "param": param,
+        "reason": reason,
+    })))
+}
+
+/// Optional nullable string param (`{ type: 'string', nullable: true }`):
+/// absent → skip, null → write NULL, other types → INVALID_PARAM.
+fn opt_nullable_str(body: &Value, key: &str) -> Result<Option<Option<String>>, Response> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
+        Some(_) => Err(invalid_param(key, "expected a string or null")),
+    }
+}
+
+fn opt_bool(body: &Value, key: &str) -> Result<Option<bool>, Response> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid_param(key, "expected a boolean")),
+    }
+}
+
+fn opt_enum(body: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, Response> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::String(s)) if allowed.contains(&s.as_str()) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_param(
+            key,
+            &format!("expected one of: {}", allowed.join(", ")),
+        )),
+    }
+}
+
+/// Enforces the schema min/maxLength of `nameSchema`/`descriptionSchema`/
+/// `locationSchema` (raw value, before post-validation trim like upstream).
+fn with_str_limits(
+    value: Result<Option<Option<String>>, Response>,
+    key: &str,
+    min: usize,
+    max: usize,
+) -> Result<Option<Option<String>>, Response> {
+    match value? {
+        Some(Some(s)) => {
+            let len = s.chars().count();
+            if len < min {
+                return Err(invalid_param(key, "must not be empty"));
+            }
+            if len > max {
+                return Err(invalid_param(key, "must be shorter than the limit"));
+            }
+            Ok(Some(Some(s)))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `birthdaySchema` pattern: `^([0-9]{4})-([0-9]{2})-([0-9]{2})$`.
+fn valid_birthday(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// `endpoints/i/update.ts` paramDef M1 subset → [`mk_db::user::ProfileUpdate`].
+fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Response> {
+    let name = match with_str_limits(opt_nullable_str(body, "name"), "name", 1, 50)? {
+        None => None,
+        Some(v) => Some(match v {
+            None => None,
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            }
+        }),
+    };
+    let description = with_str_limits(
+        opt_nullable_str(body, "description"),
+        "description",
+        1,
+        1500,
+    )?;
+    let location = with_str_limits(opt_nullable_str(body, "location"), "location", 1, 50)?;
+    // TODO(M2): validate `lang` against langmap keys + null (upstream paramDef
+    // enum); no langmap port exists yet, so M1 stores the raw string.
+    let lang = opt_nullable_str(body, "lang")?;
+    let url = opt_nullable_str(body, "url")?;
+    // birthday column is character(10): "YYYY-MM-DD" strings persist as-is,
+    // undefined/null persist as NULL.
+    let birthday = match body.get("birthday") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => {
+            if !valid_birthday(s) {
+                return Err(invalid_param("birthday", "expected YYYY-MM-DD"));
+            }
+            Some(Some(s.clone()))
+        }
+        Some(_) => return Err(invalid_param("birthday", "expected a string or null")),
+    };
+
+    // fields: array of { name, value }, 0..16 items; entries with an empty
+    // trimmed name/value are dropped and survivors are trimmed (upstream's
+    // post-ajv filter/map).
+    let fields = match body.get("fields") {
+        None => None,
+        Some(Value::Array(items)) => {
+            if items.len() > 16 {
+                return Err(invalid_param(
+                    "fields",
+                    "array must not have more than 16 items",
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let fname = item.get("name").and_then(|x| x.as_str());
+                let fvalue = item.get("value").and_then(|x| x.as_str());
+                let (Some(n), Some(v)) = (fname, fvalue) else {
+                    return Err(invalid_param(
+                        "fields",
+                        "items must be { name, value } strings",
+                    ));
+                };
+                let (nt, vt) = (n.trim(), v.trim());
+                if nt.is_empty() || vt.is_empty() {
+                    continue;
+                }
+                out.push(json!({ "name": nt, "value": vt }));
+            }
+            Some(Value::Array(out))
+        }
+        Some(_) => return Err(invalid_param("fields", "expected an array")),
+    };
+
+    let visibility = ["public", "followers", "private"];
+    let chat_scope = ["everyone", "followers", "following", "mutual", "none"];
+    Ok(mk_db::user::ProfileUpdate {
+        name,
+        is_locked: opt_bool(body, "isLocked")?,
+        is_explorable: opt_bool(body, "isExplorable")?,
+        hide_online_status: opt_bool(body, "hideOnlineStatus")?,
+        chat_scope: opt_enum(body, "chatScope", &chat_scope)?,
+        description,
+        location,
+        birthday,
+        lang,
+        url,
+        fields,
+        no_crawle: opt_bool(body, "noCrawle")?,
+        prevent_ai_learning: opt_bool(body, "preventAiLearning")?,
+        inject_featured_note: opt_bool(body, "injectFeaturedNote")?,
+        receive_announcement_email: opt_bool(body, "receiveAnnouncementEmail")?,
+        always_mark_nsfw: opt_bool(body, "alwaysMarkNsfw")?,
+        auto_sensitive: opt_bool(body, "autoSensitive")?,
+        careful_bot: opt_bool(body, "carefulBot")?,
+        auto_accept_followed: opt_bool(body, "autoAcceptFollowed")?,
+        public_reactions: opt_bool(body, "publicReactions")?,
+        following_visibility: opt_enum(body, "followingVisibility", &visibility)?,
+        followers_visibility: opt_enum(body, "followersVisibility", &visibility)?,
+    })
+}
+
+/// `POST /api/i/update` — requireCredential profile update, M1 subset of
+/// upstream `endpoints/i/update.ts` (name/description/location/birthday/lang/
+/// url/fields + the boolean/visibility switch set; avatar, banner, decorations,
+/// mutedWords, room, pinnedPageId, alsoKnownAs etc. are TODO).
+async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+
+    // requireCredential: only native 16-char tokens resolve to a local user;
+    // anything else is the 401 AUTHENTICATION_FAILED shape.
+    let Some(tok) = token.as_deref().filter(|t| t.len() == 16) else {
+        return authentication_failed();
+    };
+    let me_id: Option<String> = match mk_db::user::find_local_user_id_by_token(pool, tok).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_i_update", error = %e, "find_local_user_id_by_token");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let Some(me_id) = me_id else {
+        return authentication_failed();
+    };
+
+    let row = match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_i_update", error = %e, "find_user_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let Some(row) = row else {
+        return authentication_failed();
+    };
+    // call(): requireCredential suspended gate.
+    if row.is_suspended {
+        return api_err(ApiError::new(
+            403,
+            mk_types::api_error::ApiErrorKind::Permission,
+            "YOUR_ACCOUNT_SUSPENDED",
+            "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+            "Your account has been suspended.",
+        ));
+    }
+
+    // --- paramDef subset ---
+    let update = match parse_profile_update(body) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    if let Err(e) = mk_db::user::update_profile_subset(pool, &me_id, &update).await {
+        tracing::error!(target: "dbg_i_update", error = %e, "update_profile_subset");
+        return api_err(ApiError::internal_error());
+    }
+
+    // Fresh persist + pack (MeDetailed, includeSecrets path).
+    let row = match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_i_update", error = %e, "find_user_by_id[fresh]");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let Some(row) = row else {
+        return api_err(ApiError::internal_error());
+    };
+    let profile = match mk_db::user::find_profile(pool, &row.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_i_update", error = %e, "find_profile[fresh]");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(mk_core::services::user_pack::pack_inline(
+            &row, &profile, true, ctx,
         )),
     )
         .into_response()
