@@ -345,7 +345,11 @@ fn detailed_as_me(row: &LocalUserRow, profile: &ProfileRow, ctx: InstanceCtx<'_>
 }
 
 /// Lite view of a local user used inside note packs (`pack`, lite: true).
-pub fn user_lite_value(row: &LocalUserRow, _profile: &ProfileRow, ctx: InstanceCtx<'_>) -> serde_json::Value {
+pub fn user_lite_value(
+    row: &LocalUserRow,
+    _profile: &ProfileRow,
+    ctx: InstanceCtx<'_>,
+) -> serde_json::Value {
     let _ = _profile;
     use crate::packers::user::UserLite;
     let lite = UserLite {

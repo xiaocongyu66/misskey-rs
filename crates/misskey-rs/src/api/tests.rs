@@ -450,11 +450,39 @@ async fn notes_create_and_show() {
     assert_eq!(note["repliesCount"], json!(0));
 
     // e2e asserts exact field sets — optional-absent fields must be missing
-    let got = note.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
-    for absent in ["deletedAt", "cw", "replyId", "renoteId", "reply", "renote", "poll", "channelId", "myReaction", "clippedCount"] {
+    let got = note
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for absent in [
+        "deletedAt",
+        "cw",
+        "replyId",
+        "renoteId",
+        "reply",
+        "renote",
+        "poll",
+        "channelId",
+        "myReaction",
+        "clippedCount",
+    ] {
         assert!(!got.contains(absent), "{absent} must be absent");
     }
-    for present in ["mentions", "fileIds", "files", "tags", "emojis", "reactions", "reactionEmojis", "localOnly", "reactionCount", "renoteCount", "visibleUserIds"] {
+    for present in [
+        "mentions",
+        "fileIds",
+        "files",
+        "tags",
+        "emojis",
+        "reactions",
+        "reactionEmojis",
+        "localOnly",
+        "reactionCount",
+        "renoteCount",
+        "visibleUserIds",
+    ] {
         assert!(got.contains(present), "{present} must be present");
     }
 

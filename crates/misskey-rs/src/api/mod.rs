@@ -59,7 +59,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
 
     // Registry endpoints that need a JSON body parsed before dispatch.
-    if name == "users/show" || name == "signin" || name == "i" || name == "i/update" || name == "notes/create" || name == "notes/show" {
+    if name == "users/show"
+        || name == "signin"
+        || name == "i"
+        || name == "i/update"
+        || name == "notes/create"
+        || name == "notes/show"
+    {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
@@ -999,7 +1005,6 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         .into_response()
 }
 
-
 /// Shared note-packing for the M1 slice: user row + profile → UserLite value.
 async fn note_user_lite(
     state: &AppState,
@@ -1033,7 +1038,9 @@ async fn note_user_lite(
         url: &state.config.url,
         host: &state.config.host(),
     };
-    Ok(mk_core::services::user_pack::user_lite_value(&row, &profile, ctx))
+    Ok(mk_core::services::user_pack::user_lite_value(
+        &row, &profile, ctx,
+    ))
 }
 
 /// `POST /api/notes/create` — M1 subset: text (+optional visibility/replyId),
@@ -1126,9 +1133,29 @@ async fn pack_note(
     let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
-    let mentions = row.mentions.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-    let tags = row.tags.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-    let emojis = if row.emojis.is_object() { row.emojis.clone() } else { json!({}) };
+    let mentions = row
+        .mentions
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let tags = row
+        .tags
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let emojis = if row.emojis.is_object() {
+        row.emojis.clone()
+    } else {
+        json!({})
+    };
     Ok(mk_core::packers::note::note_pack_min(
         &row, user_lite, created_at, &mentions, &tags, emojis,
     ))

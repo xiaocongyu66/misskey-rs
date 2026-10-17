@@ -9,7 +9,11 @@ use serde_json::{json, Value};
 
 fn string_vec(v: &serde_json::Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -56,7 +60,13 @@ pub fn note_pack_min(
         // poll body is M2
     }
     o.insert("localOnly".into(), json!(row.local_only));
-    o.insert("reactionAcceptance".into(), row.reaction_acceptance.as_str().map(|s| json!(s)).unwrap_or(Value::Null));
+    o.insert(
+        "reactionAcceptance".into(),
+        row.reaction_acceptance
+            .as_str()
+            .map(|s| json!(s))
+            .unwrap_or(Value::Null),
+    );
     o.insert("reactionEmojis".into(), json!({}));
     o.insert("emojis".into(), emojis);
     o.insert("reactions".into(), json!({}));
@@ -69,10 +79,25 @@ pub fn note_pack_min(
 /// Field-set contract for unit tests (e2e deepStrictEqual harness parity).
 pub fn m1_note_fields() -> &'static [&'static str] {
     &[
-        "id", "createdAt", "text", "userId", "user", "visibility",
-        "mentions", "visibleUserIds", "fileIds", "files", "tags",
-        "localOnly", "reactionAcceptance", "reactionEmojis", "emojis",
-        "reactions", "reactionCount", "renoteCount", "repliesCount",
+        "id",
+        "createdAt",
+        "text",
+        "userId",
+        "user",
+        "visibility",
+        "mentions",
+        "visibleUserIds",
+        "fileIds",
+        "files",
+        "tags",
+        "localOnly",
+        "reactionAcceptance",
+        "reactionEmojis",
+        "emojis",
+        "reactions",
+        "reactionCount",
+        "renoteCount",
+        "repliesCount",
     ]
 }
 
