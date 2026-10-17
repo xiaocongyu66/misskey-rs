@@ -464,9 +464,13 @@ async fn mute_create(
 
     // paramDef: expiresAt integer|null; upstream silently no-ops on a past
     // timestamp (`if (ps.expiresAt && ps.expiresAt <= Date.now()) return;`).
+    // JS truthiness: `0` is falsy → not a no-op, and
+    // `ps.expiresAt ? new Date(ps.expiresAt) : null` maps 0 → NULL, i.e. an
+    // indefinite mute row (upstream mute/create.ts).
     let expires_at_ms = match body.get("expiresAt") {
         None | Some(Value::Null) => None,
         Some(v @ Value::Number(_)) => match v.as_i64() {
+            Some(0) => None,
             Some(ms) if ms <= super::now_ms() as i64 => return Ok(ok_empty()),
             Some(ms) => Some(ms),
             None => {
