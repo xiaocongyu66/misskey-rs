@@ -317,8 +317,10 @@ pub struct ProfileUpdate {
     pub followers_visibility: Option<String>,
 }
 
-/// One dynamically-built SET assignment value. The corresponding placeholder
-/// type is inferred by PG from the assignment target.
+/// One dynamically-built SET assignment value. Text/Json/Bool values become
+/// bind parameters whose type PG infers from the assignment target; enum
+/// values are used as inlined escaped literals (sqlx binds str params with
+/// the TEXT type OID, which PG rejects against enum columns — 42804).
 enum SetVal {
     Text(Option<String>),
     Bool(bool),
@@ -373,91 +375,78 @@ pub async fn update_profile_subset(
     }
 
     // --- "user_profile" table (upstream `profileUpdates`) ---
-    let mut cols: Vec<&'static str> = Vec::new();
+    // `userId` is $1; every bound value gets the next $n in push order. Enum
+    // columns take inline literals (see SetVal docs).
+    let mut sets: Vec<String> = Vec::new();
     let mut vals: Vec<SetVal> = Vec::new();
+    macro_rules! push_set {
+        ($col:expr, bound $val:expr) => {{
+            vals.push($val);
+            sets.push(format!("{} = ${}", $col, vals.len() + 1));
+        }};
+        ($col:expr, lit $val:expr) => {{
+            sets.push(format!("{} = '{}'", $col, $val.replace('\'', "''")));
+        }};
+    }
     if let Some(v) = &u.description {
-        cols.push("\"description\"");
-        vals.push(SetVal::Text(v.clone()));
+        push_set!("\"description\"", bound SetVal::Text(v.clone()));
     }
     if let Some(v) = &u.location {
-        cols.push("\"location\"");
-        vals.push(SetVal::Text(v.clone()));
+        push_set!("\"location\"", bound SetVal::Text(v.clone()));
     }
     // birthday is always written: JSON string → value, absent/null → NULL
     let birthday = u.birthday.clone().unwrap_or_default();
-    cols.push("\"birthday\"");
-    vals.push(SetVal::Text(birthday));
+    push_set!("\"birthday\"", bound SetVal::Text(birthday));
     if let Some(v) = &u.lang {
-        cols.push("\"lang\"");
-        vals.push(SetVal::Text(v.clone()));
+        push_set!("\"lang\"", bound SetVal::Text(v.clone()));
     }
     if let Some(v) = &u.url {
-        cols.push("\"url\"");
-        vals.push(SetVal::Text(v.clone()));
+        push_set!("\"url\"", bound SetVal::Text(v.clone()));
     }
     if let Some(v) = &u.fields {
-        cols.push("\"fields\"");
         vals.push(SetVal::JsonText(
             serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()),
         ));
+        // ::text keeps the declared param type string; PG then does the
+        // explicit text→jsonb I/O-conversion input.
+        sets.push(format!("\"fields\" = ${}::jsonb", vals.len() + 1));
     }
     if let Some(v) = u.no_crawle {
-        cols.push("\"noCrawle\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"noCrawle\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.prevent_ai_learning {
-        cols.push("\"preventAiLearning\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"preventAiLearning\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.inject_featured_note {
-        cols.push("\"injectFeaturedNote\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"injectFeaturedNote\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.receive_announcement_email {
-        cols.push("\"receiveAnnouncementEmail\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"receiveAnnouncementEmail\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.always_mark_nsfw {
-        cols.push("\"alwaysMarkNsfw\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"alwaysMarkNsfw\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.auto_sensitive {
-        cols.push("\"autoSensitive\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"autoSensitive\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.careful_bot {
-        cols.push("\"carefulBot\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"carefulBot\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.auto_accept_followed {
-        cols.push("\"autoAcceptFollowed\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"autoAcceptFollowed\"", bound SetVal::Bool(v));
     }
     if let Some(v) = u.public_reactions {
-        cols.push("\"publicReactions\"");
-        vals.push(SetVal::Bool(v));
+        push_set!("\"publicReactions\"", bound SetVal::Bool(v));
     }
+    // PG enums (labels validated against the paramDef whitelist upstream of
+    // this call; escaped here regardless — PG coerces the literal to the enum).
     if let Some(v) = &u.following_visibility {
-        cols.push("\"followingVisibility\"");
-        vals.push(SetVal::Text(Some(v.clone())));
+        push_set!("\"followingVisibility\"", lit v.clone());
     }
     if let Some(v) = &u.followers_visibility {
-        cols.push("\"followersVisibility\"");
-        vals.push(SetVal::Text(Some(v.clone())));
+        push_set!("\"followersVisibility\"", lit v.clone());
     }
-    if !cols.is_empty() {
-        let sets: Vec<String> = cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let cast = if matches!(vals[i], SetVal::JsonText(_)) {
-                    "::jsonb"
-                } else {
-                    ""
-                };
-                format!("{} = ${}{}", c, i + 2, cast)
-            })
-            .collect();
+    if !sets.is_empty() {
         let sql = format!(
             r#"UPDATE "user_profile" SET {} WHERE "userId" = $1"#,
             sets.join(", ")
