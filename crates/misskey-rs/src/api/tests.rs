@@ -591,18 +591,15 @@ async fn i_update_persists_is_bot_and_is_cat() {
     let my_id = me["id"].as_str().unwrap().to_string();
     let my_token = me["token"].as_str().unwrap().to_string();
 
-    let persisted = |pool: &mk_db::sqlx::PgPool, id: &str| {
-        let id = id.to_string();
-        async move {
-            let (is_bot, is_cat): (bool, bool) =
-                mk_db::sqlx::query_as(r#"SELECT "isBot", "isCat" FROM "user" WHERE "id" = $1"#)
-                    .bind(&id)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap();
-            (is_bot, is_cat)
-        }
-    };
+    async fn persisted(pool: &mk_db::sqlx::PgPool, id: &str) -> (bool, bool) {
+        let (is_bot, is_cat): (bool, bool) =
+            mk_db::sqlx::query_as(r#"SELECT "isBot", "isCat" FROM "user" WHERE "id" = $1"#)
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (is_bot, is_cat)
+    }
 
     // fresh signup defaults (signup upstream ignores isBot/isCat outright)
     assert_eq!(persisted(&pool, &my_id).await, (false, false));
