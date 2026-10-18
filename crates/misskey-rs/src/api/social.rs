@@ -1271,15 +1271,18 @@ pub(crate) async fn following_update(
             "Followee is yourself.",
         );
     }
-    let followee = match get_user(pool, user_id).await {
-        Ok(Some(u)) => u,
-        Ok(None) => meta_err(
-            "NO_SUCH_USER",
-            "14318698-f67e-492a-99da-5353a5ac52be",
-            "No such user.",
-        ),
+    // upstream GetterService.getUser → NO_SUCH_USER before the edge probe
+    match get_user(pool, user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return meta_err(
+                "NO_SUCH_USER",
+                "14318698-f67e-492a-99da-5353a5ac52be",
+                "No such user.",
+            );
+        }
         Err(resp) => return resp,
-    };
+    }
     let exists = match mk_db::social::following_exists(pool, &me_id, user_id).await {
         Ok(v) => v,
         Err(e) => {
