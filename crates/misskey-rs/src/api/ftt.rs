@@ -254,7 +254,7 @@ pub(crate) async fn push_to_tl(
         if author_host.is_none()
             && (visibility != "specified" || !visible_user_ids.iter().any(|v| v == author_id))
         {
-            tracing::debug!(target: "dbg_ftt", author_id, author_host = ?author_host, visibility, visible = visible_user_ids.len(), "self HTL push leg");
+            tracing::info!(target: "dbg_ftt", author_id, author_host = ?author_host, visibility, visible = visible_user_ids.len(), "self HTL push leg");
             pushes.push((
                 format!("list:homeTimeline:{author_id}"),
                 note_id.to_string(),
