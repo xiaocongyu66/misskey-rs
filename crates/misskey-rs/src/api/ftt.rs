@@ -61,6 +61,8 @@ async fn push_all(
     }
     conn.write_all(cmd.as_bytes()).await?;
     conn.shutdown().await?;
+    // ftt2 triage: prove exactly what hit the wire.
+    tracing::info!(target: "dbg_ftt", cmd = %cmd, "lpush wire bytes");
     Ok(())
 }
 
@@ -86,6 +88,8 @@ pub(crate) async fn debug_lrange(
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
     tokio::time::timeout(BULK_READ_TIMEOUT, async {
         loop {
             let n = conn.read(&mut chunk).await?;
@@ -98,6 +102,7 @@ pub(crate) async fn debug_lrange(
     })
     .await
     .unwrap_or(Ok(())); // timeout → best-effort partial parse
+    tracing::info!(target: "dbg_ftt", raw = %String::from_utf8_lossy(&buf), key = %key, "lrange wire answer");
     parse_resp_array(&buf)
 }
 
