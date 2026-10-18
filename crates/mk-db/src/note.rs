@@ -30,17 +30,20 @@ pub struct NewNote<'a> {
 }
 
 /// Bumps user counters after a note insert (`NoteCreateService`
-/// incrementUserNotesCount + tag merge). Hashtag arrays are normalized
-/// (lowercase) at the caller.
+/// incNotesCountOfUser: `updatedAt: new Date()` rides the same update —
+/// the users/search activeness legs key off `user.updatedAt` — + tag
+/// merge). Hashtag arrays are normalized (lowercase) at the caller.
 pub async fn credit_note_to_user(
     pool: &PgPool,
     user_id: &str,
     hashtags: &[String],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE "user" SET "notesCount" = "notesCount" + 1 WHERE "id" = $1"#)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"UPDATE "user" SET "notesCount" = "notesCount" + 1, "updatedAt" = now() WHERE "id" = $1"#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     for tag in hashtags {
         sqlx::query(
             r#"UPDATE "user" SET "tags" = array_append("tags", $2)
