@@ -869,7 +869,8 @@ pub(crate) async fn notes_timeline(
             body.get("withRenotes")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
-        ),
+        )
+        .await,
     )
     .await
 }
@@ -899,7 +900,8 @@ pub(crate) async fn notes_local_timeline(
             body.get("withReplies")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-        ),
+        )
+        .await,
     )
     .await
 }
@@ -936,7 +938,8 @@ pub(crate) async fn notes_hybrid_timeline(
             body.get("withReplies")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
-        ),
+        )
+        .await,
     )
     .await
 }
@@ -1069,7 +1072,14 @@ pub(crate) async fn notes_reactions_create(
             }
         }
         Ok(None) => {
-            if let Err(e) = mk_db::note::insert_note_reaction(pool, me_id, note_id, reaction).await
+            if let Err(e) = mk_db::note::insert_note_reaction(
+                pool,
+                &mk_types::id::gen_aid_now(),
+                me_id,
+                note_id,
+                reaction,
+            )
+            .await
             {
                 tracing::error!(target: "dbg_notes", error = %e, "insert_note_reaction");
                 return crate::api::api_err(crate::api::ApiError::internal_error());

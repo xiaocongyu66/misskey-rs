@@ -1513,6 +1513,21 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
 
     let id = mk_types::id::gen_aid_now();
     let hashtags = mk_core::services::misc::extract_hashtags(text);
+    let mention_names: Vec<String> = mk_core::services::misc::extract_mentions(text)
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect();
+    // reply denormals (visibility clause + reply filters read these).
+    // NOTE_COLS doesn't carry threadId/replyUserHost yet — thread root falls
+    // back to the direct reply id until the row mapping grows those columns.
+    let (reply_user_id, thread_id) = if let Some(rid) = reply_id {
+        match mk_db::note::find_note_by_id(pool, rid).await {
+            Ok(Some(t)) => (Some(t.user_id), Some(rid.to_string())),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     if let Err(e) = mk_db::note::insert_note(
         pool,
         &mk_db::note::NewNote {
@@ -1521,6 +1536,10 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             user_id: &me_id,
             visibility,
             reply_id,
+            reply_user_id: reply_user_id.as_deref(),
+            reply_user_host: None, // remote reply author — TODO(M4) with AP
+            thread_id: thread_id.as_deref(),
+            mentions: &mention_names,
             hashtags: &hashtags,
         },
     )
