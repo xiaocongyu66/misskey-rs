@@ -31,6 +31,9 @@ pub(crate) const SOCIAL_ENDPOINTS: &[&str] = &[
     "mute/delete",
     "blocking/create",
     "blocking/delete",
+    // users.ts census: flips the pack's isRenoteMuted relation flag
+    "renote-mute/create",
+    "renote-mute/delete",
 ];
 
 fn db_err(context: &str, e: mk_db::sqlx::Error) -> Response {
@@ -660,6 +663,87 @@ async fn blocking_delete(
 }
 
 // ---------------------------------------------------------------------------
+// renote-mute/create + renote-mute/delete (endpoints/renote-mute/*.ts — the
+// users.ts リノートミュート census flips isRenoteMuted through these rows)
+// ---------------------------------------------------------------------------
+
+async fn renote_mute_create(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let user_id = user_id_param(body)?;
+    if me_id == user_id {
+        return Err(meta_err(
+            "MUTEE_IS_YOURSELF",
+            "37285718-52f7-4aef-b7de-c38b8e8a8420",
+            "Mutee is yourself.",
+        ));
+    }
+    get_user(pool, user_id).await?.ok_or_else(|| {
+        meta_err(
+            "NO_SUCH_USER",
+            "5e0a5dff-1e94-4202-87ae-4d9c89eb2271",
+            "No such user.",
+        )
+    })?;
+
+    let exists = mk_db::social::renote_muting_exists(pool, me_id, user_id)
+        .await
+        .map_err(|e| db_err("renote_mute_create exists", e))?;
+    if exists {
+        return Err(meta_err(
+            "ALREADY_MUTING",
+            "ccfecbe4-1f1c-4fc2-8a3d-c3ffee61cb7b",
+            "You are already muting that user.",
+        ));
+    }
+
+    mk_db::social::insert_renote_muting(pool, &mk_types::id::gen_aid_now(), me_id, user_id)
+        .await
+        .map_err(|e| db_err("renote_mute_create insert", e))?;
+    Ok(ok_empty())
+}
+
+async fn renote_mute_delete(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let user_id = user_id_param(body)?;
+    if me_id == user_id {
+        return Err(meta_err(
+            "MUTEE_IS_YOURSELF",
+            "619b1314-0850-4597-a242-e245f3da42af",
+            "Mutee is yourself.",
+        ));
+    }
+    get_user(pool, user_id).await?.ok_or_else(|| {
+        meta_err(
+            "NO_SUCH_USER",
+            "9b6728cf-638c-4aa1-bedb-e07d8101474d",
+            "No such user.",
+        )
+    })?;
+
+    let exists = mk_db::social::renote_muting_exists(pool, me_id, user_id)
+        .await
+        .map_err(|e| db_err("renote_mute_delete exists", e))?;
+    if !exists {
+        return Err(meta_err(
+            "NOT_MUTING",
+            "2e4ef874-8bf0-4b4b-b069-4598f6d05817",
+            "You are not muting that user.",
+        ));
+    }
+
+    mk_db::social::delete_renote_muting(pool, me_id, user_id)
+        .await
+        .map_err(|e| db_err("renote_mute_delete", e))?;
+    Ok(ok_empty())
+}
+
+// ---------------------------------------------------------------------------
 // dispatch entry
 // ---------------------------------------------------------------------------
 
@@ -688,6 +772,8 @@ pub(crate) async fn route(
         "mute/delete" => mute_delete(pool, body, &me_id).await,
         "blocking/create" => blocking_create(state, pool, body, &me_id).await,
         "blocking/delete" => blocking_delete(state, pool, body, &me_id).await,
+        "renote-mute/create" => renote_mute_create(pool, body, &me_id).await,
+        "renote-mute/delete" => renote_mute_delete(pool, body, &me_id).await,
         _ => unreachable!("dispatch block checked the name"),
     };
     match result {
