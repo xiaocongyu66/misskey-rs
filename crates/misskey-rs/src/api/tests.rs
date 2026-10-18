@@ -6161,7 +6161,7 @@ async fn user_list_timeline_filters_pager_channel() {
     let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(lacks(&res, &n_ch));
     assert!(lacks(&res, &n_ch_note), "member channel note excluded");
-    let n_ch_renote = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt }), at).await;
+    let n_ch_renote = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
     let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(
         has(&res, &n_ch_renote),
@@ -6184,15 +6184,15 @@ async fn user_list_timeline_filters_pager_channel() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("ALREADY_MUTING_CHANNEL"));
-    let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt }), at).await;
+    let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
     let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(lacks(&res, &n_ch_renote2), "muted channel renote drops out");
     assert!(has(&res, &n_ch_renote), "pre-mute renote unaffected");
 
     // -- withFiles: true keeps the file notes only ------------------------
     let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
-    let n_txt = note_post(&app, json!({ "text": "txt", "i": bt }), at).await;
-    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt }), at).await;
+    let n_txt = note_post(&app, json!({ "text": "txt", "i": bt })).await;
+    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
     let res = fetch_tl(
         &app,
         json!({ "listId": list_id, "withFiles": true, "limit": 100 }),
@@ -6208,7 +6208,7 @@ async fn user_list_timeline_filters_pager_channel() {
         json!({ "text": "home", "visibility": "home", "i": dt }),
     )
     .await;
-    let n_renote = note_post(&app, json!({ "renoteId": n_dave_home, "i": bt }), at).await;
+    let n_renote = note_post(&app, json!({ "renoteId": n_dave_home, "i": bt })).await;
     let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(has(&res, &n_renote), "default withRenotes keeps renotes");
     let res = fetch_tl(
