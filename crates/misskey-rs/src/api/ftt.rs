@@ -35,9 +35,9 @@ use crate::AppState;
 const BULK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One pipelined LPUSH batch. Fire-and-forget like upstream's `r.exec()`
-/// (whose individual replies are never inspected): encode, write, shutdown
-/// the write half, drop. Pipeline correctness is pinned by the tests.rs
-/// ftt2 redis leg reading the lists back through `debug_lrange`.
+/// (whose individual replies are never inspected) — with a triage-only
+/// reply sniff (dbg_ftt) since the unit/e2e oracles showed vanished pushes.
+#[allow(clippy::needless_borrow)]
 async fn push_all(
     cfg: &crate::config::RedisConfig,
     pushes: &[(String, String)],
@@ -61,8 +61,30 @@ async fn push_all(
     }
     conn.write_all(cmd.as_bytes()).await?;
     conn.shutdown().await?;
-    // ftt2 triage: prove exactly what hit the wire.
-    tracing::info!(target: "dbg_ftt", cmd = %cmd, "lpush wire bytes");
+    // ftt2 triage: prove exactly what hit the wire and what came back (an
+    // unread `-ERR…` would otherwise vanish with the fire-and-forget drop).
+    let mut rbuf = Vec::new();
+    let mut rchunk = [0u8; 512];
+    let _ = tokio::time::timeout(BULK_READ_TIMEOUT, async {
+        loop {
+            let n = conn.read(&mut rchunk).await?;
+            if n == 0 {
+                break;
+            }
+            rbuf.extend_from_slice(&rchunk[..n]);
+            if rbuf.len() >= 256 {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    tracing::info!(
+        target: "dbg_ftt",
+        cmd = %cmd,
+        reply = %String::from_utf8_lossy(&rbuf),
+        "lpush wire"
+    );
     Ok(())
 }
 
