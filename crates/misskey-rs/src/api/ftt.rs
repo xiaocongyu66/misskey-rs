@@ -30,45 +30,95 @@ use std::time::Duration;
 
 use crate::AppState;
 
-/// One pipelined LPUSH batch. Reply lines (`:n\r\n` for LPUSH, `+OK\r\n` for
-/// a configured AUTH) are drained count-wise, not parsed — the suite only
-/// observes the pushed values, never the reply codes.
+/// One pipelined LPUSH batch. Fire-and-forget like upstream's `r.exec()`
+/// (whose individual replies are never inspected): encode, write, shutdown
+/// the write half, drop. Pipeline correctness is pinned by the tests.rs
+/// ftt2 redis leg reading the lists back through `debug_lrange`.
 async fn push_all(
     cfg: &crate::config::RedisConfig,
     pushes: &[(String, String)],
 ) -> Result<(), std::io::Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let mut conn = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
     let mut cmd = String::new();
-    let mut replies = 0usize;
     if let Some(pass) = &cfg.pass {
         cmd.push_str(&format!(
             "*2\r\n$4\r\nAUTH\r\n${}\r\n{}\r\n",
             pass.len(),
             pass
         ));
-        replies += 1;
     }
     for (key, id) in pushes {
         // RESP2 array: LPUSH key id — `$N` marks BYTE lengths.
         cmd.push_str("*3\r\n$5\r\nLPUSH\r\n");
         cmd.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
         cmd.push_str(&format!("${}\r\n{}\r\n", id.len(), id));
-        replies += 1;
     }
     conn.write_all(cmd.as_bytes()).await?;
+    conn.shutdown().await?;
+    Ok(())
+}
+
+/// Raw RESP2 LRANGE key 0 -1 (debug/test probe — the e2e suite's
+/// `redisForTimelines.lrange('list:homeTimeline:${uid}', 0, -1)`).
+pub(crate) async fn debug_lrange(
+    cfg: &crate::config::RedisConfig,
+    key: &str,
+) -> Result<Vec<String>, std::io::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut conn = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
+    let cmd = format!(
+        "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$1\r\n-1\r\n",
+        key.len(),
+        key
+    );
+    conn.write_all(cmd.as_bytes()).await?;
+    conn.shutdown().await?;
 
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    while buf.iter().filter(|b| **b == b'\n').count() < replies {
+    let mut chunk = [0u8; 1024];
+    loop {
         let n = conn.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(())
+    parse_resp_array(&buf)
+}
+
+/// Minimal RESP2 bulk-array parser for debug_lrange's reply
+/// (`*<n>\r\n` + n × `$<len>\r\n<data>\r\n`; error/plain replies → empty).
+fn parse_resp_array(buf: &[u8]) -> Result<Vec<String>, std::io::Error> {
+    let mut out = Vec::new();
+    let mut idx = match buf.iter().position(|b| *b == b'\n') {
+        Some(i) if buf[0] == b'*' => i + 1,
+        _ => return Ok(out),
+    };
+    while idx < buf.len() {
+        // bulk string header `$<len>\r\n`
+        if buf[idx] != b'$' {
+            return Ok(out);
+        }
+        let Some(hdr_end) = buf[idx..].iter().position(|b| *b == b'\n') else {
+            return Ok(out);
+        };
+        let len: usize = std::str::from_utf8(&buf[idx + 1..idx + hdr_end])
+            .map_err(|_| std::io::Error::other("bad resp utf8"))?
+            .trim_end_matches('\r')
+            .parse()
+            .map_err(|_| std::io::Error::other("bad resp length"))?;
+        idx += hdr_end + 1;
+        let end = idx + len;
+        if end + 2 > buf.len() {
+            return Ok(out); // truncated — best effort
+        }
+        out.push(String::from_utf8_lossy(&buf[idx..end]).into_owned());
+        idx = end + 2; // skip data + CRLF
+    }
+    Ok(out)
 }
 
 /// pushToTl — call right after the note insert + user notesCount credit

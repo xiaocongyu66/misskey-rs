@@ -6984,3 +6984,125 @@ async fn ftt2_enable_fanout_timeline_meta_flag() {
 
     let _ = pool;
 }
+
+// ===== ftt2: the FTT Redis push shape (timelines.ts L941-953 probes) ========
+//
+// ci.yml carries the redis:7 service, so this leg asserts the LPUSH pipeline
+// end to end through the raw-RESP probe `ftt::debug_lrange` (the e2e reads
+// `redisForTimelines.lrange('list:homeTimeline:${uid}', 0, -1)`):
+// flag on → bob's follower list + alice's self list hold the posted ids;
+// flag off (update-meta, timelines.ts L104) → a fresh post stays out;
+// a no-follower author's list only holds her own self-push. Gracefully
+// skipped when redis is unreachable (local dev without the service).
+
+#[tokio::test]
+async fn ftt2_redis_home_timeline_push_shape() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    let redis_cfg = crate::config::RedisConfig {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        pass: None,
+    };
+    if tokio::net::TcpStream::connect(("127.0.0.1", 6379))
+        .await
+        .is_err()
+    {
+        return; // no redis service — CI always provisions one
+    }
+    init_tracing();
+    let pool = fresh_pool("mkftt2r").await;
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://127.0.0.1:3000".to_string(),
+            db: None,
+            redis: Some(redis_cfg.clone()),
+            test: true,
+        },
+        pool: Some(pool.clone()),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+    });
+
+    // first signup = root (SignupService L160) — update-meta is requireAdmin
+    let alice = signup(&app, &uname("f2a")).await;
+    let at = alice["token"].as_str().unwrap();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+
+    // bob follows alice (timelines.ts FTT: following/create by bob)
+    let bob = signup(&app, &uname("f2b")).await;
+    let b_id = bob["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": bob["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // flag on (leg true arm) — persists before the posts
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": at, "enableFanoutTimeline": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // alice posts → pushed to her own HTL + bob's (follower); id order: the
+    // follower leg rides the same note.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "ftt hello", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let bob_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{b_id}"))
+        .await
+        .unwrap();
+    assert!(
+        bob_list.iter().any(|n| n == &note),
+        "FTT: ローカルユーザーの HTL にはプッシュされる — bob's list: {bob_list:?}"
+    );
+    let alice_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{a_id}"))
+        .await
+        .unwrap();
+    assert!(
+        alice_list.iter().any(|n| n == &note),
+        "self push — alice's list: {alice_list:?}"
+    );
+
+    // flag off (leg false arm: exists == 0) — fresh posts push nothing
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": at, "enableFanoutTimeline": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let carol = signup(&app, &uname("f2c")).await;
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "gated", "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let gated_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let c_id = carol["id"].as_str().unwrap().to_string();
+    let carol_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{c_id}"))
+        .await
+        .unwrap();
+    assert!(
+        !carol_list.iter().any(|n| n == &gated_note),
+        "fanout:false arm must not push (exists == 0): {carol_list:?}"
+    );
+
+    let _ = pool;
+}
