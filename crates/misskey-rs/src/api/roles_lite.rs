@@ -238,7 +238,7 @@ async fn create(state: &AppState, body: &Value, token: Option<&str>) -> ApiResul
             .unwrap_or(default)
     };
     let id = mk_types::id::gen_aid_now();
-    let now_iso = mk_core::services::signup::ms_to_iso(crate::now_ms() as i64);
+    let now_iso = mk_core::services::signup::ms_to_iso(crate::ratelimit::now_ms() as i64);
     mk_db::roles_lite::create_role(
         pool,
         &id,
