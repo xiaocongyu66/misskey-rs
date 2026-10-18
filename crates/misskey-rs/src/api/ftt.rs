@@ -109,7 +109,7 @@ pub(crate) async fn push_to_tl(
         // NoteCreateService L1073-1090: every channel follower's home gets
         // the note (channelTimeline / userTimelineWithChannel have no reader
         // here and are skipped).
-        let followers: Vec<String> = sqlx::query_scalar(
+        let followers: Vec<String> = mk_db::sqlx::query_scalar(
             r#"SELECT "followerId" FROM "channel_following" WHERE "followeeId" = $1"#,
         )
         .bind(cid)
@@ -129,7 +129,7 @@ pub(crate) async fn push_to_tl(
         // L1094-1137: local (followerHost NULL), non-hibernated followers.
         // following."followerHost" is denormalized-NULL by our insert lane,
         // so the discriminator is the JOINed user row host.
-        let followers: Vec<(String, bool)> = sqlx::query_as(
+        let followers: Vec<(String, bool)> = mk_db::sqlx::query_as(
             r#"SELECT f."followerId", f."withReplies"
                FROM "following" f JOIN "user" fu ON fu."id" = f."followerId"
                WHERE f."followeeId" = $1
