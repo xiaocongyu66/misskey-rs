@@ -22,7 +22,8 @@ mod social;
 mod freq;
 // i/update long-tail wave: drive/files/create (upload) + i/pin + i/unpin +
 // users/update-memo endpoints closing the users.ts を書き換えることができる census
-mod drive;
+// pub(crate): main.rs routes `/streaming` into drive::streaming (drive-agent2).
+pub(crate) mod drive;
 // gate-roles: minimal admin/roles/create + admin/roles/assign seeding the
 // users.ts role fixtures (Publicなロール/バッヂロール census)
 mod roles_lite;
@@ -260,6 +261,25 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         };
     }
     // ==== END i/update TAIL DISPATCH ARM ====
+
+    // ==== drive-agent2 DISPATCH ARM (drive/files/attached-notes +
+    // drive/files/upload-from-url — drive.ts arena) — on the roles-lite arm
+    // pattern: method check, body parsing and token extraction live here;
+    // the endpoint bodies in api::drive (db paths in mk-db/src/drive.rs,
+    // the /streaming hub routed in main.rs).
+    if name == "drive/files/attached-notes" || name == "drive/files/upload-from-url" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return drive::handle_json(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END drive-agent2 DISPATCH ARM ====
 
     // social-agent dispatch block: follow/mute/block social actions
     // (following/*, mute/*, blocking/*) — requireCredential, JSON body,

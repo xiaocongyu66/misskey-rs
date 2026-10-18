@@ -28,6 +28,9 @@ pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::permissive();
     Router::new()
         .route("/api/{*name}", any(api::dispatch))
+        // streaming websocket hub (drive-agent2: publishMainStream /
+        // urlUploadFinished — upstream StreamingApiServerService entry).
+        .route("/streaming", get(api::drive::streaming::entry))
         .route("/healthz", get(healthz))
         .layer(cors)
         .layer(middleware::from_fn(json_utf8_charset))

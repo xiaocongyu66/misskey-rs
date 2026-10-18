@@ -3980,3 +3980,125 @@ async fn channels_slice_roundtrip() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("NO_SUCH_CHANNEL"));
 }
+
+// ---------------------------------------------------------------------------
+// drive-agent2: drive/files/{create,attached-notes,upload-from-url} —
+// upstream test/e2e/drive.ts (添付ノート一覧を取得できる / 他の人から見えない).
+// ---------------------------------------------------------------------------
+
+/// Minimal multipart POST (files/create carries no JSON body).
+async fn post_multipart(
+    app: axum::Router,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn drive_attached_notes_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_drive_attached").await;
+    let app = crate::build_router(test_state(pool));
+
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let b_token = bob["token"].as_str().unwrap().to_string();
+
+    // multipart upload (jpeg magic bytes — mirrors e2e uploadFile)
+    let mut body: Vec<u8> =
+        b"--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"192.jpg\"\r\n\r\n"
+            .to_vec();
+    body.extend_from_slice(b"\xFF\xD8\xFF\xe0jpeg-bytes");
+    body.extend_from_slice(b"\r\n--XX\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n");
+    body.extend_from_slice(a_token.as_bytes());
+    body.extend_from_slice(b"\r\n--XX--\r\n");
+    let (s, file) = post_multipart(
+        app.clone(),
+        "/api/drive/files/create",
+        "multipart/form-data; boundary=XX",
+        body,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {file}");
+    assert_eq!(file["name"], json!("192.jpg"));
+    assert_eq!(file["type"], json!("image/jpeg"));
+    assert_eq!(file["userId"], alice["id"]);
+    let file_id = file["id"].as_str().unwrap().to_string();
+
+    // note carrying the file (notes/create fileIds note-pair writes)
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "with file", "fileIds": [file_id], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // attached-notes: owner sees the note (pack with id), reverse order supported
+    let (s, notes) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-notes",
+        json!({ "fileId": file_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {notes}");
+    assert_eq!(notes.as_array().unwrap().len(), 1);
+    assert_eq!(notes[0]["id"], json!(note_id));
+
+    // unknown file under the caller → NO_SUCH_FILE (attached-notes.ts)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-notes",
+        json!({ "fileId": "x".repeat(24), "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // 添付ノート一覧は他の人から見えない (drive.ts): foreign file → 400 error
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-notes",
+        json!({ "fileId": file_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // upload-from-url acks 204 before the async download (bad URL → the
+    // spawned task logs; the endpoint contract is the immediate 204)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/files/upload-from-url",
+        json!({ "url": "http://127.0.0.1:9/never.jpg", "marker": "m", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+}

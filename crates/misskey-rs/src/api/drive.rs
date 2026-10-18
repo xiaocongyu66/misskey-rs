@@ -1,19 +1,208 @@
-//! `drive/files/create` (multipart upload) + the shared
-//! `DriveFileEntityService.getPublicUrl` helper.
+//! Drive domain (drive.ts arena): `drive/files/create` (multipart upload),
+//! `drive/files/attached-notes`, `drive/files/upload-from-url` + the
+//! `/streaming` main-channel websocket hub the upload-finished event rides
+//! on, plus the shared `DriveFileEntityService.getPublicUrl` helper.
 //!
-//! Upstream flow (`endpoints/drive/files/create.ts` + `DriveService.addFile`):
-//! the multipart `file` part is stored and a `drive_file` row inserted
-//! (MIME sniffed from content when the blob type is empty, md5 of the bytes,
-//! url = `{base}/files/{accessKey}/{name}` for the internal-storage shape).
-//! Response = packed DriveFile (`pack(file, { self: true })`); the e2e
-//! Avatar/Banner census cases consume the row `id` through `i/update`.
+//! Upstream flows:
+//! - `endpoints/drive/files/create.ts` + `DriveService.addFile`: multipart
+//!   `file` part stored and a `drive_file` row inserted (MIME sniffed from
+//!   content when the blob type is empty, md5 of the bytes, name through
+//!   `misc/correct-filename.ts`, url = `{base}/files/{accessKey}/{name}` for
+//!   the internal-storage shape). Response = pack(file, { self: true }).
+//! - `endpoints/drive/files/attached-notes.ts`: files are looked up by
+//!   `{ id, userId: me }` (moderator bypass unported), 400 NO_SUCH_FILE
+//!   otherwise; notes via `:file <@ note.fileIds` + makePaginationQuery;
+//!   each packed with `NoteEntityService.pack(note, me, { detail: true })`.
+//! - `endpoints/drive/files/upload-from-url.ts` → `DriveService.uploadFromUrl`:
+//!   204 immediately; the download runs async (upstream: job queue), name =
+//!   URL path basename (DownloadService.downloadUrl L47), type sniffed from
+//!   bytes, then `publishMainStream(userId, 'urlUploadFinished', { marker,
+//!   file })`.
 //!
 //! Deviations (documented for the report): file BYTES are not persisted (no
 //! `/files` route exists — TODO(M4) internal storage), and `blurhash` stores
 //! a deterministic printable placeholder derived from the content hash
 //! because real blurhashing needs image decoding — TODO(M4). Both are
 //! asserted only shape-wise upstream (users.ts pins `id` plus the
-//! `/[ -~]{54}/` blurhash regex).
+//! `/[ -~]{54}/` blurhash regex). Web properties are `{}` (real width/height
+//! need image decoding — TODO(M4)).
+
+pub(crate) mod streaming {
+    //! `/streaming` websocket hub — the M-slice of upstream
+    //! `StreamingApiServerService` + `stream/Connection.ts` + `main` channel:
+    //! bearer/`?i=` auth, `{type:'connect'}` → `{type:'connected'}` handshake
+    //! and per-user `main`-channel event fanout (`publishMainStream`), of
+    //! which the drive arena needs `urlUploadFinished`. Other channels and
+    //! client message types (`sr`/`subNote`/…) exist upstream but are not
+    //! wired by any acceptance arena yet — they are ignored here.
+
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+    use axum::extract::{Request, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc::UnboundedSender;
+
+    /// `userId` → live `main` subscriptions (channel id + sink). The channel
+    /// id is the client-chosen subscription handle replayed in every push
+    /// (`sendMessageToWs` wraps `{ type, body }`; channel events carry
+    /// `{ id, type: eventType, body }`).
+    type Registry = Mutex<HashMap<String, Vec<(String, UnboundedSender<String>)>>>;
+
+    static MAIN_SINKS: LazyLock<Registry> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// `GlobalEventService.publishMainStream(userId, type, value)`.
+    pub fn publish_main(user_id: &str, event_type: &str, event_body: Value) {
+        let sinks: Vec<(String, UnboundedSender<String>)> = {
+            let Ok(reg) = MAIN_SINKS.lock() else {
+                return;
+            };
+            reg.get(user_id).cloned().unwrap_or_default()
+        };
+        for (sub_id, tx) in sinks {
+            let frame = json!({
+                "type": "channel",
+                "body": { "id": sub_id, "type": event_type, "body": event_body },
+            });
+            let _ = tx.send(frame.to_string());
+        }
+    }
+
+    /// Route handler (main.rs: `/streaming`, GET + Upgrade). The websocket
+    /// upgrade is taken as an extractor before the body request so a
+    /// non-upgrade ping 400s like upstream's `wss` check.
+    pub async fn entry(
+        State(state): State<crate::AppState>,
+        ws: WebSocketUpgrade,
+        req: Request,
+    ) -> Response {
+        // Auth mirrors StreamingApiServerService: `Authorization: Bearer`
+        // wins over the `i` query param; failures are a bare 401.
+        let query = req.uri().query().unwrap_or_default();
+        let token = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(|s| s.to_string())
+            .or_else(|| {
+                query.split('&').find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    (k == "i").then(|| v.to_string())
+                })
+            });
+
+        let Some(pool) = &state.pool else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let Some(user_id) = super::super::resolve_me(pool, token.as_deref()).await else {
+            let mut resp = StatusCode::UNAUTHORIZED.into_response();
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(
+                    "Bearer realm=\"Misskey\", error=\"invalid_token\", error_description=\"Failed to authenticate\"",
+                ),
+            );
+            return resp;
+        };
+        // Suspended users are refused (403) like the upstream upgrade path.
+        match mk_db::user::find_user_by_id(pool, &user_id).await {
+            Ok(Some(row)) if row.is_suspended => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Ok(_) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+
+        ws.on_upgrade(move |socket| handle_socket(user_id, socket))
+    }
+
+    async fn handle_socket(user_id: String, socket: WebSocket) {
+        let (mut sink, mut source) = socket.split();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Forward task: registry fanout → socket sink.
+        let forward = tokio::spawn(async move {
+            while let Some(text) = event_rx.recv().await {
+                if sink.send(Message::text(text)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Recv loop: parse client frames; only `connect` matters here.
+        while let Some(Ok(msg)) = source.next().await {
+            // (parens: a block-like scrutinee in a let-else needs them)
+            let Value::Object(obj) = (match msg {
+                Message::Text(t) => serde_json::from_str(t.as_str()).unwrap_or(Value::Null),
+                Message::Close(_) => break,
+                _ => continue,
+            },) else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("connect") {
+                match obj.get("type").and_then(Value::as_str) {
+                    Some("disconnect") => {
+                        if let Some(id) = obj
+                            .get("body")
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                        {
+                            if let Ok(mut reg) = MAIN_SINKS.lock() {
+                                if let Some(v) = reg.get_mut(&user_id) {
+                                    v.retain(|(sid, _)| sid != &id);
+                                }
+                            }
+                        }
+                    }
+                    // readNotification / sr / s / unsubNote / channel frames:
+                    // no-op in this slice.
+                    _ => {}
+                }
+                continue;
+            }
+            let Some(body) = obj.get("body") else {
+                continue;
+            };
+            let Some(channel) = body.get("channel").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(sub_id) = body.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            // requireCredential channels need `user != null` (main qualifies);
+            // an unknown channel name throws upstream and connects nothing.
+            if channel != "main" {
+                continue;
+            }
+            let registered = {
+                let Ok(mut reg) = MAIN_SINKS.lock() else {
+                    break;
+                };
+                let entry = reg.entry(user_id.clone()).or_default();
+                entry.retain(|(sid, _)| sid != sub_id);
+                entry.push((sub_id.to_string(), event_tx.clone()));
+                true
+            };
+            if registered && body.get("pong").and_then(Value::as_bool) == Some(true) {
+                let frame = json!({ "type": "connected", "body": { "id": sub_id } });
+                let _ = event_tx.send(frame.to_string());
+            }
+        }
+
+        {
+            if let Ok(mut reg) = MAIN_SINKS.lock() {
+                reg.remove(&user_id);
+            }
+        }
+        forward.abort();
+    }
+}
 
 use axum::Json;
 use axum::extract::Request;
@@ -23,6 +212,21 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{ApiError, api_err};
+
+/// JSON drive endpoints of this slice — mod.rs routes
+/// `drive/files/attached-notes` + `drive/files/upload-from-url` here.
+pub(crate) async fn handle_json(
+    state: &AppState,
+    name: &str,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    match name {
+        "drive/files/attached-notes" => attached_notes(state, body, token).await,
+        "drive/files/upload-from-url" => files_upload_from_url(state, body, token).await,
+        _ => api_err(ApiError::unknown_endpoint()),
+    }
+}
 
 /// POST /api/drive/files/create — requireCredential multipart upload.
 pub async fn files_create(state: AppState, req: Request) -> Response {
@@ -107,21 +311,22 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         .or_else(|| sniffed.clone())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // name = ps.name ?? file.name (trim, 'blob'/empty → keep upstream
-    // fallback of the uploaded filename basename)
+    // name = ps.name ?? blob basename, run through correctFileName (the
+    // drive.ts 'ローカルからアップロードできる' case pins name 'テスト画像' +
+    // a jpeg blob → 'テスト画像.jpg').
     let raw_name = field(&parts, "name")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
-    let name = raw_name
+    let base_name = raw_name
         .unwrap_or(&file.0)
         .rsplit('/')
         .next()
         .unwrap_or("untitled")
         .to_string();
-    let name = if name.is_empty() || name == "blob" {
-        "untitled".to_string()
+    let name = if base_name.is_empty() || base_name == "blob" {
+        correct_filename("untitled", sniffed.as_deref().and_then(mime_ext))
     } else {
-        name
+        correct_filename(&base_name, sniffed.as_deref().and_then(mime_ext))
     };
 
     let id = mk_types::id::gen_aid_now();
@@ -132,10 +337,7 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         mk_core::services::signup::secure_rndstr(24),
         name
     );
-    let properties = match sniffed.as_deref() {
-        Some("image/jpeg") | Some("image/png") | Some("image/gif") => json!({}),
-        _ => json!({}),
-    };
+    let properties = json!({});
     let blurhash = Some(blurhash_placeholder(&digest));
 
     let row = mk_db::drive::DriveFileRow {
@@ -149,6 +351,15 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         url: url.clone(),
         webpublic_url: None,
         properties: properties.clone(),
+        // drive/files/create also takes comment/isSensitive/folderId fields;
+        // the multipart parser reads them when present.
+        comment: field(&parts, "comment")
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        is_sensitive: field(&parts, "isSensitive") == Some("true"),
+        folder_id: field(&parts, "folderId")
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
     };
     let access_key = mk_core::services::signup::secure_rndstr(32);
     if let Err(e) = mk_db::drive::insert_drive_file(pool, &row, &access_key).await {
@@ -156,29 +367,286 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         return api_err(ApiError::internal_error());
     }
 
-    // pack(driveFile, { self: true }) — detailed shape
-    let created_at = mk_types::id::parse_aid_date(&id)
+    let packed = pack_drive_file(&row, true);
+    (StatusCode::OK, Json(packed)).into_response()
+}
+
+/// `DriveFileEntityService.pack(file, { self })` subset (no `detail` folder
+/// recursion and no `withUser` user packing in this slice — both stay null
+/// for local files the arenas see). Field presence mirrors the upstream
+/// `awaitAll` literal: `{ self: true }` → raw properties/url (the e2e
+/// upload round-trips assert `name`/`type` off this shape).
+pub(crate) fn pack_drive_file(row: &mk_db::drive::DriveFileRow, self_mode: bool) -> Value {
+    let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
-    let packed = json!({
-        "id": id,
+    json!({
+        "id": row.id,
         "createdAt": created_at,
-        "name": name,
-        "type": mime,
-        "md5": digest,
+        "name": row.name,
+        "type": row.file_type,
+        "md5": row.md5,
         "size": row.size,
-        "isSensitive": false,
-        "blurhash": blurhash,
-        "properties": properties,
-        "url": url,
+        "isSensitive": row.is_sensitive,
+        "blurhash": row.blurhash,
+        "properties": if self_mode { row.properties.clone() } else { get_public_properties(row) },
+        "url": if self_mode { row.url.clone() } else { get_public_url_from_row(row) },
         "thumbnailUrl": Value::Null,
-        "comment": Value::Null,
-        "folderId": Value::Null,
+        "comment": row.comment,
+        "folderId": row.folder_id,
         "folder": Value::Null,
-        "userId": me_id,
+        "userId": row.user_id,
+        "user": Value::Null,
         "userHost": Value::Null,
+    })
+}
+
+/// `getPublicProperties` subset: non-self packs strip image dimensions down
+/// to width/height only when the row's own properties carry them.
+fn get_public_properties(row: &mk_db::drive::DriveFileRow) -> Value {
+    let width = row.properties.get("width");
+    let height = row.properties.get("height");
+    if width.is_none() && height.is_none() {
+        return json!({});
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(w) = width {
+        out.insert("width".into(), w.clone());
+    }
+    if let Some(h) = height {
+        out.insert("height".into(), h.clone());
+    }
+    Value::Object(out)
+}
+
+fn get_public_url_from_row(row: &mk_db::drive::DriveFileRow) -> String {
+    row.webpublic_url.clone().unwrap_or_else(|| row.url.clone())
+}
+
+/// `POST /api/drive/files/attached-notes` (upstream
+/// endpoints/drive/files/attached-notes.ts): requireCredential; 400
+/// NO_SUCH_FILE when the file is missing or foreign (moderator bypass
+/// unported — the role table has no moderator wiring in this slice); notes
+/// through `fileIds @> ARRAY[fileId]` + pagination, packed detail.
+async fn attached_notes(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let Some(file_id) = body.get("fileId").and_then(Value::as_str) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "fileId",
+            "reason": "required",
+        })));
+    };
+
+    // limit 1..=100 default 10 (paramDef); sinceId/untilId nullable ids.
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 10i64,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=100).contains(&n) => n,
+            _ => {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "limit",
+                    "reason": "must be an integer in 1..=100",
+                })));
+            }
+        },
+    };
+    let since_id = body.get("sinceId").and_then(Value::as_str);
+    let until_id = body.get("untilId").and_then(Value::as_str);
+
+    // findOneBy({ id, userId: me }) — foreign files do not exist for the
+    // caller (drive.ts '添付ノート一覧は他の人から見えない' pins 400 + error
+    // body).
+    let file = match mk_db::drive::find_drive_file(pool, file_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "find_drive_file");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let owned = matches!(&file, Some(f) if f.user_id.as_deref() == Some(me_id.as_str()));
+    if !owned {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_FILE",
+            "c118ece3-2e4b-4296-99d1-51756e32d232",
+            "No such file.",
+        ));
+    }
+
+    let note_ids =
+        match mk_db::drive::note_ids_attaching_file(pool, file_id, since_id, until_id, limit).await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(target: "dbg_drive", error = %e, "note_ids_attaching_file");
+                return api_err(ApiError::internal_error());
+            }
+        };
+
+    let mut out = Vec::with_capacity(note_ids.len());
+    for note_id in &note_ids {
+        match super::pack_note(state, pool, note_id).await {
+            Ok(n) => out.push(n),
+            Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `POST /api/drive/files/upload-from-url` (upstream
+/// endpoints/drive/files/upload-from-url.ts): requireCredential, 204 with
+/// the download + insert + urlUploadFinished push running after the
+/// response (upstream defers to the job queue).
+async fn files_upload_from_url(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let Some(url) = body.get("url").and_then(Value::as_str) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "url",
+            "reason": "required",
+        })));
+    };
+    let marker = body.get("marker").and_then(Value::as_str).map(String::from);
+    let is_sensitive = body.get("isSensitive").and_then(Value::as_bool) == Some(true);
+    let comment = body
+        .get("comment")
+        .and_then(Value::as_str)
+        .map(|s| s.chars().take(512).collect::<String>());
+    let force = body.get("force").and_then(Value::as_bool) == Some(true);
+    let folder_id = body
+        .get("folderId")
+        .and_then(Value::as_str)
+        .map(String::from);
+    // force has no same-hash dedupe to bypass (TODO(M4): md5 dedupe when the
+    // byte store lands) — parsed for param parity.
+
+    let pool = pool.clone();
+    let instance_url = state.config.url.clone();
+    let me_id = me_id.clone();
+    let url = url.to_string();
+    tokio::spawn(async move {
+        process_url_upload(
+            pool,
+            instance_url,
+            me_id,
+            url,
+            marker,
+            is_sensitive,
+            comment,
+            folder_id,
+        )
+        .await;
     });
-    (StatusCode::OK, Json(packed)).into_response()
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DriveService.uploadFromUrl` async half: download → addFile semantics →
+/// publishMainStream 'urlUploadFinished'. Failures log and publish nothing,
+/// matching the upstream downloader error path.
+#[allow(clippy::too_many_arguments)]
+async fn process_url_upload(
+    pool: mk_db::sqlx::PgPool,
+    instance_url: String,
+    me_id: String,
+    url: String,
+    marker: Option<String>,
+    is_sensitive: bool,
+    comment: Option<String>,
+    folder_id: Option<String>,
+) {
+    let bytes = match download(&url).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "dbg_drive", url = %url, error = %e, "upload_from_url download failed");
+            return;
+        }
+    };
+
+    // DownloadService.downloadUrl: name = URL pathname basename.
+    let name_raw = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("untitled");
+    let mime = sniff_mime(&bytes);
+    let name = correct_filename(
+        if name_raw.is_empty() {
+            "untitled"
+        } else {
+            name_raw
+        },
+        mime.as_deref().and_then(mime_ext),
+    );
+
+    let id = mk_types::id::gen_aid_now();
+    let digest = md5_hex(&bytes);
+    let stored_url = format!(
+        "{}/files/{}/{}",
+        instance_url.trim_end_matches('/'),
+        mk_core::services::signup::secure_rndstr(24),
+        name
+    );
+    // uploadFromUrl: "If the comment is same as the name, skip comment".
+    let comment = comment.filter(|c| c != &name);
+    let properties = json!({});
+    let blurhash = Some(blurhash_placeholder(&digest));
+
+    let row = mk_db::drive::DriveFileRow {
+        id: id.clone(),
+        user_id: Some(me_id.clone()),
+        md5: digest,
+        name: name.clone(),
+        file_type: mime.unwrap_or_else(|| "application/octet-stream".to_string()),
+        size: bytes.len() as i32,
+        blurhash,
+        url: stored_url,
+        webpublic_url: None,
+        properties,
+        comment,
+        is_sensitive,
+        folder_id: folder_id.filter(|f| !f.is_empty()),
+    };
+    let access_key = mk_core::services::signup::secure_rndstr(32);
+    if let Err(e) = mk_db::drive::insert_drive_file(&pool, &row, &access_key).await {
+        tracing::error!(target: "dbg_drive", error = %e, "upload_from_url insert");
+        return;
+    }
+
+    let packed = pack_drive_file(&row, true);
+    streaming::publish_main(
+        &me_id,
+        "urlUploadFinished",
+        json!({ "marker": marker, "file": packed }),
+    );
+}
+
+/// Simple HTTPS/HTTP GET (DownloadService.downloadUrl subset: no redirects,
+/// size caps or SSRF checks yet — TODO(M4) HttpRequestService parity).
+async fn download(url: &str) -> Result<Vec<u8>, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    Ok(bytes.to_vec())
 }
 
 struct Part {
@@ -270,6 +738,59 @@ fn sniff_mime(data: &[u8]) -> Option<String> {
         Some("image/webp".to_string())
     } else {
         None
+    }
+}
+
+/// `file-type` ext subset for the sniffed MIMEs (jpeg ext is `jpg`).
+fn mime_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// `misc/correct-filename.ts` — reconcile a filename with the detected
+/// extension: missing ext → appended; mismatched ext → appended too
+/// (jpeg/tiff and exe/dll treated as synonyms; archive exts never touched;
+/// unknown ext (`null`) leaves the filename alone).
+fn correct_filename(filename: &str, ext: Option<&str>) -> String {
+    const TARGET_EXTS_TO_SKIP: [&str; 7] = [".gz", ".tar", ".tgz", ".bz2", ".xz", ".zip", ".7z"];
+    let dot_ext = match ext {
+        Some(e) => {
+            if e.starts_with('.') {
+                e.to_string()
+            } else {
+                format!(".{e}")
+            }
+        }
+        None => ".unknown".to_string(),
+    };
+
+    let ext_regexp_end = filename.char_indices().rev().find_map(|(i, _)| {
+        filename
+            .get(i..)
+            .filter(|s| s.starts_with('.') && s[1..].chars().all(|c| c.is_ascii_alphanumeric()))
+    });
+    let filename_ext = ext_regexp_end.map(|s| s.to_ascii_lowercase());
+
+    match filename_ext {
+        None => format!("{filename}{dot_ext}"),
+        Some(fe) => {
+            if ext.is_none()
+                || fe == dot_ext
+                || (dot_ext == ".jpg" && fe == ".jpeg")
+                || (dot_ext == ".tif" && fe == ".tiff")
+                || (dot_ext == ".exe" && fe == ".dll")
+                || TARGET_EXTS_TO_SKIP.contains(&dot_ext.as_str())
+            {
+                filename.to_string()
+            } else {
+                format!("{filename}{dot_ext}")
+            }
+        }
     }
 }
 
@@ -418,5 +939,31 @@ mod tests {
         assert_eq!(parts[1].data, b"true");
         assert_eq!(parts[2].name, "i");
         assert_eq!(parts[2].data, b"tokenvalue123456");
+    }
+
+    #[test]
+    fn correct_filename_upload_parity() {
+        // drive.ts 'テスト画像' + jpeg bytes → 'テスト画像.jpg'
+        assert_eq!(
+            correct_filename("テスト画像", Some("jpg")),
+            "テスト画像.jpg"
+        );
+        // ext already matches → untouched
+        assert_eq!(correct_filename("192.jpg", Some("jpg")), "192.jpg");
+        // jpeg ext synonym
+        assert_eq!(correct_filename("192.jpeg", Some("jpg")), "192.jpeg");
+        // no ext on the detected type → guess stays
+        assert_eq!(correct_filename("data", None), "data");
+        // unknown type with an ext → unchanged
+        assert_eq!(correct_filename("data.bin", None), "data.bin");
+        // unknown type without an ext → .unknown
+        assert_eq!(correct_filename("data2", None), "data2.unknown");
+        // archive exts never recomposed
+        assert_eq!(
+            correct_filename("archive.dat.gz", Some("zip")),
+            "archive.dat.gz"
+        );
+        // mismatched ext is appended, not replaced
+        assert_eq!(correct_filename("notes.txt", Some("png")), "notes.txt.png");
     }
 }

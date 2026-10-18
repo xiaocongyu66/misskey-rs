@@ -18,7 +18,11 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+# drive lane: reqwest = the DriveService.uploadFromUrl downloader; futures-util
+# = the /streaming websocket hub (split + forward task over ws::WebSocket).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+futures-util = "0.3"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
