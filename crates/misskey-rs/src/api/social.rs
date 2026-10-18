@@ -1146,17 +1146,14 @@ pub(crate) async fn timeline_or_hybrid(
     }
 }
 
-/// Credential gate for simple (me, body) note endpoints.
-pub(crate) async fn credential_gate<F, Fut>(
+/// Credential gate + explicit dispatch for the two (me, body) note endpoints
+/// (closure-based generic gate trips HRTB lifetimes — keep this concrete).
+pub(crate) async fn note_credential_dispatch(
     state: &AppState,
+    name: &str,
     body: &Value,
     token: Option<&str>,
-    handler: F,
-) -> Response
-where
-    F: FnOnce(&AppState, &Value, &str) -> Fut,
-    Fut: std::future::Future<Output = Response>,
-{
+) -> Response {
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
@@ -1164,5 +1161,9 @@ where
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    handler(state, body, &me_id).await
+    if name == "notes/reactions/create" {
+        notes_reactions_create(state, body, &me_id).await
+    } else {
+        notes_delete(state, body, &me_id).await
+    }
 }

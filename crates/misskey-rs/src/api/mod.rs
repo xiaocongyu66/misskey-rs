@@ -137,16 +137,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "notes/reactions" {
             return social::notes_reactions(&state, &body).await;
         }
-        if name == "notes/reactions/create" {
-            return social::credential_gate(&state, &body, token.as_deref(), |s, b, me| {
-                social::notes_reactions_create(s, b, me)
-            })
-            .await;
-        }
-        if name == "notes/delete" {
-            return social::credential_gate(&state, &body, token.as_deref(), |s, b, me| {
-                social::notes_delete(s, b, me)
-            })
+        if name == "notes/reactions/create" || name == "notes/delete" {
+            return social::note_credential_dispatch(
+                &state,
+                name.as_str(),
+                &body,
+                token.as_deref(),
+            )
             .await;
         }
         return users_show(&state, &body, token).await;
