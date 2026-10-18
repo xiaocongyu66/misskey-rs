@@ -149,7 +149,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return notes_create(&state, &body, token).await;
         }
         if name == "notes/show" {
-            return notes_show(&state, &body).await;
+            return notes_show(&state, &body, token).await;
         }
         if name == "users/search" {
             return users_search(&state, &body, token).await;
@@ -3165,8 +3165,10 @@ async fn pack_note_for(
     }
 }
 
-/// `POST /api/notes/show` — noteId lookup.
-async fn notes_show(state: &AppState, body: &Value) -> Response {
+/// `POST /api/notes/show` — noteId lookup. Guest-ok, but a riding credential
+/// packs the viewer in (populatePoll isVoted / myReaction require it; an
+/// invalid riding credential still 401s through the ApiCallService auth).
+async fn notes_show(state: &AppState, body: &Value, token: Option<&str>) -> Response {
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
@@ -3176,7 +3178,18 @@ async fn notes_show(state: &AppState, body: &Value) -> Response {
             "reason": "required",
         })));
     };
-    match pack_note(state, pool, note_id).await {
+    let me_id = match token {
+        Some(t) => match mk_db::user::find_local_user_id_by_token(pool, t).await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return authentication_failed(),
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "find_local_user_id_by_token[show]");
+                return api_err(ApiError::internal_error());
+            }
+        },
+        None => None,
+    };
+    match pack_note_for(state, pool, note_id, me_id.as_deref()).await {
         Ok(n) => (StatusCode::OK, Json(n)).into_response(),
         Err(r) => *r,
     }
