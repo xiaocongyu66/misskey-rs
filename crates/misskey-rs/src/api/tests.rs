@@ -6080,8 +6080,10 @@ async fn user_list_timeline_filters_pager_channel() {
         assert_eq!(s, StatusCode::OK, "body: {v}");
         v["createdNote"]["id"].as_str().unwrap().to_string()
     }
-    async fn fetch_tl(app: &axum::Router, mut params: Value) -> Value {
-        params["i"] = json!(at);
+    // E0434: fn items cannot capture the test's `at` — bind the token as a
+    // parameter instead (call sites thread it through).
+    async fn fetch_tl(app: &axum::Router, mut params: Value, token: &str) -> Value {
+        params["i"] = json!(token);
         let (s, v) = post_json(app.clone(), "/api/notes/user-list-timeline", params).await;
         assert_eq!(s, StatusCode::OK, "body: {v}");
         v
@@ -6117,20 +6119,20 @@ async fn user_list_timeline_filters_pager_channel() {
     let n1 = note_post(&app, json!({ "text": "p1", "i": bt })).await;
     let n2 = note_post(&app, json!({ "text": "p2", "i": bt })).await;
     let n3 = note_post(&app, json!({ "text": "p3", "i": bt })).await;
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(has(&res, &n1));
     assert!(has(&res, &n3));
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 1 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 1 }), at).await;
     let arr = res.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["id"], json!(n3), "newest first");
-    let res = fetch_tl(&app, json!({ "listId": list_id, "untilId": n3 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "untilId": n3 }), at).await;
     assert!(has(&res, &n2), "untilId is exclusive-bound DESC");
     assert!(lacks(&res, &n3));
-    let res = fetch_tl(&app, json!({ "listId": list_id, "sinceId": n1 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "sinceId": n1 }), at).await;
     assert!(has(&res, &n3), "sinceId is exclusive-bound ASC");
     assert!(lacks(&res, &n1));
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(
         has(&res, &n1) && has(&res, &n3),
         "unbounded fetch carries all"
@@ -6156,11 +6158,11 @@ async fn user_list_timeline_filters_pager_channel() {
         json!({ "text": "ok", "channelId": channel_id, "i": bt }),
     )
     .await;
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(lacks(&res, &n_ch));
     assert!(lacks(&res, &n_ch_note), "member channel note excluded");
-    let n_ch_renote = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let n_ch_renote = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(
         has(&res, &n_ch_renote),
         "external renote of a channel note flows"
@@ -6182,18 +6184,19 @@ async fn user_list_timeline_filters_pager_channel() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("ALREADY_MUTING_CHANNEL"));
-    let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(lacks(&res, &n_ch_renote2), "muted channel renote drops out");
     assert!(has(&res, &n_ch_renote), "pre-mute renote unaffected");
 
     // -- withFiles: true keeps the file notes only ------------------------
     let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
-    let n_txt = note_post(&app, json!({ "text": "txt", "i": bt })).await;
-    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let n_txt = note_post(&app, json!({ "text": "txt", "i": bt }), at).await;
+    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt }), at).await;
     let res = fetch_tl(
         &app,
         json!({ "listId": list_id, "withFiles": true, "limit": 100 }),
+        at,
     )
     .await;
     assert!(lacks(&res, &n_txt));
@@ -6205,12 +6208,13 @@ async fn user_list_timeline_filters_pager_channel() {
         json!({ "text": "home", "visibility": "home", "i": dt }),
     )
     .await;
-    let n_renote = note_post(&app, json!({ "renoteId": n_dave_home, "i": bt })).await;
-    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    let n_renote = note_post(&app, json!({ "renoteId": n_dave_home, "i": bt }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(has(&res, &n_renote), "default withRenotes keeps renotes");
     let res = fetch_tl(
         &app,
         json!({ "listId": list_id, "withRenotes": false, "limit": 100 }),
+        at,
     )
     .await;
     assert!(lacks(&res, &n_renote));
@@ -6457,14 +6461,14 @@ async fn user_list_timeline_ul_tl2_specified_pager_window_withfiles() {
         json!({ "text": "dm-ride", "visibility": "specified", "visibleUserIds": [a], "i": bt }),
     )
     .await;
-    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(has(&res, &n_spec_me), "specified addressed to me rides");
     let n_spec_other = note_post(
         &app,
         json!({ "text": "dm-hold", "visibility": "specified", "visibleUserIds": [c], "i": bt }),
     )
     .await;
-    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(
         lacks(&res, &n_spec_other),
         "specified addressed to the other member stays out"
@@ -6479,7 +6483,7 @@ async fn user_list_timeline_ul_tl2_specified_pager_window_withfiles() {
         json!({ "text": "fol-reply", "visibility": "followers", "replyId": n_a_home, "i": bt }),
     )
     .await;
-    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(
         has(&res, &n_b_folreply),
         "followers reply addressed to me rides unfollowed"
