@@ -56,6 +56,12 @@ fn expand(
     // produced `$3:varchar[]` — a postgres syntax error at the cast ("syntax
     // error at or near "":""), the 500 behind timelines_matrix_home_local_hybrid.
     // Longest-name-first matching keeps :ME: from clobbering :MELIST:.
+    //
+    // Bare-token fallback: the comparison half of the PAGER bounds was once
+    // written `n."id" < :UNTIL` (no closing colon); neither the old replace
+    // nor a strict scanner matched it, the naked `:UNTIL` reached postgres
+    // and 500ed EVERY timeline fetch. A token followed by a non-word char
+    // now binds too; `:MEx`-style alnum followers stay verbatim.
     const NAMES: [&str; 7] = ["MELIST", "ME", "FOL", "UNTIL", "SINCE", "LIMIT", "DIR"];
     let bind_of = |name: &str| -> String {
         match name {
@@ -79,15 +85,25 @@ fn expand(
                 let rest = &sql[i + 1..];
                 if rest.starts_with(name) {
                     let close = i + 1 + name.len();
-                    if bytes.get(close) == Some(&b':') {
-                        out.push_str(&bind_of(name));
-                        // `:NAME::…` — the closing colon is the cast's first
-                        // half; emit it so the following `:` completes `::`.
-                        if bytes.get(close + 1) == Some(&b':') {
-                            out.push(':');
+                    match bytes.get(close) {
+                        // Proper `:NAME:` token — and when the closing colon
+                        // is the first half of a `::` cast, re-emit it.
+                        Some(&b':') => {
+                            out.push_str(&bind_of(name));
+                            if bytes.get(close + 1) == Some(&b':') {
+                                out.push(':');
+                            }
+                            i = close + 1;
+                            matched = true;
                         }
-                        i = close + 1;
-                        matched = true;
+                        // Bare-token fallback (see doc above): `:NAME)` /
+                        // `:NAME ` binds instead of leaking the token.
+                        Some(&c) if !c.is_ascii_alphanumeric() && c != b'_' => {
+                            out.push_str(&bind_of(name));
+                            i = close;
+                            matched = true;
+                        }
+                        _ => {}
                     }
                     break;
                 }
@@ -110,8 +126,8 @@ fn dir_asc(since_id: Option<&str>) -> &'static str {
 const INNER: &str =
     r#"SELECT n."id" FROM "note" n INNER JOIN "user" u ON u."id" = n."userId" WHERE "#;
 
-const PAGER: &str = r#" AND (:UNTIL::varchar IS NULL OR n."id" < :UNTIL)
-            AND (:SINCE::varchar IS NULL OR n."id" > :SINCE)
+const PAGER: &str = r#" AND (:UNTIL::varchar IS NULL OR n."id" < :UNTIL::varchar)
+            AND (:SINCE::varchar IS NULL OR n."id" > :SINCE::varchar)
             ORDER BY n."id" :DIR: LIMIT :LIMIT:"#;
 
 /// keep non-renotes and quotes only (withRenotes=false /
@@ -402,5 +418,38 @@ mod tests {
         assert!(guest.contains(r#""userId" = $4"#), "{guest}");
         let me = expand(RENOTE_CHANNEL_MUTE, 2, 3, 1, 4, 5, 6, "");
         assert!(me.contains(r#""userId" = $2"#), "{me}");
+    }
+
+    /// The PAGER bounds must expand BOTH halves: the cast half
+    /// (`:UNTIL::varchar`) and the comparison half. A leak of a naked
+    /// `:UNTIL` (tl-v3c: the 500 behind every timeline fetch — postgres
+    /// "syntax error at or near "":"") or any other token is fatal.
+    #[test]
+    fn pager_expands_cast_and_comparison_bounds() {
+        let out = expand(PAGER, 2, 3, 1, 4, 5, 6, "DESC");
+        assert!(
+            out.contains(r#"($4::varchar IS NULL OR n."id" < $4::varchar)"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"($5::varchar IS NULL OR n."id" > $5::varchar)"#),
+            "{out}"
+        );
+        assert!(out.contains(r#"ORDER BY n."id" DESC LIMIT $6"#), "{out}");
+        for leak in [
+            ":UNTIL", ":SINCE", ":LIMIT", ":DIR", ":ME", ":FOL", ":MELIST",
+        ] {
+            assert!(!out.contains(leak), "leaked {leak}: {out}");
+        }
+    }
+
+    /// Bare-token fallback: a token without its closing colon (template
+    /// leak, delimiter-followed) still expands — and an alnum follower
+    /// (`:MEx`) stays verbatim so false positives stay impossible.
+    #[test]
+    fn expand_binds_bare_token_but_not_alnum_follower() {
+        let out = expand(r#"n."id" < :UNTIL) AND x = :ME:"#, 2, 3, 1, 4, 5, 6, "");
+        assert_eq!(out, r#"n."id" < $4) AND x = $2"#);
+        assert_eq!(expand(":MEx", 2, 3, 1, 4, 5, 6, ""), ":MEx");
     }
 }
