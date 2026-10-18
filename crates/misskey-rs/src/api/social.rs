@@ -1021,9 +1021,11 @@ pub(crate) async fn notes_hybrid_timeline(
             body.get("withFiles")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // upstream paramDef default: false (hybrid-timeline.ts L70) — the
+            // social-TL reply gate is ON unless the caller opens it
             body.get("withReplies")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true),
+                .unwrap_or(false),
         )
         .await,
     )
