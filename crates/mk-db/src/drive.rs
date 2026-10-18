@@ -146,8 +146,9 @@ pub async fn note_ids_attaching_file(
     until_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, sqlx::Error> {
+    let file_id_param = [file_id.to_string()];
     let mut q = sqlx::QueryBuilder::new(r#"SELECT "id" FROM "note" WHERE "fileIds" @> "#);
-    q.push_bind(&[file_id][..]);
+    q.push_bind(&file_id_param[..]);
     if let Some(since) = since_id {
         q.push(r#" AND "id" > "#).push_bind(since);
     }

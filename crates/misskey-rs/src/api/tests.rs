@@ -4905,3 +4905,185 @@ async fn notes_create_word_ladders() {
         );
     }
 }
+
+#[tokio::test]
+async fn notes_create_mentions_and_translate_ladder() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_note_mentions").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // 同じユーザーに複数メンションしても内部的にまとめられる (user ids, dedup)
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "@bob @bob @bob yo", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
+    let row = mk_db::note::find_note_by_id(&pool, &note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.mentions, vec![bob_id.clone()], "db mentions");
+
+    // 存在しないユーザーにメンションできる (resolves to nothing, stays 200)
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "@ghost yo", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    let ghost_id = note["createdNote"]["id"].as_str().unwrap().to_string();
+    let row = mk_db::note::find_note_by_id(&pool, &ghost_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.mentions.is_empty());
+
+    // メンションの数が上限を超えるとエラーになる (mentionLimit policy 0)
+    let (s, role) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({
+            "name": "test",
+            "description": "",
+            "color": null,
+            "iconUrl": null,
+            "displayOrder": 0,
+            "target": "manual",
+            "condFormula": {},
+            "isAdministrator": false,
+            "isModerator": false,
+            "isPublic": false,
+            "isExplorable": false,
+            "asBadge": false,
+            "canEditMembersByModerator": false,
+            "policies": { "mentionLimit": { "useDefault": false, "priority": 1, "value": 0 } },
+            "i": r_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "@bob potentially annoying text", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err["error"]["code"],
+        json!("CONTAINS_TOO_MANY_MENTIONS"),
+        "body: {err}"
+    );
+    // ダイレクト投稿もエラーになる
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "potentially annoying text",
+            "visibility": "specified",
+            "visibleUserIds": [bob_id],
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"]["code"], json!("CONTAINS_TOO_MANY_MENTIONS"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/unassign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/delete",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // notes/translate ladder: unknown note → NO_SUCH_NOTE (400)
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/translate",
+        json!({ "noteId": "foo", "targetLang": "ja", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_NOTE"), "body: {err}");
+
+    // default install (no DeepL key) → UNAVAILABLE
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/translate",
+        json!({ "noteId": note_id, "targetLang": "ja", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"]["code"], json!("UNAVAILABLE"), "body: {err}");
+
+    // text:null poll note → 204 空レスポンス
+    let (s, null_note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": null,
+            "poll": { "choices": ["kinoko", "takenoko"] },
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {null_note}");
+    assert_eq!(null_note["createdNote"]["text"], json!(null));
+    let null_id = null_note["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/translate",
+        json!({ "noteId": null_id, "targetLang": "ja", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    // bare create → visible on users/notes (freq path) and on the global notes list
+    let (s, res) = post_json(
+        app.clone(),
+        "/api/users/notes",
+        json!({ "userId": alice["id"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(
+        res.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["text"] == json!("test")),
+        "users/notes carries the note: {res}"
+    );
+    let (s, res) = post_json(app.clone(), "/api/notes", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    let arr = res.as_array().unwrap();
+    assert!(arr.iter().all(|n| n["visibility"] == json!("public")));
+    assert!(arr.iter().any(|n| n["id"] == json!(note_id)));
+}

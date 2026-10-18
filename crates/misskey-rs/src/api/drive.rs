@@ -340,6 +340,16 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
     let properties = json!({});
     let blurhash = Some(blurhash_placeholder(&digest));
 
+    // note.ts NSFW census (DriveService.addFile): the uploader's merged
+    // `alwaysMarkNsfw` role policy forces the flag on (`if (userRoleNSFW)
+    // file.isSensitive = true`).
+    let uploader_always_nsfw = match mk_db::role::user_assigned_roles(pool, &me_id).await {
+        Ok(assigned) => mk_core::services::role::UserPolicy::compute(&assigned).always_mark_nsfw,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "user_assigned_roles");
+            return api_err(ApiError::internal_error());
+        }
+    };
     let row = mk_db::drive::DriveFileRow {
         id: id.clone(),
         user_id: Some(me_id.clone()),
@@ -356,7 +366,7 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         comment: field(&parts, "comment")
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty()),
-        is_sensitive: field(&parts, "isSensitive") == Some("true"),
+        is_sensitive: field(&parts, "isSensitive") == Some("true") || uploader_always_nsfw,
         folder_id: field(&parts, "folderId")
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty()),
