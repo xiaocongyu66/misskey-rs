@@ -3317,9 +3317,13 @@ async fn frequently_replied_orders_and_gates() {
         json!("e6965129-7b2a-40a4-bae2-cd84cd434822")
     );
 
-    // emergent block gate: dave blocks alice → excluded from her list even
-    // though this server still accepted the reply at creation time;
-    // mallory (blocked BY alice) stays included
+    // emergent block gate: the creation-time reject is upstream too —
+    // dave blocks alice → her NEW reply to dave's note 400s
+    // (NoteCreateService.fetchAndCreate L383-391 via the notes/create
+    // endpoint, L99 YOU_HAVE_BEEN_BLOCKED) while the pre-block d-replies
+    // still count in the list and the blocker is excluded at query time
+    // (TARGET_BLOCKER_GATE); mallory (blocked BY alice — the reverse
+    // direction is not a gate) accepts the reply and stays included
     let (s, _) = post_json(
         app.clone(),
         "/api/blocking/create",
@@ -3334,15 +3338,29 @@ async fn frequently_replied_orders_and_gates() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    for target in [&d1, &m1] {
-        let (s, body) = post_json(
-            app.clone(),
-            "/api/notes/create",
-            json!({ "text": "re2", "replyId": target, "i": a_token }),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK, "body: {body}");
-    }
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "re2", "replyId": d1, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(
+        body["error"]["code"],
+        json!("YOU_HAVE_BEEN_BLOCKED"),
+        "body: {body}"
+    );
+    assert_eq!(
+        body["error"]["id"],
+        json!("b0df6025-f2e8-44b4-a26a-17ad99104612")
+    );
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "re2", "replyId": m1, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
     let (s, body) = post_json(
         app.clone(),
         "/api/users/get-frequently-replied-users",
