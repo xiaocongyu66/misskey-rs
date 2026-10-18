@@ -102,17 +102,12 @@ pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
     o.insert("userId".into(), json!(row.user_id));
     o.insert("user".into(), parts.user_lite.clone());
     o.insert("text".into(), json!(row.text));
-    // upstream pack: optional fields are ABSENT when unset (e2e exact-field
-    // sets) — cw/replyId/renoteId/channelId only when set.
-    if let Some(cw) = &row.cw {
-        o.insert("cw".into(), json!(cw));
-    }
-    if let Some(reply_id) = &row.reply_id {
-        o.insert("replyId".into(), json!(reply_id));
-    }
-    if let Some(renote_id) = &row.renote_id {
-        o.insert("renoteId".into(), json!(renote_id));
-    }
+    // upstream pack L404-406: `cw: note.cw` / `replyId: note.replyId` /
+    // `renoteId: note.renoteId` are UNCONDITIONAL object entries — nullable
+    // scalar columns stay present as null (only `undefined` drops a key).
+    o.insert("cw".into(), json!(row.cw));
+    o.insert("replyId".into(), json!(row.reply_id));
+    o.insert("renoteId".into(), json!(row.renote_id));
     o.insert(
         "visibility".into(),
         json!(match row.visibility.as_str() {
@@ -168,9 +163,10 @@ pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
     }
     // Detail block (`opts.detail`):
     if parts.detail {
-        if row.clipped_count > 0 {
-            o.insert("clippedCount".into(), json!(row.clipped_count));
-        }
+        // `clippedCount: note.clippedCount` (pack L436) — a real column
+        // (models/Note.ts, smallint default 0), so the detail key is present
+        // with 0 for plain notes, not absent.
+        o.insert("clippedCount".into(), json!(row.clipped_count));
         if let Some(reply) = &parts.reply {
             o.insert("reply".into(), reply.clone());
         }

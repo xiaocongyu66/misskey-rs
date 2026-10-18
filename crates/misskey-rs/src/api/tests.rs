@@ -452,39 +452,40 @@ async fn notes_create_and_show() {
     assert_eq!(note["user"]["username"], username.as_str());
     assert_eq!(note["repliesCount"], json!(0));
 
-    // e2e asserts exact field sets — optional-absent fields must be missing
-    let got = note
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
+    // e2e asserts exact field sets — optional-absent fields must be missing.
+    // Upstream presence truth (NoteEntityService.pack L403-436): only
+    // `undefined` drops a key — nullable scalars stay present as null
+    // (`cw: note.cw`, `replyId`/`renoteId`, detail `clippedCount` column
+    // default 0), while empty collections vanish (`mentions`/`tags`
+    // `.length > 0 ? : undefined`, `emojis` local-host → undefined,
+    // `visibleUserIds` only for specified).
     for absent in [
         "deletedAt",
-        "cw",
-        "replyId",
-        "renoteId",
+        "mentions",
+        "tags",
+        "emojis",
+        "visibleUserIds",
+        "channelId",
         "reply",
         "renote",
         "poll",
-        "channelId",
         "myReaction",
-        "clippedCount",
     ] {
         assert!(!got.contains(absent), "{absent} must be absent");
     }
     for present in [
-        "mentions",
+        "cw",
+        "replyId",
+        "renoteId",
+        "clippedCount",
         "fileIds",
         "files",
-        "tags",
-        "emojis",
         "reactions",
         "reactionEmojis",
         "localOnly",
         "reactionCount",
         "renoteCount",
-        "visibleUserIds",
+        "repliesCount",
     ] {
         assert!(got.contains(present), "{present} must be present");
     }
