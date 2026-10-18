@@ -4922,10 +4922,17 @@ async fn notes_create_mentions_and_translate_ladder() {
     let bob_id = bob["id"].as_str().unwrap().to_string();
 
     // 同じユーザーに複数メンションしても内部的にまとめられる (user ids, dedup)
+    // e2e note.ts L330-343 mentions the literal `@bob` because its fixture
+    // signs up the literal username; this mirror suffixes every username to
+    // dodge cross-run collisions, so the mention must target the actual
+    // account (resolveUser is by username — `@bob` alone would resolve to
+    // nothing and record no mention, unlike the mirrored upstream assert
+    // `noteDoc.mentions == [bob.id]`).
+    let bob_acct = bob["username"].as_str().unwrap().to_string();
     let (s, note) = post_json(
         app.clone(),
         "/api/notes/create",
-        json!({ "text": "@bob @bob @bob yo", "i": a_token }),
+        json!({ "text": format!("@{bob_acct} @{bob_acct} @{bob_acct} yo"), "i": a_token }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {note}");
@@ -4986,7 +4993,7 @@ async fn notes_create_mentions_and_translate_ladder() {
     let (s, err) = post_json(
         app.clone(),
         "/api/notes/create",
-        json!({ "text": "@bob potentially annoying text", "i": a_token }),
+        json!({ "text": format!("@{bob_acct} potentially annoying text"), "i": a_token }),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -5067,6 +5074,14 @@ async fn notes_create_mentions_and_translate_ladder() {
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
 
     // bare create → visible on users/notes (freq path) and on the global notes list
+    // (the e2e ladder's 'ノートできる' plain note, note.ts L35-46 text 'test')
+    let (s, plain) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "test", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {plain}");
     let (s, res) = post_json(
         app.clone(),
         "/api/users/notes",
