@@ -239,7 +239,7 @@ pub async fn list_public(
     let sql = format!(
         r#"
         SELECT {COLS},
-               (a."userId" = $3) AS "for_you",
+               COALESCE(a."userId" = $3, FALSE) AS "for_you",
                EXISTS(SELECT 1 FROM "announcement_read" r
                       WHERE r."announcementId" = a."id" AND r."userId" = $3) AS "is_read"
         FROM "announcement" a
