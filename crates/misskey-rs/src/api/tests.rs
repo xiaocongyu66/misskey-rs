@@ -6328,6 +6328,22 @@ async fn users_notes_user_tl_channel_plane_legs() {
     .execute(&pool)
     .await
     .unwrap();
+    // the API renote path must denormalize the parent's channel too: the
+    // notes/create renote arm stamps renoteChannelId (NoteCreateService.ts
+    // L680) — guard against the silent no-stamp regression (the stamp keyed
+    // on the row's own id instead of the parent matched nothing once).
+    let ch_renote_api = note_post(&app, json!({ "renoteId": ch_note, "i": b_token })).await;
+    let (stamped,): (Option<String>,) =
+        mk_db::sqlx::query_as(r#"SELECT "renoteChannelId" FROM "note" WHERE "id" = $1"#)
+            .bind(&ch_renote_api)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamped.as_deref(),
+        Some(ch_open.as_str()),
+        "API renote must carry the parent's channel in renoteChannelId"
+    );
 
     // -- default plane: channel rows never flow (channelId IS NULL), the
     //    renote of a muted channel's note drops with the viewer's muting ---

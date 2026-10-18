@@ -911,7 +911,7 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
     if let Err(e) = mk_db::channel::stamp_newest_renote(
         pool,
         me_id,
-        &id,
+        renote_id,
         channel_id_in.as_deref(),
         target.channel_id.as_deref(),
     )
