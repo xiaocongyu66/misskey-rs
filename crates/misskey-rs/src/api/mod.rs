@@ -247,42 +247,6 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
     // ==== END delete-account DISPATCH ARM ====
 
-    // ==== announcements DISPATCH ARM (announcements slice) ====
-    // announcements-agent: the announcements family names route into
-    // api::announcement on the channels-arm pattern — method check, body
-    // parsing, token extraction and the credential-declared probe live in
-    // this arm; the requireCredential/requireModerator gates + endpoint
-    // bodies in api::announcement (db paths in mk-db/src/announcement.rs).
-    // The admin/announcements/* names shadow the admin/* catch-all below,
-    // so this arm sits ahead of it (roles_lite/delete_account convention).
-    if announcement::handles(name.as_str()) {
-        if method != Method::POST {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        let headers = req.headers().clone();
-        let body = match parse_json_body(req).await {
-            Ok(b) => b,
-            Err(resp) => return resp,
-        };
-        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
-        let credential_declared = body.get("i").is_some()
-            || headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.starts_with("Bearer "))
-                .unwrap_or(false);
-        let token = extract_token(&body, &headers);
-        if token.is_none() {
-            if let Some(v) = body.get("i") {
-                if v.as_str().is_none() {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-            }
-        }
-        return announcement::handle(&state, name.as_str(), &body, token, credential_declared)
-            .await;
-    }
-    // ==== END announcements DISPATCH ARM ====
 
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
