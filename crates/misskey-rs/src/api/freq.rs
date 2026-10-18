@@ -248,6 +248,18 @@ pub(crate) async fn user_notes(state: &AppState, body: &Value, token: Option<&st
         Some(Value::Bool(b)) => *b,
         Some(_) => return super::invalid_param("withRenotes", "expected a boolean"),
     };
+    // utl-misc (users/notes paramDef L59-61): withReplies / withChannelNotes
+    // default false — the reply gate and the channel plane key off these.
+    let with_replies = match body.get("withReplies") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return super::invalid_param("withReplies", "expected a boolean"),
+    };
+    let with_channel_notes = match body.get("withChannelNotes") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return super::invalid_param("withChannelNotes", "expected a boolean"),
+    };
     let me_id: Option<String> = super::resolve_me(pool, token).await;
 
     let ids = match mk_db::freq::user_note_ids(
@@ -259,6 +271,8 @@ pub(crate) async fn user_notes(state: &AppState, body: &Value, token: Option<&st
         limit,
         with_files,
         with_renotes,
+        with_replies,
+        with_channel_notes,
     )
     .await
     {

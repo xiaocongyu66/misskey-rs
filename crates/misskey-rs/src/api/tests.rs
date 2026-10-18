@@ -5675,3 +5675,711 @@ async fn timelines_tl_v3c_per_stream_legs() {
     assert!(lacks(&res, &n_bob_text));
     assert!(has(&res, &n_bob_file));
 }
+
+// utl-misc: users/notes User TL mute-chain + reply-gate + sinceId-ASC legs
+// (pinned upstream timelines.ts User TL section): ミュートしているユーザーの
+// ノートの、関係のないユーザによる引用ノート/リプライの、リノートが含まれない
+// (the generateMutedUserQueryForNotes renote-side pass), ミュートしていても
+// userId に指定したユーザーの投稿が含まれる (excludeUserFromMute), the
+// NoteCreateService.pushToTl userTimeline reply plane (self-replies stay,
+// replies to others ride only withReplies), and the makePaginationQuery
+// sinceId ASC order.
+#[tokio::test]
+async fn users_notes_user_tl_mute_chain_reply_gate_since_id() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkutlmisc").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("uma")).await;
+    let bob = signup(&app, &uname("umb")).await;
+    let carol = signup(&app, &uname("umc")).await;
+    let dave = signup(&app, &uname("umd")).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+    let carol_token = carol["token"].as_str().unwrap();
+    let dave_token = dave["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_user_notes(app: &axum::Router, mut params: Value, token: Option<&str>) -> Value {
+        if let Some(t) = token {
+            params["i"] = json!(t);
+        }
+        let (s, v) = post_json(app.clone(), "/api/users/notes", params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+
+    // -- mute chain: alice mutes carol; bob's renote of carol's note, of
+    //    dave's quote-of-carol, and of dave's reply-of-carol all vanish from
+    //    bob's users/notes as seen by alice (QueryService renote pass) but
+    //    survive for the guest view (no muter) ------------------------------
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": carol["id"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let carol_note = note_post(&app, json!({ "text": "hi", "i": carol_token })).await;
+    let dave_quote = note_post(
+        &app,
+        json!({ "text": "quote hi", "renoteId": carol_note, "i": dave_token }),
+    )
+    .await;
+    let dave_reply = note_post(
+        &app,
+        json!({ "text": "reply hi", "replyId": carol_note, "i": dave_token }),
+    )
+    .await;
+    let bob_renote_of_muted =
+        note_post(&app, json!({ "renoteId": carol_note, "i": b_token })).await;
+    let bob_renote_of_quote =
+        note_post(&app, json!({ "renoteId": dave_quote, "i": b_token })).await;
+    let bob_renote_of_reply =
+        note_post(&app, json!({ "renoteId": dave_reply, "i": b_token })).await;
+
+    let res = fetch_user_notes(&app, json!({ "userId": b_id, "limit": 100 }), Some(a_token)).await;
+    assert!(
+        !has(&res, &bob_renote_of_muted),
+        "mute chain must drop the renote of a muted user's note: {res}"
+    );
+    assert!(
+        !has(&res, &bob_renote_of_quote),
+        "mute chain must drop the renote of a quote of a muted user's note: {res}"
+    );
+    assert!(
+        !has(&res, &bob_renote_of_reply),
+        "mute chain must drop the renote of a reply to a muted user's note: {res}"
+    );
+    let res = fetch_user_notes(&app, json!({ "userId": b_id, "limit": 100 }), None).await;
+    assert!(
+        has(&res, &bob_renote_of_reply),
+        "guest view carries no muter — the renote stays: {res}"
+    );
+
+    // -- excludeUserFromMute: fetching the MUTED user's own timeline keeps
+    //    their notes (mute chain starts from the requested user) ----------
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": carol["id"], "limit": 100 }),
+        Some(a_token),
+    )
+    .await;
+    assert!(
+        has(&res, &carol_note),
+        "userId exempts the requested user from the mute exclusion: {res}"
+    );
+
+    // -- reply plane: a reply to a third party rides only withReplies; the
+    //    self-reply stays on the default plane (target dave is unmuted so
+    //    the mute chain never masks the gate) ------------------------------
+    let bob_note1 = note_post(&app, json!({ "text": "hi", "i": b_token })).await;
+    let dave_base = note_post(&app, json!({ "text": "dave", "i": dave_token })).await;
+    let bob_reply_out = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": dave_base, "i": b_token }),
+    )
+    .await;
+    let bob_self_reply = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": bob_note1, "i": b_token }),
+    )
+    .await;
+    let res = fetch_user_notes(&app, json!({ "userId": b_id, "limit": 100 }), Some(a_token)).await;
+    assert!(has(&res, &bob_note1));
+    assert!(
+        !has(&res, &bob_reply_out),
+        "[withReplies: false] 他人への返信が含まれない: {res}"
+    );
+    assert!(
+        has(&res, &bob_self_reply),
+        "self-replies stay on the base plane: {res}"
+    );
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": b_id, "limit": 100, "withReplies": true }),
+        Some(a_token),
+    )
+    .await;
+    assert!(
+        has(&res, &bob_reply_out),
+        "[withReplies: true] 他人への返信が含まれる: {res}"
+    );
+
+    // -- sinceId pagination: makePaginationQuery runs ASC on sinceId-only
+    //    and DESC when untilId bounds it (FTT sinceId legs) ---------------
+    let note_since = note_post(&app, json!({ "text": "since", "i": a_token })).await;
+    let note1 = note_post(&app, json!({ "text": "1", "i": a_token })).await;
+    let note2 = note_post(&app, json!({ "text": "2", "i": a_token })).await;
+    let note_until = note_post(&app, json!({ "text": "until", "i": a_token })).await;
+    let res = fetch_user_notes(&app, json!({ "userId": a_id, "sinceId": note_since }), None).await;
+    let ids: Vec<&str> = res
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![note1.as_str(), note2.as_str(), note_until.as_str()],
+        "sinceId-only → ASC: {res}"
+    );
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": a_id, "sinceId": note_since, "untilId": note_until }),
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = res
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![note2.as_str(), note1.as_str()],
+        "sinceId+untilId → DESC inside the window: {res}"
+    );
+}
+
+// ===== ul-tl: users/lists/* + notes/user-list-timeline ======================
+//
+// timelines.ts User List TL legs (upstream users/lists fixtures family +
+// notes/user-list-timeline.ts getFromDb): list membership visibility
+// (public/home ride always, followers only once the viewer follows the member
+// or authored the note), the per-member withReplies reply plane
+// (UserListService.addMember default false), the non-owner NO_SUCH_LIST shape
+// and the withFiles filter.
+
+#[tokio::test]
+async fn user_list_timeline_membership_visibility_replies() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkul_tl_membership").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("ula")).await;
+    let bob = signup(&app, &uname("ulb")).await;
+    let carol = signup(&app, &uname("ulc")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_tl(app: &axum::Router, params: Value, token: &str) -> (StatusCode, Value) {
+        post_json(
+            app.clone(),
+            "/api/notes/user-list-timeline",
+            json!({ "listId": params["listId"], "limit": 100, "i": token }),
+        )
+        .await
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    // -- users/lists/create: UserList pack shape { id, createdAt, name,
+    //    userIds: [], isPublic: false } -----------------------------------
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "list", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert_eq!(list["name"], json!("list"));
+    assert_eq!(list["userIds"], json!([]));
+    assert_eq!(list["isPublic"], json!(false));
+    assert!(list["createdAt"].as_str().is_some());
+    let list_id = list["id"].as_str().unwrap().to_string();
+
+    // -- users/lists/push: 204, and the member shows in the pack ----------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+
+    // -- non-followed member: public + home ride, followers stays out -----
+    let n_bob_pub = note_post(&app, json!({ "text": "hi", "i": bt })).await;
+    let n_bob_home = note_post(&app, json!({ "text": "hi", "visibility": "home", "i": bt })).await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(has(&res, &n_bob_pub));
+    assert!(has(&res, &n_bob_home));
+    let n_bob_fol = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "followers", "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &n_bob_fol));
+
+    // -- followed member's followers note rides (and packs its text) ------
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let n_bob_fol2 = note_post(
+        &app,
+        json!({ "text": "fol", "visibility": "followers", "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(has(&res, &n_bob_fol2));
+    assert!(
+        res.as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == json!(n_bob_fol2))
+            .unwrap()["text"]
+            == json!("fol")
+    );
+
+    // -- self rides: alice pushed herself, her own followers note flows ---
+    let n_alice_fol = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "followers", "i": at }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(lacks(&res, &n_alice_fol), "self not yet a member");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": a, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(has(&res, &n_alice_fol));
+
+    // -- reply plane (membership withReplies default false): self-replies
+    //    and replies to ME ride; third-party replies stay out until
+    //    users/lists/update-membership withReplies: true opens the gate ---
+    let n_alice_plain = note_post(&app, json!({ "text": "hi", "i": at })).await;
+    let n_bob_selfrep =
+        note_post(&app, json!({ "text": "hi", "replyId": n_bob_pub, "i": bt })).await;
+    let n_bob_merep = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": n_alice_plain, "i": bt }),
+    )
+    .await;
+    let n_carol_plain = note_post(
+        &app,
+        json!({ "text": "hi", "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    let n_bob_carolrep = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": n_carol_plain, "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(has(&res, &n_bob_selfrep), "self-reply always rides");
+    assert!(has(&res, &n_bob_merep), "reply addressed to me rides");
+    assert!(lacks(&res, &n_bob_carolrep), "third-party reply gated");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/update-membership",
+        json!({ "listId": list_id, "userId": b, "withReplies": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(
+        has(&res, &n_bob_carolrep),
+        "withReplies: true opens the gate"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/update-membership",
+        json!({ "listId": list_id, "userId": b, "withReplies": false, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id }), at).await;
+    assert!(
+        lacks(&res, &n_bob_carolrep),
+        "withReplies: false closes it again"
+    );
+
+    // -- non-owner listId → NO_SUCH_LIST (list scoped to its OWNER) -------
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/user-list-timeline",
+        json!({ "listId": list_id, "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_LIST"));
+
+    // -- requireCredential: bare no-credential call → CREDENTIAL_REQUIRED -
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/user-list-timeline",
+        json!({ "listId": list_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
+#[tokio::test]
+async fn user_list_timeline_filters_pager_channel() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkul_tl_filters").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("ulf")).await;
+    let bob = signup(&app, &uname("ulg")).await;
+    let dave = signup(&app, &uname("ulh")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+    let dt = dave["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_tl(app: &axum::Router, mut params: Value) -> Value {
+        params["i"] = json!(at);
+        let (s, v) = post_json(app.clone(), "/api/notes/user-list-timeline", params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+    async fn push_member(app: &axum::Router, list_id: &str, user_id: &str, token: &str) {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/users/lists/push",
+            json!({ "listId": list_id, "userId": user_id, "i": token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "list", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list_id = list["id"].as_str().unwrap().to_string();
+    push_member(&app, &list_id, b, at).await;
+
+    // -- pager: limit=1 returns the newest only; untilId/sinceId are
+    //    EXCLUSIVE bounds (makePaginationQuery) ---------------------------
+    let n1 = note_post(&app, json!({ "text": "p1", "i": bt })).await;
+    let n2 = note_post(&app, json!({ "text": "p2", "i": bt })).await;
+    let n3 = note_post(&app, json!({ "text": "p3", "i": bt })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(has(&res, &n1));
+    assert!(has(&res, &n3));
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 1 })).await;
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], json!(n3), "newest first");
+    let res = fetch_tl(&app, json!({ "listId": list_id, "untilId": n3 })).await;
+    assert!(has(&res, &n2), "untilId is exclusive-bound DESC");
+    assert!(lacks(&res, &n3));
+    let res = fetch_tl(&app, json!({ "listId": list_id, "sinceId": n1 })).await;
+    assert!(has(&res, &n3), "sinceId is exclusive-bound ASC");
+    assert!(lacks(&res, &n1));
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(
+        has(&res, &n1) && has(&res, &n3),
+        "unbounded fetch carries all"
+    );
+
+    // -- member's channel note stays out; the channel-external renote of it
+    //    flows (bob is a list member, the renote row itself has no channel) -
+    let (s, channel) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "channel", "i": dt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {channel}");
+    let channel_id = channel["id"].as_str().unwrap().to_string();
+    let n_ch = note_post(
+        &app,
+        json!({ "text": "ok", "channelId": channel_id, "i": dt }),
+    )
+    .await;
+    let n_ch_note = note_post(
+        &app,
+        json!({ "text": "ok", "channelId": channel_id, "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(lacks(&res, &n_ch));
+    assert!(lacks(&res, &n_ch_note), "member channel note excluded");
+    let n_ch_renote = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(
+        has(&res, &n_ch_renote),
+        "external renote of a channel note flows"
+    );
+
+    // -- channels/mute/create flips the renoteChannelId gate --------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/channels/mute/create",
+        json!({ "channelId": channel_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/channels/mute/create",
+        json!({ "channelId": channel_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ALREADY_MUTING_CHANNEL"));
+    let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(lacks(&res, &n_ch_renote2), "muted channel renote drops out");
+    assert!(has(&res, &n_ch_renote), "pre-mute renote unaffected");
+
+    // -- withFiles: true keeps the file notes only ------------------------
+    let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
+    let n_txt = note_post(&app, json!({ "text": "txt", "i": bt })).await;
+    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        json!({ "listId": list_id, "withFiles": true, "limit": 100 }),
+    )
+    .await;
+    assert!(lacks(&res, &n_txt));
+    assert!(has(&res, &n_file));
+
+    // -- withRenotes: false drops bob's pure renote (quotes would stay) ---
+    let n_dave_home = note_post(
+        &app,
+        json!({ "text": "home", "visibility": "home", "i": dt }),
+    )
+    .await;
+    let n_renote = note_post(&app, json!({ "renoteId": n_dave_home, "i": bt })).await;
+    let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 })).await;
+    assert!(has(&res, &n_renote), "default withRenotes keeps renotes");
+    let res = fetch_tl(
+        &app,
+        json!({ "listId": list_id, "withRenotes": false, "limit": 100 }),
+    )
+    .await;
+    assert!(lacks(&res, &n_renote));
+}
+
+// utl-misc: users/notes User TL channel-plane legs (pinned upstream
+// timelines.ts User TL section): チャンネル投稿が含まれない, the
+// [withChannelNotes: true] sensitive-channel split ([withChannelNotes: true]
+// 他人が取得した場合センシティブチャンネル投稿が含まれない / 自分が取得した
+// 場合…含まれる), and the Channel チャンネルミュート pair incl. the
+// [チャンネル外リノート] renoteChannelId gate. Channel rows are raw-stamped
+// (channels/create persists the channel; the note.channelId write side is a
+// sibling lane's in-flight plumbing) so the SQL plane asserts in isolation.
+#[tokio::test]
+async fn users_notes_user_tl_channel_plane_legs() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkutlchan").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("uca")).await;
+    let bob = signup(&app, &uname("ucb")).await;
+    let a_token = alice["token"].as_str().unwrap();
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_user_notes(app: &axum::Router, mut params: Value, token: Option<&str>) -> Value {
+        if let Some(t) = token {
+            params["i"] = json!(t);
+        }
+        let (s, v) = post_json(app.clone(), "/api/users/notes", params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+
+    // -- channels: an open one and a sensitive one (channels/create persists
+    //    isSensitive); alice mutes the open one via a raw channel_muting row
+    //    (the channels/mute/* slice is a sibling lane) ---------------------
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "open", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    let ch_open = ch["id"].as_str().unwrap().to_string();
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "hot", "isSensitive": true, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    let ch_hot = ch["id"].as_str().unwrap().to_string();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "channel_muting" ("id", "userId", "channelId", "expiresAt")
+           VALUES ($1, $2, $3, NULL)"#,
+    )
+    .bind(mk_types::id::gen_aid_now())
+    .bind(alice["id"].as_str().unwrap())
+    .bind(&ch_open)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // -- raw channel notes: an open-channel note, a sensitive-channel note
+    //    and an out-of-channel renote of the open-channel note -------------
+    let ch_note = mk_types::id::gen_aid_now();
+    let ch_hot_note = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note" ("id", "userId", "text", "visibility", "channelId")
+           VALUES ($1, $2, 'ch', 'public', $3),
+                  ($4, $2, 'hot', 'public', $5)"#,
+    )
+    .bind(&ch_note)
+    .bind(b_id)
+    .bind(&ch_open)
+    .bind(&ch_hot_note)
+    .bind(&ch_hot)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let plain_note = note_post(&app, json!({ "text": "plain", "i": b_token })).await;
+    let ch_renote = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note"
+             ("id", "userId", "visibility", "renoteId", "renoteUserId", "renoteChannelId")
+           VALUES ($1, $2, 'public', $3, $2, $4)"#,
+    )
+    .bind(&ch_renote)
+    .bind(b_id)
+    .bind(&ch_note)
+    .bind(&ch_open)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // -- default plane: channel rows never flow (channelId IS NULL), the
+    //    renote of a muted channel's note drops with the viewer's muting ---
+    let res = fetch_user_notes(&app, json!({ "userId": b_id, "limit": 100 }), Some(a_token)).await;
+    assert!(has(&res, &plain_note));
+    assert!(!has(&res, &ch_note), "チャンネル投稿が含まれない: {res}");
+    assert!(
+        !has(&res, &ch_renote),
+        "[チャンネル外リノート] チャンネルミュート＝TLに流れない: {res}"
+    );
+    let res = fetch_user_notes(&app, json!({ "userId": b_id, "limit": 100 }), None).await;
+    assert!(
+        has(&res, &ch_renote),
+        "guest view carries no channel muting: {res}"
+    );
+
+    // -- withChannelNotes: true — the muted channel stays dropped, the
+    //    sensitive channel is dropped for others but kept for the owner ----
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": b_id, "limit": 100, "withChannelNotes": true }),
+        Some(a_token),
+    )
+    .await;
+    assert!(
+        !has(&res, &ch_note),
+        "チャンネルミュート＝TLに流れない: {res}"
+    );
+    assert!(
+        !has(&res, &ch_renote),
+        "muted renoteChannel drops on the channel plane too: {res}"
+    );
+    assert!(
+        !has(&res, &ch_hot_note),
+        "他人が取得した場合センシティブチャンネル投稿が含まれない: {res}"
+    );
+    assert!(has(&res, &plain_note));
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": b_id, "limit": 100, "withChannelNotes": true }),
+        Some(b_token),
+    )
+    .await;
+    assert!(
+        has(&res, &ch_note),
+        "owner view keeps the unmuted channel note: {res}"
+    );
+    assert!(
+        has(&res, &ch_hot_note),
+        "自分が取得した場合センシティブチャンネル投稿が含まれる: {res}"
+    );
+    let res = fetch_user_notes(
+        &app,
+        json!({ "userId": b_id, "limit": 100, "withChannelNotes": true }),
+        None,
+    )
+    .await;
+    assert!(
+        has(&res, &ch_note),
+        "guest view keeps the unmuted channel note: {res}"
+    );
+    assert!(
+        has(&res, &ch_renote),
+        "guest view keeps the channel renote: {res}"
+    );
+}

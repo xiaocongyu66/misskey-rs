@@ -138,13 +138,16 @@ pub async fn frequent_replied_counts(
     Ok(out)
 }
 
-/// users/notes db path: the requested user's notes (channels excluded),
-/// visibility-gated, suspended-author gate, mute/block gates for logged-in
-/// viewers with the requested user exempted from the mute exclusion
-/// (`excludeUserFromMute`). withRenotes=false drops pure renotes authored by
-/// the requested user (bracket mirrors upstream). Binds: $1 = requested
-/// user; $2 = viewer when logged in; the pager occupies the trailing binds
-/// (guest: $2/$3/$4; logged-in: $3/$4/$5).
+// -- utl-misc (users/notes channel + mute-chain legs, upstream
+// endpoints/users/notes.ts getFromDb + core/QueryService.ts) ---------------
+/// users/notes db path: the requested user's notes. Channel plane rides
+/// withChannelNotes (default plane keeps `channelId IS NULL`), the mute
+/// chain covers author/reply/renote + the renote-side pass with the
+/// requested user exempted (`excludeUserFromMute`), and sinceId-only paging
+/// runs ASC (makePaginationQuery). withRenotes=false drops pure renotes
+/// authored by the requested user. Binds: $1 = requested user; $2 = viewer
+/// when logged in; the pager occupies the trailing binds (guest: $2/$3/$4;
+/// logged-in: $3/$4/$5).
 #[allow(clippy::too_many_arguments)]
 pub async fn user_note_ids(
     pool: &PgPool,
@@ -155,21 +158,66 @@ pub async fn user_note_ids(
     limit: i64,
     with_files: bool,
     with_renotes: bool,
+    with_replies: bool,
+    with_channel_notes: bool,
 ) -> Result<Vec<String>, sqlx::Error> {
     let mut sql = String::from(
         r#"SELECT n."id" FROM "note" n
-        WHERE n."userId" = $1 AND n."channelId" IS NULL
+        WHERE n."userId" = $1
         AND NOT EXISTS (
             SELECT 1 FROM "user" u WHERE u."id" = n."userId" AND u."isSuspended")"#,
     );
+    // isSelf gates the sensitive-channel pass (users/notes.ts L174-199):
+    // only the owner's own fetch keeps sensitive-channel notes; the guest
+    // face sees the same gate (me == null ⇒ isSelf false upstream).
+    let is_self = me == Some(user_id);
+    if with_channel_notes {
+        if me.is_some() {
+            // mutingChannelIds gate: (channelId IS NULL OR NOT IN muted);
+            // the empty-set subquery degrades to TRUE, so the clause rides
+            // unconditionally like upstream's length check would
+            // (users/notes.ts L185-192).
+            sql.push_str(
+                r#" AND (n."channelId" IS NULL OR n."channelId" NOT IN (
+                SELECT "channelId" FROM "channel_muting" WHERE "userId" = $2
+                  AND ("expiresAt" IS NULL OR "expiresAt" > now())))"#,
+            );
+        }
+        if !is_self {
+            sql.push_str(
+                r#" AND (n."channelId" IS NULL OR NOT EXISTS (
+                SELECT 1 FROM "channel" c WHERE c."id" = n."channelId" AND c."isSensitive"))"#,
+            );
+        }
+    } else {
+        sql.push_str(r#" AND n."channelId" IS NULL"#);
+    }
     if me.is_some() {
-        sql.push_str(&VIS_ME.replace("{alias}", "n"));
+        // ミュートされたチャンネルのリノート対策 (users/notes.ts L205-211):
+        // a renote of a muted channel's note drops out of every plane.
         sql.push_str(
-            r#" AND n."userId" NOT IN (
-            SELECT "muteeId" FROM "muting" WHERE "muterId" = $2
-              AND ("expiresAt" IS NULL OR "expiresAt" > now())
-              AND "muteeId" != $1)"#,
+            r#" AND (n."renoteChannelId" IS NULL OR n."renoteChannelId" NOT IN (
+            SELECT "channelId" FROM "channel_muting" WHERE "userId" = $2
+              AND ("expiresAt" IS NULL OR "expiresAt" > now())))"#,
         );
+        sql.push_str(&VIS_ME.replace("{alias}", "n"));
+        // generateMutedUserQueryForNotes with excludeUserFromMute = the
+        // requested user (QueryService.ts L206-212): the shared subquery is
+        // reused for the author / reply / renote columns and the renote-side
+        // pass (noteColumn='renote', L109) — a renote of a quote/reply of a
+        // muted user vanishes (users/notes.ts L215-218).
+        let mute_sel = r#"(SELECT "muteeId" FROM "muting" WHERE "muterId" = $2
+                  AND ("expiresAt" IS NULL OR "expiresAt" > now())
+                  AND "muteeId" != $1)"#;
+        sql.push_str(&format!(
+            r#" AND (n."replyUserId" IS NULL OR n."replyUserId" NOT IN {mute_sel})
+            AND (n."renoteUserId" IS NULL OR n."renoteUserId" NOT IN {mute_sel})
+            AND (n."renoteId" IS NULL OR NOT EXISTS (
+            SELECT 1 FROM "note" rn WHERE rn."id" = n."renoteId" AND (
+                  rn."userId" IN {mute_sel}
+               OR rn."replyUserId" IN {mute_sel}
+               OR rn."renoteUserId" IN {mute_sel})))"#,
+        ));
         sql.push_str(
             r#" AND n."userId" NOT IN (
             SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2)"#,
@@ -185,6 +233,19 @@ pub async fn user_note_ids(
     } else {
         sql.push_str(&VIS_GUEST.replace("{alias}", "n"));
     }
+    if !with_replies {
+        if with_channel_notes {
+            // excludeReplies: userTimelineWithChannel may include replies
+            // (users/notes.ts L135): all replies dropped on that plane
+            // unless withReplies opened the gate.
+            sql.push_str(r#" AND n."replyId" IS NULL"#);
+        } else {
+            // NoteCreateService.pushToTl (L1157-1180, misc/is-reply.ts):
+            // the base userTimeline holds non-replies + self-replies;
+            // replies to others ride only userTimelineWithReplies.
+            sql.push_str(r#" AND (n."replyId" IS NULL OR n."replyUserId" = n."userId")"#);
+        }
+    }
     if with_files {
         sql.push_str(r#" AND n."fileIds" != '{}'"#);
     }
@@ -194,17 +255,22 @@ pub async fn user_note_ids(
               OR n."fileIds" != '{}' OR n."hasPoll")"#,
         );
     }
+    // makePaginationQuery (QueryService.ts L54-77): sinceId without untilId
+    // paginates oldest-first ASC — the FTT sinceId legs assert ascending;
+    // both bounds (or untilId alone) stay newest-first DESC.
+    let asc = since_id.is_some() && until_id.is_none();
+    let dir = if asc { "ASC" } else { "DESC" };
     let paged = if me.is_some() {
         format!(
             "{sql} AND ($3::varchar IS NULL OR n.\"id\" < $3)
          AND ($4::varchar IS NULL OR n.\"id\" > $4)
-         ORDER BY n.\"id\" DESC LIMIT $5"
+         ORDER BY n.\"id\" {dir} LIMIT $5"
         )
     } else {
         format!(
             "{sql} AND ($2::varchar IS NULL OR n.\"id\" < $2)
          AND ($3::varchar IS NULL OR n.\"id\" > $3)
-         ORDER BY n.\"id\" DESC LIMIT $4"
+         ORDER BY n.\"id\" {dir} LIMIT $4"
         )
     };
 
