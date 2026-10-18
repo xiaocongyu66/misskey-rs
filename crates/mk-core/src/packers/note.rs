@@ -198,6 +198,7 @@ pub fn note_pack_min(
     tags: &[String],
     emojis: Value,
 ) -> Value {
+    let _ = (mentions, tags);
     note_pack_full(
         row,
         &NotePackParts {

@@ -2535,7 +2535,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     // ---- fetchAndCreate ----
     // author host (mention fallback `m.host ?? user.host`).
     let me_host = match mk_db::note::user_host_of(pool, &me_id).await {
-        Ok(h) => h.flatten(),
+        Ok(h) => h,
         Err(e) => {
             tracing::error!(target: "dbg_notes", error = %e, "user_host_of");
             return api_err(ApiError::internal_error());
@@ -2996,13 +2996,7 @@ async fn load_pack_note(
         match mk_db::poll::find_poll_by_note(pool, &row.id).await {
             Ok(p) => p.map(|p| {
                 let expires = p.expires_at_ms.map(mk_core::services::signup::ms_to_iso);
-                let my_choices = match me_id {
-                    Some(me) => mk_db::poll::poll_votes_of_user(pool, &row.id, me)
-                        .await
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                mk_core::packers::note::poll_pack(&p, &my_choices, expires)
+                (p, expires)
             }),
             Err(e) => {
                 tracing::error!(target: "dbg_notes", error = %e, "find_poll_by_note");
@@ -3062,6 +3056,17 @@ async fn load_pack_note(
         }
     } else {
         None
+    };
+
+    let poll = match (poll, me_id, detail && depth < MAX_PACK_DEPTH) {
+        (Some((p, expires)), Some(me), true) => {
+            let my_choices = mk_db::poll::poll_votes_of_user(pool, &row.id, me)
+                .await
+                .unwrap_or_default();
+            Some(mk_core::packers::note::poll_pack(&p, &my_choices, expires))
+        }
+        (Some((p, expires)), _, true) => Some(mk_core::packers::note::poll_pack(&p, &[], expires)),
+        _ => None,
     };
 
     Ok(Some(mk_core::packers::note::note_pack_full(
