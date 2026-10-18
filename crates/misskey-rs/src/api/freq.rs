@@ -19,7 +19,11 @@ use crate::AppState;
 use crate::error::{ApiError, api_err};
 
 /// Users-pack pipeline identical to users/show (the e2e compares the packed
-/// user against a users/show round-trip byte-for-byte).
+/// user against a users/show round-trip byte-for-byte): roles-aware pack
+/// (`isSilenced` = merged-policy `!canPublicNote` — the roles-less pack
+/// degrades to the base policy and reports isSilenced: false for silenced
+/// users, failing the get-frequently-replied-users サイレンス case), then the
+/// users/show memo pass and the me-view role-compat post-passes.
 async fn pack_user_detailed(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
@@ -48,18 +52,37 @@ async fn pack_user_detailed(
         Ok(r) => r,
         Err(resp) => return Err(*resp),
     };
-    let ctx = mk_core::services::user_pack::InstanceCtx {
-        url: &state.config.url,
-        host: &state.config.host(),
+    // UserEntityService.pack reads roleService per packed user (badge list +
+    // merged policies).
+    let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(target: "dbg_freq", error = %e, "pack_user user_assigned_roles");
+            return Err(api_err(ApiError::internal_error()));
+        }
     };
-    Ok(Some(mk_core::services::user_pack::pack_inline_opts(
+    let role_pack = mk_core::services::user_pack::RolePack {
+        assigned: &assigned,
+        target_is_root: row.username_lower == "root",
+        viewer_is_moderator: super::viewer_is_moderator(pool, me_id).await,
+    };
+    let mut packed = mk_core::services::user_pack::pack_inline_with_roles(
         &row,
         &profile,
         is_me,
         relation.as_ref(),
-        ctx,
+        mk_core::services::user_pack::InstanceCtx {
+            url: &state.config.url,
+            host: &state.config.host(),
+        },
         false, // users/show: secrets stay hidden even for self
-    )))
+        Some(&role_pack),
+    );
+    super::set_viewers_memo(pool, me_id, &row.id, &mut packed).await;
+    if is_me {
+        super::apply_me_role_compat(&mut packed);
+    }
+    Ok(Some(packed))
 }
 
 fn no_such_user_resp() -> Response {

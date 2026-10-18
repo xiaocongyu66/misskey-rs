@@ -3438,3 +3438,327 @@ async fn pinned_users_lists_meta_accts() {
     let (s, _) = post_json(app.clone(), "/api/pinned-users", json!({})).await;
     assert_eq!(s, StatusCode::OK);
 }
+
+// ==== delete-account + freq silenced census (test/e2e/users.ts) ====
+
+/// e2e users.ts 削除済 fixtures: signup → post → i/delete-account → the user
+/// stays listed ('削除済ユーザーが含まれる') while the me-view users/show
+/// packs `isDeleted: true` ('削除済みになっていること') and not-me views omit
+/// the flag ('自分以外から見たときは削除済みか判定できない').
+#[tokio::test]
+async fn delete_account_by_self_soft_flag_and_listed() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("delacct_self").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let dbp = pool.clone();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let victim = signup(&app, "dself").await;
+    let v_token = victim["token"].as_str().unwrap().to_string();
+    let v_id = victim["id"].as_str().unwrap().to_string();
+    let alice = signup(&app, "dselfviewer").await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // fixtures: post(userDeletedBySelf, { text: 'test' }) before deletion —
+    // the note purge lives in the upstream queue job, so the deleted user
+    // keeps appearing in lists inside the census window.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "test", "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // requireCredential
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/delete-account",
+        json!({ "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("1384574d-a912-4b81-8601-c7b1c4085df1")
+    );
+
+    // wrong password → Error('incorrect password') → 500 ISE
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/delete-account",
+        json!({ "password": "nope", "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // success → the endpoint returns undefined → ApiCallService 204
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/delete-account",
+        json!({ "password": "test", "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // '削除済みになっていること' — me-view packs isDeleted: true
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": v_id, "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["isDeleted"], json!(true));
+
+    // '自分以外から見たときは削除済みか判定できない' — not-me view omits it
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": v_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert!(body.get("isDeleted").is_none(), "body: {body}");
+
+    // '削除済ユーザーが含まれる' — users/search (and the list/read paths)
+    // keep serving the deleted user
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/search",
+        json!({ "query": "dself", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == json!(v_id)),
+        "body: {body}"
+    );
+    let (s, body) = post_json(app.clone(), "/api/users", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == json!(v_id)),
+        "body: {body}"
+    );
+
+    // idempotent: `userDetailed.isDeleted → return` → 204 again
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/delete-account",
+        json!({ "password": "test", "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // DeleteAccountService safeguard: root refuses self-deletion (500; the
+    // password compare runs first and matches)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/delete-account",
+        json!({ "password": "test", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    drop(dbp);
+}
+
+/// e2e users.ts 削除済(byAdmin): admin/delete-account as root — the plain
+/// caller hits requireAdmin (ROLE_PERMISSION_DENIED), the root call flips
+/// the flag + writes the deleteAccount moderation log, and a re-run hits the
+/// `user.isDeleted → return` short-circuit.
+#[tokio::test]
+async fn delete_account_by_admin_gates_and_moderation_log() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("delacct_admin").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let dbp = pool.clone();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let victim = signup(&app, "dadmin").await;
+    let v_token = victim["token"].as_str().unwrap().to_string();
+    let v_id = victim["id"].as_str().unwrap().to_string();
+    let caller = signup(&app, "dcaller").await;
+    let c_token = caller["token"].as_str().unwrap().to_string();
+
+    // requireAdmin: plain caller → ROLE_PERMISSION_DENIED (c3d38592…)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/delete-account",
+        json!({ "userId": v_id, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61")
+    );
+
+    // missing target → findOneByOrFail → 500 ISE
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/delete-account",
+        json!({ "userId": mk_types::id::gen_aid_now(), "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // root deletes → 204 + deleteAccount moderation log
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/delete-account",
+        json!({ "userId": v_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let logs: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "moderation_log" WHERE "type" = 'deleteAccount'"#,
+    )
+    .fetch_one(&dbp)
+    .await
+    .unwrap();
+    assert_eq!(logs, 1);
+
+    // '削除済み(byAdmin)になっていること' — me-view packs isDeleted: true
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": v_id, "i": v_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["isDeleted"], json!(true));
+
+    // re-run → `user.isDeleted → return` → 204, no second log
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/delete-account",
+        json!({ "userId": v_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let logs: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "moderation_log" WHERE "type" = 'deleteAccount'"#,
+    )
+    .fetch_one(&dbp)
+    .await
+    .unwrap();
+    assert_eq!(logs, 1);
+
+    drop(dbp);
+}
+
+/// e2e users.ts freq サイレンス case: a silenced (canPublicNote: false role)
+/// reply target must appear in get-frequently-replied-users with the
+/// users/show-identical pack (`isSilenced: true`) — the freq pack path reads
+/// the merged role policy like users/show does.
+#[tokio::test]
+async fn freq_pack_silenced_user_equals_users_show() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("freq_silenced_pack").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let silenced = signup(&app, "fsil").await;
+    let s_token = silenced["token"].as_str().unwrap().to_string();
+    let s_id = silenced["id"].as_str().unwrap().to_string();
+    let s_username = silenced["username"].as_str().unwrap().to_string();
+    let alice = signup(&app, "fviewer").await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+
+    // users.ts fixture: role(root, {}, { canPublicNote: { priority: 0,
+    // useDefault: false, value: false } }) + admin/roles/assign
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({
+            "name": "Silenced",
+            "asBadge": false,
+            "canEditMembersByModerator": false,
+            "isAdministrator": false,
+            "isModerator": false,
+            "isPublic": false,
+            "target": "manual",
+            "policies": {
+                "canPublicNote": { "priority": 0, "useDefault": false, "value": false }
+            },
+            "i": root_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let role_id = body["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": s_id, "roleId": role_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    // fixtures: the silenced user posts; alice replies to it
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "test", "i": s_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    let note_id = note["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": format!("@{s_username} test"),
+            "replyId": note_id,
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // freq: the silenced user present with the users/show-identical pack
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": a_id, "limit": 100, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let entries = body.as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e["user"]["id"] == json!(s_id))
+        .expect("silenced user in freq list");
+    let (s, show) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": s_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {show}");
+    assert_eq!(entry["user"], show, "freq pack must equal users/show");
+    assert_eq!(entry["user"]["isSilenced"], json!(true));
+}
