@@ -16,14 +16,14 @@
 //! semantics) OR an isAdministrator role assignment. Once signup stamps
 //! `meta."rootUserId"` the username fallback goes inert.
 
-use axum::extract::Request;
-use axum::http::{header, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::Request;
+use axum::http::{Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
 
-use crate::error::{api_err, ApiError};
 use crate::AppState;
+use crate::error::{ApiError, api_err};
 
 use super::{
     build_relation, invalid_param, opt_bool, opt_enum, opt_nullable_str, pack_search_rows,

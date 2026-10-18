@@ -1,8 +1,8 @@
 //! AID: 10 chars = 8 chars of base36 (milliseconds since 2000-01-01T00:00:00Z)
 //! + 2 chars of incrementing noise. Port of `misc/id/aid.ts`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Milliseconds at 2000-01-01T00:00:00Z.
@@ -112,9 +112,10 @@ mod tests {
             .as_millis() as i64;
         let a = gen_aid(t);
         assert_eq!(a.len(), 10);
-        assert!(a
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
 
         let b = gen_aid(t);
         let c = gen_aid(t + 1);

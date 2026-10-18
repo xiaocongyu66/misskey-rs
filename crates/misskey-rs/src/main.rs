@@ -8,11 +8,11 @@ mod ratelimit;
 
 use std::net::SocketAddr;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{any, get};
-use axum::Router;
 use tower_http::cors::CorsLayer;
 
 pub use config::Config;

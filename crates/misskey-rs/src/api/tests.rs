@@ -4,7 +4,7 @@
 use super::*;
 use axum::body::Body;
 use axum::http::Request;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 /// Unit-test binaries never run main(), so tracing has no subscriber and
@@ -1398,10 +1398,12 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert!(n["createdAt"].as_str().is_some());
     assert_eq!(n["userId"], a["id"]);
     assert_eq!(n["user"]["username"], username_a.as_str());
-    assert!(n["user"]["avatarUrl"]
-        .as_str()
-        .unwrap()
-        .contains("/identicon/"));
+    assert!(
+        n["user"]["avatarUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/identicon/")
+    );
     assert_eq!(n["note"]["id"], note_id.as_str());
     assert_eq!(n["note"]["text"], format!("@{} hello", username_b));
 

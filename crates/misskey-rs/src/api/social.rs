@@ -12,13 +12,13 @@
 //! TODO(M2+): remote flow). Meta errors without `httpStatusCode` surface as
 //! kind=client 400 (`ApiCallService.#sendApiError`).
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{api_err, ApiError};
 use crate::AppState;
+use crate::error::{ApiError, api_err};
 
 /// The endpoint names routed into this module (single source of truth for the
 /// `social-agent` dispatch block in mod.rs).

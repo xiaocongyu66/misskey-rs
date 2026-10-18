@@ -1,8 +1,8 @@
 //! PostgreSQL access: pool construction and migrations.
 //! The only crate allowed to touch SQL.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 pub use sqlx;
 

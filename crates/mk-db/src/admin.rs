@@ -10,7 +10,7 @@
 
 use sqlx::PgPool;
 
-use crate::user::{LocalUserRow, LOCAL_USER_COLS};
+use crate::user::{LOCAL_USER_COLS, LocalUserRow};
 
 /// `UserSuspendService.suspend` DB writes: `usersRepository.update(id, {
 /// isSuspended: true })` + the harness-visible `updatedAt = now()` bump, and

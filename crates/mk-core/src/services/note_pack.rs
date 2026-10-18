@@ -12,7 +12,7 @@
 //! `ReactionService.convertLegacyReaction(s)` (zero-count entries filtered).
 
 use mk_db::note::NoteRow;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Inputs for one packed note. `reply`/`renote` are only Some when the row
 /// has the corresponding id; `Some(Value::Null)` models upstream's
@@ -131,10 +131,12 @@ pub fn pack_note_lite(inp: &NotePackIn<'_>) -> Value {
     o.insert("reactions".into(), reactions.clone());
     o.insert(
         "reactionCount".into(),
-        json!(reactions
-            .as_object()
-            .map(|m| m.values().filter_map(|v| v.as_i64()).sum::<i64>())
-            .unwrap_or(0)),
+        json!(
+            reactions
+                .as_object()
+                .map(|m| m.values().filter_map(|v| v.as_i64()).sum::<i64>())
+                .unwrap_or(0)
+        ),
     );
     o.insert("renoteCount".into(), json!(row.renote_count));
     o.insert("repliesCount".into(), json!(row.replies_count));

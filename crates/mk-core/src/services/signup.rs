@@ -3,8 +3,8 @@
 //! carries validation, hashing, key generation, token generation, and the
 //! fresh-user MeDetailed construction.
 
-use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::RsaPrivateKey;
+use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
 use crate::packers::user::{
     BackupCodesStock, ChatScope, MeDetailed, OnlineStatus, VisibilityLevel,

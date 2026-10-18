@@ -248,11 +248,13 @@ mod tests {
 
         // Kinds filter: an unrelated job never spills into other kinds.
         handle.enqueue("test.other", &json!({})).await.unwrap();
-        assert!(handle
-            .claim_next(&["test.unrelated"])
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            handle
+                .claim_next(&["test.unrelated"])
+                .await
+                .unwrap()
+                .is_none()
+        );
         let other = handle.claim_next(&["test.other"]).await.unwrap().unwrap();
         handle.complete(other.id).await.unwrap();
         assert!(handle.claim_next(&["test.other"]).await.unwrap().is_none());

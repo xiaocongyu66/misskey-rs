@@ -4,15 +4,15 @@
 //! the hand-written table here from M2 on; the dispatch chain already mirrors
 //! `ApiCallService.handleRequest` ordering so endpoints slot in.
 
-use axum::extract::{Request, State};
-use axum::http::{header, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
 
-use crate::error::{api_err, ApiError};
-use crate::ratelimit::Limit;
 use crate::AppState;
+use crate::error::{ApiError, api_err};
+use crate::ratelimit::Limit;
 
 // social-agent: follow/mute/block/renote social actions (M2 truthful slice)
 mod social;
@@ -433,7 +433,7 @@ fn parse_json_body(
                 return Err(api_err(ApiError::invalid_param(json!({
                     "param": "",
                     "reason": "body could not be read",
-                }))))
+                }))));
             }
         };
         if bytes.is_empty() {

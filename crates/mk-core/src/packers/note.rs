@@ -5,7 +5,7 @@
 //! recursion, poll, files, clips).
 
 use mk_db::note::NoteRow;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn string_vec(v: &serde_json::Value) -> Vec<String> {
     v.as_array()

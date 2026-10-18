@@ -10,13 +10,13 @@
 //! endpoints/users/notes.ts (db-fallback shape), core/MetaService.ts,
 //! endpoints/admin/update-meta.ts (requireAdministrator).
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{api_err, ApiError};
 use crate::AppState;
+use crate::error::{ApiError, api_err};
 
 /// Users-pack pipeline identical to users/show (the e2e compares the packed
 /// user against a users/show round-trip byte-for-byte).
@@ -298,7 +298,7 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
                 "AUTHENTICATION_FAILED",
                 "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
                 "Authentication failed. Please ensure your token is correct.",
-            ))
+            ));
         }
         Err(e) => {
             tracing::error!(target: "dbg_freq", error = %e, "find_local_user_id_by_token");
@@ -314,7 +314,7 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
                 "AUTHENTICATION_FAILED",
                 "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
                 "Authentication failed. Please ensure your token is correct.",
-            ))
+            ));
         }
         Err(e) => {
             tracing::error!(target: "dbg_freq", error = %e, "find_user_by_id[me]");

@@ -15,7 +15,7 @@
 //! targetNoteId.
 
 use mk_db::notification::NotificationRow;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Upstream `NOTE_REQUIRED_NOTIFICATION_TYPES` (non-grouped, typed SOURCE
 /// set): these must carry `note` or the notification is not shown.

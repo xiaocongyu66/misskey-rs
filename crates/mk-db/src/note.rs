@@ -397,11 +397,7 @@ fn expand(
 }
 
 fn dir_asc(since_id: Option<&str>) -> &'static str {
-    if since_id.is_some() {
-        "ASC"
-    } else {
-        "DESC"
-    }
+    if since_id.is_some() { "ASC" } else { "DESC" }
 }
 
 fn wrap_outer(inner: &str, asc: bool) -> String {
