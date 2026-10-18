@@ -3010,8 +3010,9 @@ async fn load_pack_note(
     // reply (detail:false recursion) / renote (detail:true recursion):
     // JOINed-but-missing rows pack as null upstream.
     let (reply, renote) = if detail && depth < MAX_PACK_DEPTH {
+        // async fn 自再帰は Box 化が必要 (E0733) — nested packs box the future.
         let reply = if let Some(rid) = &row.reply_id {
-            match load_pack_note(state, pool, rid, me_id, false, depth + 1).await? {
+            match Box::pin(load_pack_note(state, pool, rid, me_id, false, depth + 1)).await? {
                 Some(v) => Some(v),
                 None => Some(Value::Null),
             }
@@ -3019,7 +3020,7 @@ async fn load_pack_note(
             None
         };
         let renote = if let Some(rid) = &row.renote_id {
-            match load_pack_note(state, pool, rid, me_id, true, depth + 1).await? {
+            match Box::pin(load_pack_note(state, pool, rid, me_id, true, depth + 1)).await? {
                 Some(v) => Some(v),
                 None => Some(Value::Null),
             }
