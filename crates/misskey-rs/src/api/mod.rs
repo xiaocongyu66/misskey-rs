@@ -109,6 +109,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/timeline"
         || name == "notes/local-timeline"
         || name == "notes/hybrid-timeline"
+        // timelines matrix: following/update flips the following.withReplies
+        // push flag the Home/Hybrid reply legs read (social lane may absorb)
+        || name == "following/update"
         || name == "notes/reactions"
         || name == "notes/reactions/create"
         || name == "notes/delete"
@@ -173,6 +176,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "notes/timeline" || name == "notes/hybrid-timeline" {
             return social::timeline_or_hybrid(&state, name.as_str(), &body, token.as_deref())
                 .await;
+        }
+        // timelines matrix arm: withReplies/notify flag flip on a follow edge
+        if name == "following/update" {
+            return social::following_update(&state, &body, token.as_deref()).await;
         }
         if name == "notes/reactions" {
             return social::notes_reactions(&state, &body).await;

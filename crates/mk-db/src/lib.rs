@@ -39,6 +39,8 @@ pub mod role;
 pub mod roles_lite;
 // social-agent: social-graph writes (follow/mute/block/renote)
 pub mod social;
+// timelines arena: notes/timeline / notes/local-timeline / notes/hybrid-timeline
+pub mod timelines;
 pub mod user;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {

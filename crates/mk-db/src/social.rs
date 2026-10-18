@@ -472,3 +472,61 @@ pub async fn delete_renote_muting(
         .rows_affected();
     Ok(n > 0)
 }
+
+// ---------------------------------------------------------------------------
+// following/update (following-relationship flag flip; the timelines matrix
+// legs toggle withReplies through it — upstream following/update.ts
+// `followingsRepository.update({ id: exist.id }, { notify, withReplies })`)
+// ---------------------------------------------------------------------------
+
+/// Partial flip of the notify / withReplies flags on an existing edge;
+/// `None` args leave the column untouched (upstream `undefined` semantics).
+/// Returns whether the edge row existed.
+pub async fn update_following_flags(
+    pool: &PgPool,
+    follower_id: &str,
+    followee_id: &str,
+    notify: Option<Option<String>>,
+    with_replies: Option<bool>,
+) -> Result<bool, sqlx::Error> {
+    // Build each SET with its own numbered bind; every supplied bind must be
+    // referenced by the statement, so the placeholders are assigned in order.
+    let has_notify = notify.is_some();
+    let mut sets: Vec<String> = Vec::with_capacity(2);
+    let mut binds_notify: Option<Option<String>> = None;
+    let mut binds_replies: Option<bool> = None;
+    if has_notify {
+        sets.push(r#""notify" = $3"#.to_string());
+        binds_notify = notify;
+    }
+    if with_replies.is_some() {
+        sets.push(format!(
+            r#""withReplies" = ${}"#,
+            if has_notify { 4 } else { 3 }
+        ));
+        binds_replies = with_replies;
+    }
+    if sets.is_empty() {
+        let n: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+        )
+        .bind(follower_id)
+        .bind(followee_id)
+        .fetch_one(pool)
+        .await?;
+        return Ok(n > 0);
+    }
+    let sql = format!(
+        r#"UPDATE "following" SET {} WHERE "followerId" = $1 AND "followeeId" = $2"#,
+        sets.join(", ")
+    );
+    let mut q = sqlx::query(&sql).bind(follower_id).bind(followee_id);
+    if binds_notify.is_some() {
+        q = q.bind(binds_notify);
+    }
+    if binds_replies.is_some() {
+        q = q.bind(binds_replies);
+    }
+    let n = q.execute(pool).await?.rows_affected();
+    Ok(n > 0)
+}

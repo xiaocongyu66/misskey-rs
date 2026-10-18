@@ -5087,3 +5087,301 @@ async fn notes_create_mentions_and_translate_ladder() {
     assert!(arr.iter().all(|n| n["visibility"] == json!("public")));
     assert!(arr.iter().any(|n| n["id"] == json!(note_id)));
 }
+
+// ===== timelines.ts arena: notes/timeline / local / hybrid mirrors ==========
+//
+// Both-fanout-mode leg shapes from the pinned upstream e2e (timelines.ts,
+// ea2c3aed) against the mk-db timelines.rs query fusion (db fallback +
+// FanoutTimelineEndpointService push semantics). The FIXME #12065-guarded
+// shapes ride the same fusion and are covered by the e2e workflow's
+// enableFanoutTimeline:true pass.
+
+#[tokio::test]
+async fn timelines_matrix_home_local_hybrid() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktimelines_matrix").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("tla")).await;
+    let bob = signup(&app, &uname("tlb")).await;
+    let carol = signup(&app, &uname("tlc")).await;
+    let dave = signup(&app, &uname("tld")).await;
+    // &str bindings (Copy) — the e2e fixture ids/tokens ride many json! bodies
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let c = carol["id"].as_str().unwrap();
+    let d = dave["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+    let ct = carol["token"].as_str().unwrap();
+    let dt = dave["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_tl(app: &axum::Router, name: &str, mut params: Value, token: &str) -> Value {
+        params["i"] = json!(token);
+        let (s, v) = post_json(app.clone(), &format!("/api/{name}"), params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    // -- Home: candidates are own + followees; followers-visibility self and
+    //    followee (generateVisibilityQuery followers arm = author IN
+    //    meOrFollowees) -----------------------------------------------
+    let n_self_fol = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "followers", "i": at }),
+    )
+    .await;
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let n_bob = note_post(&app, json!({ "text": "hi", "i": bt })).await;
+    let n_carol = note_post(&app, json!({ "text": "hi", "i": ct })).await;
+    let n_bob_fol = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "followers", "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_self_fol));
+    assert!(has(&res, &n_bob));
+    assert!(has(&res, &n_bob_fol));
+    assert!(lacks(&res, &n_carol));
+
+    // -- Home replies: foreign reply excluded with following.withReplies
+    //    false, included after following/update flips the flag -----------
+    let n_bob_reply = note_post(&app, json!({ "text": "hi", "replyId": n_carol, "i": bt })).await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_bob_reply));
+    // not-following → NOT_FOLLOWING
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "userId": c, "withReplies": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NOT_FOLLOWING"));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "userId": b, "withReplies": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_reply));
+
+    // -- Home: followers-visibility REPLY-TARGET gate (endpoint noteFilter):
+    //    the reply rides the withReplies push but the followers parent must
+    //    be one I follow (or my own) ---------------------------------
+    let n_carol_fol = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "followers", "i": ct }),
+    )
+    .await;
+    let n_bob_reply2 = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": n_carol_fol, "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_bob_reply2));
+    assert!(lacks(&res, &n_carol_fol));
+    // after following carol both surface (withReplies stays on)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": c, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_reply2));
+    assert!(has(&res, &n_carol_fol));
+
+    // -- Home: replies addressed to me always ride along ---------------
+    let n_alice_note = note_post(&app, json!({ "text": "hi", "i": at })).await;
+    let n_bob_reply_me = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": n_alice_note, "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_reply_me));
+
+    // -- Home: specified only to visibleUserIds Targets ---------------
+    let n_bob_spec_other = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "specified", "visibleUserIds": [d], "i": bt }),
+    )
+    .await;
+    let n_bob_spec_me = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "specified", "visibleUserIds": [a], "i": bt }),
+    )
+    .await;
+    let n_self_spec = note_post(
+        &app,
+        json!({ "text": "hi", "visibility": "specified", "i": at }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_bob_spec_other));
+    assert!(has(&res, &n_bob_spec_me));
+    assert!(has(&res, &n_self_spec));
+
+    // -- Home [withRenotes: false]: pure renote dropped, quote kept -----
+    let n_bob_renote = note_post(&app, json!({ "renoteId": n_carol, "i": bt })).await;
+    let n_bob_quote = note_post(&app, json!({ "text": "q", "renoteId": n_carol, "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        "notes/timeline",
+        json!({ "withRenotes": false, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_renote));
+    assert!(has(&res, &n_bob_quote));
+
+    // -- Home: renote-mute CHAIN — muted author → unrelated quote →
+    //    followee renote vanishes (isUserRelated(note.renote) chain) ----
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": c, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let n_carol2 = note_post(&app, json!({ "text": "hi", "i": ct })).await;
+    let n_dave_quote = note_post(
+        &app,
+        json!({ "text": "quote", "renoteId": n_carol2, "i": dt }),
+    )
+    .await;
+    let n_bob_rerenote = note_post(&app, json!({ "renoteId": n_dave_quote, "i": bt })).await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_carol2));
+    assert!(lacks(&res, &n_bob_rerenote));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/mute/delete",
+        json!({ "userId": c, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // -- Home [withFiles: true] ----------------------------------------
+    let file_id = seed_drive_file(&pool, &b, "image/jpeg").await;
+    let n_bob_text = note_post(&app, json!({ "text": "hi", "i": bt })).await;
+    let n_bob_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        "notes/timeline",
+        json!({ "withFiles": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_text));
+    assert!(has(&res, &n_bob_file));
+
+    // -- Local TL: public-only plane; home visibility stays out even for
+    //    followees --------------------------------------------------
+    let n_carol_home =
+        note_post(&app, json!({ "text": "hi", "visibility": "home", "i": ct })).await;
+    let res = fetch_tl(&app, "notes/local-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_carol));
+    assert!(has(&res, &n_dave_quote));
+    assert!(lacks(&res, &n_carol_home));
+    // reply plane: foreign reply out by default; addressed-to-me in;
+    // withReplies=true opens the gate
+    let n_carol_reply_bob =
+        note_post(&app, json!({ "text": "hi", "replyId": n_bob, "i": ct })).await;
+    let n_carol_reply_me = note_post(
+        &app,
+        json!({ "text": "hi", "replyId": n_alice_note, "i": ct }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/local-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_carol_reply_bob));
+    assert!(has(&res, &n_carol_reply_me));
+    let res = fetch_tl(
+        &app,
+        "notes/local-timeline",
+        json!({ "withReplies": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(has(&res, &n_carol_reply_bob));
+
+    // -- Hybrid TL: own+followees ∪ local public ------------------------
+    let n_dave_pub = note_post(&app, json!({ "text": "hi", "i": dt })).await;
+    let n_dave_home = note_post(&app, json!({ "text": "hi", "visibility": "home", "i": dt })).await;
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_carol));
+    assert!(has(&res, &n_dave_pub));
+    assert!(lacks(&res, &n_dave_home));
+    // reply gate default-off: unaddressed foreign reply excluded…
+    let n_dave_reply = note_post(&app, json!({ "text": "hi", "replyId": n_carol, "i": dt })).await;
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_dave_reply));
+    // …and withReplies true opens the gate
+    let res = fetch_tl(
+        &app,
+        "notes/hybrid-timeline",
+        json!({ "withReplies": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(has(&res, &n_dave_reply));
+    // followee's home-visibility note rides the followee arm
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": d, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_dave_home));
+
+    // -- 凍結: suspended author drops out of the local plane and returns
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/suspend-user",
+        json!({ "userId": c, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_carol));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/unsuspend-user",
+        json!({ "userId": c, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_carol));
+}

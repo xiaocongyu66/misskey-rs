@@ -942,7 +942,7 @@ pub(crate) async fn notes_timeline(
     run_list(
         state,
         pool,
-        mk_db::note::timeline_notes(
+        mk_db::timelines::timeline_notes(
             pool,
             me_id,
             &followees,
@@ -974,7 +974,7 @@ pub(crate) async fn notes_local_timeline(
     run_list(
         state,
         pool,
-        mk_db::note::local_timeline_notes(
+        mk_db::timelines::local_timeline_notes(
             pool,
             me_id.as_deref(),
             opt_id(body, "sinceId"),
@@ -1011,7 +1011,7 @@ pub(crate) async fn notes_hybrid_timeline(
     run_list(
         state,
         pool,
-        mk_db::note::hybrid_timeline_notes(
+        mk_db::timelines::hybrid_timeline_notes(
             pool,
             me_id,
             &followees,
@@ -1243,6 +1243,96 @@ pub(crate) async fn timeline_or_hybrid(
 }
 
 /// Credential gate + explicit dispatch for the two (me, body) note endpoints
+/// `POST /api/following/update` — notify / withReplies flag flip on an
+/// existing follow edge (upstream following/update.ts; the timelines matrix
+/// legs flip `following.withReplies` through this, so it rides the timeline
+/// dispatch block until the social lane absorbs the broader following
+/// family). Returns the FOLLOWER packed (upstream `pack(follower.id, me)`).
+pub(crate) async fn following_update(
+    state: &AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_checked_user(pool, token, true).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let user_id = match user_id_param(body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if me_id == user_id {
+        return meta_err(
+            "FOLLOWEE_IS_YOURSELF",
+            "4c4cbaf9-962a-463b-8418-a5e365dbf2eb",
+            "Followee is yourself.",
+        );
+    }
+    let followee = match get_user(pool, user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => meta_err(
+            "NO_SUCH_USER",
+            "14318698-f67e-492a-99da-5353a5ac52be",
+            "No such user.",
+        ),
+        Err(resp) => return resp,
+    };
+    let exists = match mk_db::social::following_exists(pool, &me_id, user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "following_update following_exists");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    if !exists {
+        return meta_err(
+            "NOT_FOLLOWING",
+            "b8dc75cf-1cb5-46c9-b14b-5f1ffbd782c9",
+            "You are not following that user.",
+        );
+    }
+    // ps.notify: 'none' → NULL, 'normal' → 'normal' (absent = untouched)
+    let notify = match body.get("notify") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "normal" => Some(Some("normal".to_string())),
+        Some(Value::String(s)) if s == "none" => Some(None),
+        Some(_) => {
+            return super::invalid_param("notify", "must be one of normal/none");
+        }
+    };
+    let with_replies = match body.get("withReplies") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return super::invalid_param("withReplies", "expected a boolean");
+        }
+    };
+    if let Err(e) =
+        mk_db::social::update_following_flags(pool, &me_id, user_id, notify, with_replies).await
+    {
+        tracing::error!(target: "dbg_social", error = %e, "update_following_flags");
+        return api_err(ApiError::internal_error());
+    }
+    let me = match get_user(pool, &me_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return meta_err(
+                "NO_SUCH_USER",
+                "14318698-f67e-492a-99da-5353a5ac52be",
+                "No such user.",
+            );
+        }
+        Err(resp) => return resp,
+    };
+    match pack_target(state, pool, &me, &me_id).await {
+        Ok(v) => ok_json(v),
+        Err(resp) => resp,
+    }
+}
+
 /// (closure-based generic gate trips HRTB lifetimes — keep this concrete).
 pub(crate) async fn note_credential_dispatch(
     state: &AppState,
