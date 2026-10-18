@@ -7,8 +7,9 @@ harness：`vitest.e2e-rs.config.ts` + `global-setup.mts`（spawn misskey-rs + /e
 ```
 Test Files  1 failed (1)
     Tests  100 failed | 79 passed | 1 skipped | 10 todo (190)
-latest: run 39106850991 (note-domain wiring: timeline trio/reactions/delete/live mention+reply notify — neutral on users.ts by design)
 history note: run 39080371230 = 147 (nine-agent wave: notifications/social/admin/roles/queue + pack parity)
+latest: run 39118917713 @ c03339c — 0 failed (179 passed + 1 skipped + 10 todo) USERSET CLEAR
+history last-waves: 176 (gate-roles M3.5) → 179/0-final (delete-account soft flag + freq pack roles)
 history: 0 → 17 (charset) → 70 (pack mirror) → 75 (i/update subset) → 79 (relations)
           → 93 (search) → 100 (hashtags+credits) → 112 (explore list) → 147 (M3 wave)```
 ```
