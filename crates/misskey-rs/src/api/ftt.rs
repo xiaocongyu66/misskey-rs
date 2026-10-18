@@ -108,7 +108,7 @@ pub(crate) async fn debug_lrange(
     conn.write_all(cmd.as_bytes()).await?;
     conn.shutdown().await?;
 
-    let mut buf = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
