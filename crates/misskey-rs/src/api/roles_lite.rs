@@ -163,10 +163,19 @@ async fn gate(
     if me.is_suspended {
         return Err(account_suspended());
     }
-    // requireAdmin / requireModerator with the root bypass (admin.rs root
-    // shortcut: meta.rootUserId || usernameLower == 'root' || admin role;
-    // root satisfies both gates).
-    let is_root = me.username_lower == "root";
+    // requireAdmin / requireModerator with the root bypass (ApiCallService
+    // L432-442: `meta.rootUserId !== user.id` is what hands over to the
+    // role checks; root satisfies both gates). The root read is NOT merely
+    // the usernameLower shortcut — a suffixed first signup is root once
+    // SignupService stamps meta.
+    let meta_root = match mk_db::admin::root_user_id(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_roles", error = %e, "root_user_id");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    };
+    let is_root = me.username_lower == "root" || meta_root.as_deref() == Some(me.id.as_str());
     let assigned = match mk_db::role::user_assigned_roles(pool, &me.id).await {
         Ok(a) => a,
         Err(e) => {
@@ -297,16 +306,25 @@ async fn assign(state: &AppState, body: &Value, token: Option<&str>) -> ApiResul
             api_err(ApiError::internal_error())
         })?
         .ok_or_else(no_such_role)?;
-    // assign.ts: only administrators manage members unless the role opts in.
-    let is_admin = ctx.me.username_lower == "root" || {
-        let assigned = mk_db::role::user_assigned_roles(pool, &ctx.me.id)
-            .await
-            .map_err(|e| {
-                tracing::error!(target: "dbg_roles", error = %e, "user_assigned_roles[assign]");
-                api_err(ApiError::internal_error())
-            })?;
-        mk_core::services::role::has_administrator_role(&assigned)
+    // assign.ts: only administrators manage members unless the role opts in
+    // (RoleService.isAdministrator L467 — meta.rootUserId is administrator).
+    let meta_root = match mk_db::admin::root_user_id(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_roles", error = %e, "root_user_id[assign]");
+            return Err(api_err(ApiError::internal_error()));
+        }
     };
+    let is_admin =
+        ctx.me.username_lower == "root" || meta_root.as_deref() == Some(ctx.me.id.as_str()) || {
+            let assigned = mk_db::role::user_assigned_roles(pool, &ctx.me.id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(target: "dbg_roles", error = %e, "user_assigned_roles[assign]");
+                    api_err(ApiError::internal_error())
+                })?;
+            mk_core::services::role::has_administrator_role(&assigned)
+        };
     if !role.can_edit_members_by_moderator && !is_admin {
         return Err(access_denied());
     }
