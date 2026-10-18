@@ -46,6 +46,12 @@ mod note_extras;
 // note-agent: drive/files/update (drive/files/update.ts semantics; db part
 // in mk-db/src/drive_note.rs)
 mod drive_note;
+// ul-tl-agent: users/lists/* + notes/user-list-timeline (upstream
+// users/lists/{create,push,update-membership}.ts + notes/user-list-timeline.ts
+// getFromDb; the channels/mute/create list-TL requisite rides along) — db
+// paths in mk-db/src/lists.rs (user_list / user_list_membership ship in the
+// 0001 baseline).
+mod lists;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -430,6 +436,42 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return channel::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END channels DISPATCH ARM ====
+
+    // ==== ul-tl-agent DISPATCH ARM (users/lists/* + notes/user-list-timeline
+    // + channels/mute/create) ====
+    // Self-contained block on the channels-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live in this
+    // arm; all five names are requireCredential upstream, the requireCredential
+    // gates + endpoint bodies in api::lists (db paths in mk-db/src/lists.rs).
+    // channels/mute/create is not in channel::handles, so this arm shadows
+    // nothing existing.
+    if lists::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return lists::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END ul-tl-agent DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
@@ -2367,6 +2409,10 @@ async fn note_user_lite(
 /// sensitiveWords force-home + prohibitedWords rejection, mention
 /// resolution to user ids + mentionLimit policy, repliesCount bump.
 async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    // single request-time clock (upstream computes expiresAt from one
+    // Date.now() at the endpoint, L230): relative poll expiries never race
+    // the already-expired guard, absolute ones still reject below
+    let request_ms = now_ms() as i64;
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
@@ -2528,7 +2574,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
                 Some(_) => return invalid_param("poll.expiredAfter", "must be an integer"),
             };
             let expires_at_ms = match (expires_at, expired_after) {
-                (_, Some(ms)) => Some(now_ms() as i64 + ms),
+                (_, Some(ms)) => Some(request_ms + ms),
                 (e, None) => e,
             };
             Some(PollInput {
@@ -2661,10 +2707,13 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         None => None,
     };
 
-    // poll expiry (CANNOT_CREATE_ALREADY_EXPIRED_POLL).
+    // poll expiry (CANNOT_CREATE_ALREADY_EXPIRED_POLL) against the request
+    // clock: absolute past dates reject, relative expiredAfter (now+ms) can
+    // never start expired (upstream create.ts L230 + NoteCreateService
+    // L406-408 single-tick semantics)
     if let Some(p) = &poll {
         if let Some(exp) = p.expires_at_ms {
-            if exp < now_ms() as i64 {
+            if exp < request_ms {
                 return api_err(ApiError::new(
                     400,
                     mk_types::api_error::ApiErrorKind::Client,
