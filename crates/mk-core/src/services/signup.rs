@@ -73,6 +73,9 @@ pub struct SignupOutcome {
     pub username: String,
     pub username_lower: String,
     pub name: Option<String>,
+    /// `SignupApiService.ts` L116/L241: test-mode `body.host`, normalized by
+    /// `UtilityService.toPunyNullable` (lowercased; NULL when absent).
+    pub host: Option<String>,
     pub token: String,
     pub password_hash: String,
     pub public_key: String,
@@ -93,6 +96,7 @@ pub fn build_signup(
     username: &str,
     password: &str,
     name: Option<&str>,
+    host: Option<&str>,
 ) -> Result<SignupOutcome, &'static str> {
     if !validate_local_username(username) {
         return Err("INVALID_USERNAME");
@@ -106,6 +110,13 @@ pub fn build_signup(
         username: username.to_string(),
         username_lower: username.to_lowercase(),
         name: name.map(|s| s.to_string()),
+        // UtilityService.toPunyNullable: punycode + lowercase, empty → NULL.
+        // The dot-separated host labels the e2e suite signs up with are ASCII
+        // (`randomString() + '.example.com'`), where punycode is the identity
+        // and the lowercase fold is the only observable step.
+        host: host
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty()),
         token,
         password_hash,
         public_key,
@@ -132,7 +143,7 @@ pub fn me_detailed_fresh(
         id: outcome.user_id.clone(),
         name: outcome.name.clone(),
         username: outcome.username.clone(),
-        host: None,
+        host: outcome.host.clone(),
         avatar_url,
         avatar_blurhash: None,
         avatar_decorations: Vec::new(),
@@ -316,7 +327,7 @@ mod tests {
 
     #[test]
     fn signup_builds_and_hashes() {
-        let o = build_signup("alice", "test", None).unwrap();
+        let o = build_signup("alice", "test", None, None).unwrap();
         assert_eq!(o.username_lower, "alice");
         assert_eq!(o.token.len(), 16);
         assert!(o.public_key.starts_with("-----BEGIN PUBLIC KEY-----"));

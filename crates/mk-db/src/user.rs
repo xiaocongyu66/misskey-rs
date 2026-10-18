@@ -8,6 +8,9 @@ pub struct NewUser<'a> {
     pub username: &'a str,
     pub username_lower: &'a str,
     pub name: Option<&'a str>,
+    /// `SignupService.signup`'s `host: toPunyNullable(host)` — NULL for local
+    /// users, the folded host for the test-mode remote signup legs.
+    pub host: Option<&'a str>,
     pub token: &'a str,
     pub password_hash: &'a str,
     pub public_key: &'a str,
@@ -19,13 +22,14 @@ pub async fn insert_new_user(pool: &PgPool, u: &NewUser<'_>) -> Result<(), sqlx:
     sqlx::query(
         r#"
         INSERT INTO "user" ("id", "username", "usernameLower", "name", "host", "token")
-        VALUES ($1, $2, $3, $4, NULL, $5)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
     .bind(u.id)
     .bind(u.username)
     .bind(u.username_lower)
     .bind(u.name)
+    .bind(u.host)
     .bind(u.token)
     .execute(&mut *tx)
     .await?;

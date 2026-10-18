@@ -6696,3 +6696,212 @@ async fn notes_create_channel_legs_and_tl_folds() {
 
     let _ = pool;
 }
+
+// ===== tl-tail: timelines.ts census clusters (post-fix shapes) ==============
+//
+// Asserts over the endpoint shapes the remaining e2e-timelines census clusters
+// exercise, on the fixed rows:
+// - signup({ host }) — SignupApiService.ts L116 test-mode host → user."host" +
+//   pack echo + the note.userHost insert denormalization → local-timeline's
+//   `(visibility='public') AND (userHost IS NULL)` plane (timelines.ts
+//   L1172/L1747 legs, Social TL 凍結(リモート) L2204 gap);
+// - the renote-row channel denormalization (NoteCreateService.ts L651/L680:
+//   payload channelId + parent renoteChannelId) as channels/timeline's
+//   `channelId = ?` reader and the users/notes + user-list-timeline
+//   channel_muting renote gates read both (timelines.ts L3078/L3131/L3147/
+//   L3247/L2704 legs).
+
+#[tokio::test]
+async fn tl_tail_remote_host_and_channel_renote_shapes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktltail").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("tta")).await;
+    let at = alice["token"].as_str().unwrap();
+
+    // -- remote bob: test-mode signup host → pack echoes, row stores -------
+    let host = format!("{}.example.com", mk_types::id::gen_aid_now());
+    let (s, bob) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": uname("ttb"), "password": "test", "host": host }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {bob}");
+    assert_eq!(bob["host"], json!(host), "pack echoes the signup host");
+    let (b_id, bt) = (
+        bob["id"].as_str().unwrap().to_string(),
+        bob["token"].as_str().unwrap().to_string(),
+    );
+    let stored: Option<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
+            .bind(&b_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(host.as_str()));
+
+    // -- the remote public note rides the userHost denormalization on the
+    //    insert (note.rs user_host_of) and stays out of LTL ---------------
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+
+    let local_note = note_post(&app, json!({ "text": "local", "i": at })).await;
+    let remote_note = note_post(&app, json!({ "text": "remote", "i": bt })).await;
+    let remote_stored: Option<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "userHost" FROM "note" WHERE "id" = $1"#)
+            .bind(&remote_note)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remote_stored.as_deref(), Some(host.as_str()));
+    let (s, ltl) = post_json(
+        app.clone(),
+        "/api/notes/local-timeline",
+        json!({ "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ltl}");
+    assert!(has(&ltl, &local_note), "local control note in LTL: {ltl}");
+    assert!(
+        !has(&ltl, &remote_note),
+        "リモートユーザーのノートが含まれない: {ltl}"
+    );
+
+    // ...alice can still reach the followed remote user's note in HTL
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, htl) = post_json(
+        app.clone(),
+        "/api/notes/timeline",
+        json!({ "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {htl}");
+    assert!(
+        has(&htl, &remote_note),
+        "フォローしているリモートユーザーのノートが含まれる: {htl}"
+    );
+
+    // -- renote stamp shapes: a payload-channelId renote shows in the
+    //    channel TL, and muted-channel renotes drop from the users/notes and
+    //    user-list-timeline gates ------------------------------------------
+    let (s, carol) = signup(&app, &uname("ttc")).await;
+    let (c_id, ct) = (
+        carol["id"].as_str().unwrap().to_string(),
+        carol["token"].as_str().unwrap().to_string(),
+    );
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "chan", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    let ch_note = note_post(
+        &app,
+        json!({ "text": "in-chan", "channelId": ch_id, "i": ct }),
+    )
+    .await;
+    // the payload-channelId renote (timelines.ts L3138/L3155/L3255 shapes)
+    let (s, r) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": ch_note, "channelId": ch_id, "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {r}");
+    let ch_renote = r["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, ctl) = post_json(
+        app.clone(),
+        "/api/channels/timeline",
+        json!({ "channelId": ch_id, "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ctl}");
+    assert!(
+        has(&ctl, &ch_renote),
+        "閲覧中チャンネルのノートにリノートが含まれる: {ctl}"
+    );
+
+    // even muted, the VIEWED channel's rows flow (timelines.ts L3247 leg)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/mute/create",
+        json!({ "channelId": ch_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, ctl2) = post_json(
+        app.clone(),
+        "/api/channels/timeline",
+        json!({ "channelId": ch_id, "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ctl2}");
+    assert!(
+        has(&ctl2, &ch_renote),
+        "閲覧中チャンネルをミュートしていても、同チャンネルのリノートが含まれる: {ctl2}"
+    );
+
+    // users/notes renoteChannel gate ([チャンネル外リノート] L3078)
+    let (s, un) = post_json(
+        app.clone(),
+        "/api/users/notes",
+        json!({ "userId": c_id, "withChannelNotes": true, "limit": 100, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {un}");
+    assert!(
+        !has(&un, &ch_renote),
+        "[チャンネル外リノート] チャンネルミュート＝TLに流れない: {un}"
+    );
+
+    // user-list-timeline renoteChannel gate for a list member (L2704)
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "list", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": c_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, ult) = post_json(
+        app.clone(),
+        "/api/notes/user-list-timeline",
+        json!({ "listId": list_id, "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ult}");
+    assert!(
+        !has(&ult, &ch_renote),
+        "[チャンネル外リノート] チャンネル未フォロー＋リスインしてる＋チャンネルミュート＝TLに流れない: {ult}"
+    );
+
+    let _ = pool;
+}

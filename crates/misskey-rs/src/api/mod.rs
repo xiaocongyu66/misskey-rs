@@ -693,7 +693,18 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
         return api_err(ApiError::internal_error());
     }
 
-    let outcome = match mk_core::services::build_signup(username, password, None) {
+    // SignupApiService.ts L116: `host` is read from the body only when
+    // NODE_ENV=test — the timelines suite's remote-user legs
+    // (signup({ host: genHost() })) ride this; the folded host then lands in
+    // user."host" (SignupService.ts: toPunyNullable) and the note insert's
+    // userHost denormalization.
+    let host_param: Option<&str> = if state.config.test {
+        body.get("host").and_then(|v| v.as_str())
+    } else {
+        None
+    };
+
+    let outcome = match mk_core::services::build_signup(username, password, None, host_param) {
         Ok(o) => o,
         Err(code) => return reply_plain(400, code),
     };
@@ -704,6 +715,7 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
             username: &outcome.username,
             username_lower: &outcome.username_lower,
             name: outcome.name.as_deref(),
+            host: outcome.host.as_deref(),
             token: &outcome.token,
             password_hash: &outcome.password_hash,
             public_key: &outcome.public_key,
