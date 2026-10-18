@@ -4857,7 +4857,7 @@ async fn notes_create_word_ladders() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, note) = post_json(
+    let (_, note) = post_json(
         app.clone(),
         "/api/notes/create",
         json!({ "text": "hogetesthuge", "i": a_token }),

@@ -2408,7 +2408,9 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         Some(Value::Bool(b)) => *b,
         Some(_) => return invalid_param("localOnly", "must be a boolean"),
     };
-    let reaction_acceptance = match body.get("reactionAcceptance").and_then(|v| v.as_str()) {
+    // reactionAcceptance is validated (enum) and carried by the row column
+    // once the insert grows the binding; paramDef validation happens here.
+    let _reaction_acceptance = match body.get("reactionAcceptance").and_then(|v| v.as_str()) {
         None => None,
         Some(
             v @ ("likeOnly"

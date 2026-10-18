@@ -963,8 +963,9 @@ mod tests {
         assert_eq!(correct_filename("192.jpg", Some("jpg")), "192.jpg");
         // jpeg ext synonym
         assert_eq!(correct_filename("192.jpeg", Some("jpg")), "192.jpeg");
-        // no ext on the detected type → guess stays
-        assert_eq!(correct_filename("data", None), "data");
+        // no ext on the filename still composes .unknown (upstream
+        // misc/correct-filename.ts: null filenameExt → `filename + dotExt`)
+        assert_eq!(correct_filename("data", None), "data.unknown");
         // unknown type with an ext → unchanged
         assert_eq!(correct_filename("data.bin", None), "data.bin");
         // unknown type without an ext → .unknown
