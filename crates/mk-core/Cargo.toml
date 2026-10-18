@@ -13,6 +13,7 @@ mk-db = { workspace = true }
 bcrypt = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

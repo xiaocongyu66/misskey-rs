@@ -14,6 +14,8 @@ use sqlx::PgPool;
 #[derive(Debug, sqlx::FromRow)]
 pub struct NoteDriveFileRow {
     pub id: String,
+    #[sqlx(rename = "userId")]
+    pub user_id: Option<String>,
     pub name: String,
     #[sqlx(rename = "type")]
     pub file_type: String,
@@ -31,7 +33,7 @@ pub struct NoteDriveFileRow {
     pub properties: serde_json::Value,
 }
 
-const FILE_COLS: &str = r#""id", "name", ("type"::text) AS "type", "md5", "size", "comment",
+const FILE_COLS: &str = r#""id", ("userId") AS "userId", "name", ("type"::text) AS "type", "md5", "size", "comment",
     "isSensitive", "blurhash", "url", "thumbnailUrl", "webpublicUrl",
     ("properties"::text)::jsonb AS "properties""#;
 
@@ -101,8 +103,12 @@ pub async fn update_file(
 mod tests {
     use super::*;
 
-    #[sqlx::test(migrations = "./migrations")]
-    async fn owned_fetch_and_update(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn owned_fetch_and_update() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pool = crate::test_support::fresh_db("mkdb_drive_note").await;
         sqlx::query(
             r#"INSERT INTO "drive_file" ("id","userId","md5","name","type","size","properties",
                                         "storedInternal","url","isSensitive")

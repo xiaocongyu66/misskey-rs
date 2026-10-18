@@ -71,8 +71,12 @@ pub async fn update_meta_word_lists(
 mod tests {
     use super::*;
 
-    #[sqlx::test(migrations = "./migrations")]
-    async fn words_roundtrip(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn words_roundtrip() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pool = crate::test_support::fresh_db("mkdb_meta_words").await;
         let (s, p, d) = note_content_moderation_words(&pool).await.unwrap();
         assert!(s.is_empty() && p.is_empty() && d.is_none());
 

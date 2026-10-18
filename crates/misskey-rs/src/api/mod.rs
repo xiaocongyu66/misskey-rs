@@ -34,6 +34,13 @@ mod delete_account;
 // channels-agent: channels/* domain (channels/create ../favorite slice of
 // upstream endpoints/channels/*) — db paths in mk-db/src/channel.rs
 mod channel;
+// note-agent: notes.ts acceptance slice — notes (global list),
+// notes/polls/vote, notes/translate + the admin/update-meta
+// sensitiveWords/prohibitedWords patch (db paths in mk-db meta.rs).
+mod note_extras;
+// note-agent: drive/files/update (drive/files/update.ts semantics; db part
+// in mk-db/src/drive_note.rs)
+mod drive_note;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -100,6 +107,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/reactions"
         || name == "notes/reactions/create"
         || name == "notes/delete"
+        // note-agent notes.ts slice (global list + polls/vote + translate)
+        || name == "notes"
+        || name == "notes/polls/vote"
+        || name == "notes/translate"
         // freq-agent: users/get-frequently-replied-users slice + requisites
         // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
         || name == "users/get-frequently-replied-users"
@@ -181,6 +192,18 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "users/notes" {
             return freq::user_notes(&state, &body, token.as_deref()).await;
         }
+        if name == "notes" {
+            return note_extras::notes_list(&state, &body, token.as_deref()).await;
+        }
+        if name == "notes/polls/vote" || name == "notes/translate" {
+            return note_extras::handle(&state, name.as_str(), &body, token).await;
+        }
+        // note-agent: the sensitiveWords/prohibitedWords patch of update-meta
+        // (note.ts census keeps those lists in the meta row via this arm;
+        // pinnedUsers and the rest still flow to the freq arm below).
+        if name == "admin/update-meta" && note_extras::takes_update_meta(body) {
+            return note_extras::update_meta(&state, &body, token.as_deref()).await;
+        }
         if name == "admin/update-meta" {
             return freq::update_meta(&state, &body, token.as_deref()).await;
         }
@@ -224,6 +247,43 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
     // ==== END delete-account DISPATCH ARM ====
 
+    // ==== announcements DISPATCH ARM (announcements slice) ====
+    // announcements-agent: the announcements family names route into
+    // api::announcement on the channels-arm pattern — method check, body
+    // parsing, token extraction and the credential-declared probe live in
+    // this arm; the requireCredential/requireModerator gates + endpoint
+    // bodies in api::announcement (db paths in mk-db/src/announcement.rs).
+    // The admin/announcements/* names shadow the admin/* catch-all below,
+    // so this arm sits ahead of it (roles_lite/delete_account convention).
+    if announcement::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return announcement::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
+    }
+    // ==== END announcements DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -241,6 +301,19 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // multipart plugin), users/update-memo a JSON { userId, memo } body.
     if name == "drive/files/create" {
         return drive::files_create(state, req).await;
+    }
+    // note-agent: drive/files/update minimal slice (comment/name/isSensitive)
+    if name == "drive/files/update" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return drive_note::files_update(&state, &body, token.as_deref()).await;
     }
     if name == "i/pin" || name == "i/unpin" || name == "users/update-memo" {
         if method != Method::POST {
@@ -2267,8 +2340,14 @@ async fn note_user_lite(
     ))
 }
 
-/// `POST /api/notes/create` — M1 subset: text (+optional visibility/replyId),
-/// credential required (401 shapes shared with i_route flow via resolve_me).
+/// `POST /api/notes/create` — upstream `endpoints/notes/create.ts` +
+/// `NoteCreateService.fetchAndCreate/create` (note.ts acceptance ladder):
+/// paramDef validation, owned-file check (NO_SUCH_FILE on count mismatch,
+/// `misskey:id` = plain alnum so malformed ids fall through to the service
+/// check), reply-target ladder (NO_SUCH_REPLY_TARGET → pure-renote rejection
+/// → invisible-note → specified-visibility extension → block), poll expiry,
+/// sensitiveWords force-home + prohibitedWords rejection, mention
+/// resolution to user ids + mentionLimit policy, repliesCount bump.
 async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> Response {
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
@@ -2284,69 +2363,481 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     };
 
     // social-agent: renote path — upstream notes/create renoteId param with
-    // NoteCreateService renote rules (textless row; M2 local-only; the
-    // target note's notifications stay with the notifications agent).
-    if body.get("renoteId").and_then(|v| v.as_str()).is_some() {
+    // NoteCreateService renote rules. Upstream trims text inside create()
+    // before isQuote is evaluated, so whitespace-only text on a quote degrades
+    // to a pure renote with text: null — normalized on the (cloned) body here
+    // since the renote arm re-reads it.
+    if let Some(rid) = body.get("renoteId").and_then(|v| v.as_str()) {
+        if !is_alnum_id(rid) {
+            return invalid_param("renoteId", "must be an alphanumeric id");
+        }
+        let blank_text = matches!(body.get("text"), Some(Value::String(t)) if t.trim().is_empty());
+        if blank_text {
+            let mut normalized = body.clone();
+            normalized["text"] = Value::Null;
+            return social::notes_create_renote(state, &normalized, &me_id).await;
+        }
         return social::notes_create_renote(state, body, &me_id).await;
     }
 
-    let text = match body.get("text").and_then(|v| v.as_str()) {
-        Some(t) if !t.is_empty() && t.chars().count() <= 3000 => t,
-        _ => {
-            return api_err(ApiError::invalid_param(json!({
-                "param": "text",
-                "reason": "required, 1..3000 chars in M1 (poll/file notes land in M2)",
-            })));
-        }
-    };
+    // ---- paramDef (endpoints/notes/create.ts) ----
     let visibility = match body.get("visibility").and_then(|v| v.as_str()) {
         None | Some("public") => "public",
         Some(v @ ("home" | "followers" | "specified")) => v,
         Some(_) => {
-            return api_err(ApiError::invalid_param(json!({
-                "param": "visibility",
-                "reason": "must be one of public/home/followers/specified",
-            })));
+            return invalid_param(
+                "visibility",
+                "must be one of public/home/followers/specified",
+            );
         }
     };
-    let reply_id = body.get("replyId").and_then(|v| v.as_str());
+    let local_only = match body.get("localOnly") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return invalid_param("localOnly", "must be a boolean"),
+    };
+    let reaction_acceptance = match body.get("reactionAcceptance").and_then(|v| v.as_str()) {
+        None | Some(Value::Null) => None,
+        Some(
+            v @ ("likeOnly"
+            | "likeOnlyForRemote"
+            | "nonSensitiveOnly"
+            | "nonSensitiveOnlyForLocalLikeOnlyForRemote"),
+        ) => Some(v.to_string()),
+        Some(_) => return invalid_param("reactionAcceptance", "invalid enum value"),
+    };
+    let cw = match body.get("cw") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if (1..=100).contains(&s.chars().count()) => Some(s.as_str()),
+        Some(_) => return invalid_param("cw", "must be a string of 1..100 chars"),
+    };
+    // text: nullable, 1..=3000 — blank-but-nonempty strings pass the schema
+    // and trim to null inside NoteCreateService.create.
+    let raw_text = match body.get("text") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if (1..=3000).contains(&s.chars().count()) => Some(s.as_str()),
+        Some(_) => {
+            return invalid_param("text", "must be a string of 1..3000 chars");
+        }
+    };
+    let reply_id = match body.get("replyId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if is_alnum_id(s) => Some(s.as_str()),
+        Some(_) => return invalid_param("replyId", "must be an alphanumeric id"),
+    };
+    let visible_user_ids_in: Vec<String> = match body.get("visibleUserIds") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => {
+            let mut out = Vec::with_capacity(a.len());
+            for v in a {
+                match v.as_str() {
+                    Some(s) if is_alnum_id(s) && !out.contains(&s.to_string()) => {
+                        out.push(s.to_string())
+                    }
+                    _ => return invalid_param("visibleUserIds", "must be unique alphanumeric ids"),
+                }
+            }
+            out
+        }
+        Some(_) => return invalid_param("visibleUserIds", "must be an array of ids"),
+    };
+    let file_ids: Vec<String> = match body.get("fileIds").or_else(|| body.get("mediaIds")) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => {
+            if a.is_empty() || a.len() > 16 {
+                return invalid_param("fileIds", "must have 1..16 items");
+            }
+            let mut out: Vec<String> = Vec::with_capacity(a.len());
+            for v in a {
+                match v.as_str() {
+                    Some(s) if is_alnum_id(s) => {
+                        if out.contains(&s.to_string()) {
+                            return invalid_param("fileIds", "must be unique");
+                        }
+                        out.push(s.to_string());
+                    }
+                    _ => return invalid_param("fileIds", "items must be alphanumeric ids"),
+                }
+            }
+            out
+        }
+        Some(_) => return invalid_param("fileIds", "must be an array of ids"),
+    };
+    struct PollInput {
+        choices: Vec<String>,
+        multiple: bool,
+        expires_at_ms: Option<i64>,
+    }
+    let poll: Option<PollInput> = match body.get("poll") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => {
+            let Some(Value::Array(choices_raw)) = o.get("choices") else {
+                return invalid_param("poll.choices", "required");
+            };
+            if !(2..=10).contains(&choices_raw.len()) {
+                return invalid_param("poll.choices", "must have 2..10 items");
+            }
+            let mut choices: Vec<String> = Vec::with_capacity(choices_raw.len());
+            for v in choices_raw {
+                match v.as_str() {
+                    Some(c) if (1..=50).contains(&c.chars().count()) => {
+                        if choices.contains(&c.to_string()) {
+                            return invalid_param("poll.choices", "must be unique");
+                        }
+                        choices.push(c.to_string());
+                    }
+                    _ => return invalid_param("poll.choices", "must be 1..50 char strings"),
+                }
+            }
+            let multiple = match o.get("multiple") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return invalid_param("poll.multiple", "must be a boolean"),
+            };
+            let expires_at = match o.get("expiresAt") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(n)) => n.as_i64(),
+                Some(_) => return invalid_param("poll.expiresAt", "must be an integer"),
+            };
+            let expired_after = match o.get("expiredAfter") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(n)) => match n.as_i64() {
+                    Some(ms) if ms >= 1 => Some(ms),
+                    _ => return invalid_param("poll.expiredAfter", "must be >= 1"),
+                },
+                Some(_) => return invalid_param("poll.expiredAfter", "must be an integer"),
+            };
+            let expires_at_ms = match (expires_at, expired_after) {
+                (_, Some(ms)) => Some(now_ms() as i64 + ms),
+                (e, None) => e,
+            };
+            Some(PollInput {
+                choices,
+                multiple,
+                expires_at_ms,
+            })
+        }
+        Some(_) => return invalid_param("poll", "must be an object"),
+    };
 
-    let id = mk_types::id::gen_aid_now();
-    let hashtags = mk_core::services::misc::extract_hashtags(text);
-    let mention_names: Vec<String> = mk_core::services::misc::extract_mentions(text)
-        .into_iter()
-        .map(|(u, _)| u)
-        .collect();
-    // reply denormals (visibility clause + reply filters read these).
-    // NOTE_COLS doesn't carry threadId/replyUserHost yet — thread root falls
-    // back to the direct reply id until the row mapping grows those columns.
-    let (reply_user_id, thread_id) = if let Some(rid) = reply_id {
-        match mk_db::note::find_note_by_id(pool, rid).await {
-            Ok(Some(t)) => (Some(t.user_id), Some(rid.to_string())),
-            _ => (None, None),
+    // (re)note with text, files and poll are optional (schema if/then):
+    // everything else requires a non-blank text — blank strings that pass the
+    // schema trim to null inside create() instead.
+    if raw_text.is_none() && file_ids.is_empty() && poll.is_none() {
+        return invalid_param("text", "required");
+    }
+
+    // ---- fetchAndCreate ----
+    // author host (mention fallback `m.host ?? user.host`).
+    let me_host = match mk_db::note::user_host_of(pool, &me_id).await {
+        Ok(h) => h.flatten(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "user_host_of");
+            return api_err(ApiError::internal_error());
         }
-    } else {
-        (None, None)
     };
+
+    // files: owned + existing rows (upstream orders by array_position; the
+    // count-mismatch IS the NO_SUCH_FILE check).
+    let files = if file_ids.is_empty() {
+        Vec::new()
+    } else {
+        match mk_db::drive_note::fetch_owned_files(pool, &me_id, &file_ids).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "fetch_owned_files");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    };
+    if files.len() != file_ids.len() {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_FILE",
+            "b6992544-63e7-67f0-fa7f-32444b1b5306",
+            "Some files are not found.",
+        ));
+    }
+
+    // reply target ladder.
+    let reply: Option<mk_db::note::NoteRow> = match reply_id {
+        Some(rid) => {
+            let target = match mk_db::note::find_note_by_id(pool, rid).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "find_note_by_id[reply]");
+                    return api_err(ApiError::internal_error());
+                }
+            };
+            let Some(reply_row) = target else {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "NO_SUCH_REPLY_TARGET",
+                    "60142edb-1519-408e-926d-4f108d27bee0",
+                    "No such reply target.",
+                ));
+            };
+            // reply to a pure renote
+            let reply_is_quote =
+                reply_row.text.is_some() || !reply_row.file_ids.is_empty() || reply_row.has_poll;
+            if reply_row.renote_id.is_some() && !reply_is_quote {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "CANNOT_REPLY_TO_A_PURE_RENOTE",
+                    "f089e4e2-c0e7-4f60-8a23-e5a6bf786b36",
+                    "You can not reply to a pure Renote.",
+                ));
+            }
+            let visible = match note_is_visible_for_me(pool, &reply_row, &me_id).await {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            if !visible {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "CANNOT_REPLY_TO_AN_INVISIBLE_NOTE",
+                    "11cd37b3-a411-4f77-8633-c580ce6a8dce",
+                    "You cannot reply to an invisible Note.",
+                ));
+            }
+            if reply_row.visibility == "specified" && visibility != "specified" {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY",
+                    "ced780a1-2012-4caf-bc7e-a95a291294cb",
+                    "You cannot reply to a specified visibility note with extended visibility.",
+                ));
+            }
+            // blocking (blocker = reply target author)
+            if reply_row.user_id != me_id {
+                match mk_db::social::blocking_exists(pool, &reply_row.user_id, &me_id).await {
+                    Ok(true) => {
+                        return api_err(ApiError::new(
+                            400,
+                            mk_types::api_error::ApiErrorKind::Client,
+                            "YOU_HAVE_BEEN_BLOCKED",
+                            "b0df6025-f2e8-44b4-a26a-17ad99104612",
+                            "You have been blocked by this user.",
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(target: "dbg_notes", error = %e, "blocking_exists[reply]");
+                        return api_err(ApiError::internal_error());
+                    }
+                }
+            }
+            Some(reply_row)
+        }
+        None => None,
+    };
+
+    // poll expiry (CANNOT_CREATE_ALREADY_EXPIRED_POLL).
+    if let Some(p) = &poll {
+        if let Some(exp) = p.expires_at_ms {
+            if exp < now_ms() as i64 {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "CANNOT_CREATE_ALREADY_EXPIRED_POLL",
+                    "04da457d-b083-4055-9082-955525eda5a5",
+                    "Poll is already expired.",
+                ));
+            }
+        }
+    }
+
+    // ---- create() ----
+    let mut text: Option<String> = raw_text.map(|t| t.trim().to_string());
+    if let Some(t) = &text {
+        if t.is_empty() {
+            text = None;
+        }
+    }
+
+    // assigned-role policies (mentionLimit / canPublicNote).
+    let assigned = match mk_db::role::user_assigned_roles(pool, &me_id).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "user_assigned_roles");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let policy = mk_core::services::role::UserPolicy::compute(&assigned);
+
+    let (sensitive_words, prohibited_words) =
+        match mk_db::meta::note_content_moderation_words(pool).await {
+            Ok((s, p, _)) => (s, p),
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "note_content_moderation_words");
+                return api_err(ApiError::internal_error());
+            }
+        };
+
+    let mut visibility = visibility.to_string();
+    if visibility == "public" {
+        let cw_or_text = cw.or(raw_text).unwrap_or("");
+        if mk_core::services::misc::is_keyword_included(cw_or_text, &sensitive_words) {
+            visibility = "home".to_string();
+        } else if !policy.can_public_note {
+            visibility = "home".to_string();
+        }
+    }
+
+    // prohibited words: cw+text joined, then the poll choices (concat helper).
+    let prohibited_content = mk_core::services::misc::concat_note_contents_for_keyword_check(
+        cw,
+        raw_text,
+        poll.as_ref().map(|p| p.choices.as_slice()).unwrap_or(&[]),
+    );
+    if mk_core::services::misc::is_keyword_included(&prohibited_content, &prohibited_words) {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CONTAINS_PROHIBITED_WORDS",
+            "aa6e01d3-a85c-669d-758a-76aab43af334",
+            "Cannot post because it contains prohibited words.",
+        ));
+    }
+
+    // reply visibility cascade (NoteCreateService data.reply switch).
+    let mut local_only = local_only;
+    if let Some(reply_row) = &reply {
+        match reply_row.visibility.as_str() {
+            "home" if visibility == "public" => visibility = "home".to_string(),
+            "followers" if visibility == "public" || visibility == "home" => {
+                visibility = "followers".to_string();
+            }
+            _ => {}
+        }
+        // ローカルのみにリプライしたらローカルのみにする
+        if reply_row.local_only {
+            local_only = true;
+        }
+    }
+
+    // mentions: text + cw + poll choices tokens, resolved to user ids
+    // (resolveUser(m.username, m.host ?? user.host)), deduped in order.
+    let mut mention_sources = String::new();
+    if let Some(t) = raw_text {
+        mention_sources.push_str(t);
+    }
+    if let Some(c) = cw {
+        mention_sources.push_str(c);
+    }
+    if let Some(p) = &poll {
+        for c in &p.choices {
+            mention_sources.push_str(c);
+        }
+    }
+    let mut mentioned_user_ids: Vec<String> = Vec::new();
+    for (username, host) in mk_core::services::misc::extract_mentions(&mention_sources) {
+        let host = host.or_else(|| me_host.clone());
+        let id = match host.as_deref() {
+            None => mk_db::user::find_local_user_by_username(pool, &username.to_lowercase())
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.id),
+            Some(h) => mk_db::freq::find_user_id_by_acct(pool, &username.to_lowercase(), Some(h))
+                .await
+                .ok()
+                .flatten(),
+        };
+        if let Some(id) = id {
+            if !mentioned_user_ids.contains(&id) {
+                mentioned_user_ids.push(id);
+            }
+        }
+    }
+    // reply author rides the mentions when the author is not the replier.
+    if let Some(reply_row) = &reply {
+        if reply_row.user_id != me_id && !mentioned_user_ids.contains(&reply_row.user_id) {
+            mentioned_user_ids.push(reply_row.user_id.clone());
+        }
+    }
+
+    // visibleUsers: resolved subset of visibleUserIds; specified notes merge
+    // them into the mentions and pull the reply author into the targets.
+    let mut visible_user_ids: Vec<String> = Vec::new();
+    for uid in &visible_user_ids_in {
+        match mk_db::user::find_user_by_id(pool, uid).await {
+            Ok(Some(_)) => {
+                if !mentioned_user_ids.contains(uid) {
+                    mentioned_user_ids.push(uid.clone());
+                }
+                if !visible_user_ids.contains(uid) {
+                    visible_user_ids.push(uid.clone());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "find_user_by_id[visible]");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    }
+    if visibility == "specified" {
+        if let Some(reply_row) = &reply {
+            if !visible_user_ids.contains(&reply_row.user_id) {
+                visible_user_ids.push(reply_row.user_id.clone());
+            }
+        }
+    }
+
+    // mentionLimit policy (effectiveMentionCount > 0 && > mentionLimit).
+    if !mentioned_user_ids.is_empty() && mentioned_user_ids.len() as i64 > policy.mention_limit {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CONTAINS_TOO_MANY_MENTIONS",
+            "4de0363a-3046-481b-9b0f-feff3e211025",
+            "Cannot post because it exceeds the allowed number of mentions.",
+        ));
+    }
+
+    let hashtags = mk_core::services::misc::extract_hashtags(&text.clone().unwrap_or_default());
+
+    // ---- insertNote (+ poll, repliesCount bump) ----
+    let id = mk_types::id::gen_aid_now();
+    let (reply_user_id, reply_user_host, thread_id) = match &reply {
+        Some(r) => (
+            Some(r.user_id.clone()),
+            r.user_host.clone(),
+            Some(r.reply_id.clone().unwrap_or_else(|| r.id.clone())),
+        ),
+        None => (None, None, None),
+    };
+    let attached_types: Vec<String> = files.iter().map(|f| f.file_type.clone()).collect();
+    let no_visible: Vec<String> = Vec::new();
     if let Err(e) = mk_db::note::insert_note(
         pool,
         &mk_db::note::NewNote {
             id: &id,
-            text: Some(text),
+            text: text.as_deref(),
+            cw,
             user_id: &me_id,
-            visibility,
+            visibility: &visibility,
             reply_id,
             reply_user_id: reply_user_id.as_deref(),
-            reply_user_host: None, // remote reply author — TODO(M4) with AP
+            reply_user_host: reply_user_host.as_deref(),
             thread_id: thread_id.as_deref(),
-            mentions: &mention_names,
+            mentions: &mentioned_user_ids,
             hashtags: &hashtags,
-            cw: None,
-            file_ids: &[],
-            attached_file_types: &[],
-            visible_user_ids: &[],
-            has_poll: false,
-            local_only: false,
+            file_ids: &file_ids,
+            attached_file_types: &attached_types,
+            visible_user_ids: if visibility == "specified" {
+                &visible_user_ids
+            } else {
+                &no_visible
+            },
+            has_poll: poll.is_some(),
+            local_only,
         },
     )
     .await
@@ -2354,45 +2845,104 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         tracing::error!(target: "dbg_notes", error = %e, "insert_note");
         return api_err(ApiError::internal_error());
     }
+    if let Some(p) = &poll {
+        if let Err(e) = mk_db::poll::insert_poll(
+            pool,
+            &id,
+            &p.choices,
+            p.multiple,
+            p.expires_at_ms,
+            &visibility,
+            &me_id,
+        )
+        .await
+        {
+            tracing::error!(target: "dbg_notes", error = %e, "insert_poll");
+            return api_err(ApiError::internal_error());
+        }
+    }
+    if let Some(rid) = reply_id {
+        if let Err(e) = mk_db::note::bump_replies_count(pool, rid, 1).await {
+            tracing::error!(target: "dbg_notes", error = %e, "bump_replies_count");
+        }
+    }
     if let Err(e) = mk_db::note::credit_note_to_user(pool, &me_id, &hashtags).await {
         tracing::error!(target: "dbg_notes", error = %e, "credit_note_to_user");
     }
 
-    // NoteCreateService non-AP notify branch for reply: the replied-to
-    // author (local, not self) gets a 'reply' notification when the target
-    // still exists.
+    // NoteCreateService non-AP notify branch: reply → target author;
+    // mentioned local users → 'mention' (gates live in the social helper).
     if let Some(rid) = reply_id {
         if let Ok(Some(target)) = mk_db::note::find_note_by_id(pool, rid).await {
             social::notify_note_event(pool, &target.user_id, &me_id, "reply", &id).await;
         }
     }
-    // Mentions: every resolved local username distinct from the author.
-    for (username, host) in mk_core::services::misc::extract_mentions(text) {
-        if host.is_some() {
-            continue; // remote mentions need AP resolution — TODO(M4)
-        }
-        if let Ok(Some(target)) =
-            mk_db::user::find_local_user_by_username(pool, &username.to_lowercase()).await
-        {
-            if target.id != me_id {
-                social::notify_note_event(pool, &target.id, &me_id, "mention", &id).await;
-            }
+    for uid in &mentioned_user_ids {
+        if uid != &me_id {
+            social::notify_note_event(pool, uid, &me_id, "mention", &id).await;
         }
     }
 
-    let note = match pack_note(state, pool, &id).await {
+    let note = match pack_note_for(state, pool, &id, Some(&me_id)).await {
         Ok(n) => n,
         Err(r) => return *r,
     };
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
 }
 
-/// M1 note packing pipeline (row + author lite + derived createdAt).
-async fn pack_note(
+/// `NoteEntityService.isVisibleForMe` (author / specified-listed /
+/// replied-to-me / mentioned / follower ladder; the remote-follow fallback
+/// the e2e never exercises stays out).
+pub(crate) async fn note_is_visible_for_me(
+    pool: &mk_db::sqlx::PgPool,
+    note: &mk_db::note::NoteRow,
+    me_id: &str,
+) -> Result<bool, Response> {
+    match note.visibility.as_str() {
+        "specified" => {
+            Ok(note.user_id == me_id || note.visible_user_ids.iter().any(|v| v == me_id))
+        }
+        "followers" => {
+            if note.user_id == me_id
+                || note.reply_user_id.as_deref() == Some(me_id)
+                || note.mentions.iter().any(|m| m == me_id)
+            {
+                return Ok(true);
+            }
+            let followees = match mk_db::social::followee_ids(pool, me_id).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "followee_ids");
+                    return Err(api_err(ApiError::internal_error()));
+                }
+            };
+            Ok(followees.iter().any(|f| f == &note.user_id))
+        }
+        _ => Ok(true),
+    }
+}
+
+/// ajv `misskey:id` format (`/^[a-zA-Z0-9]+$/` — endpoint-base.ts L20).
+fn is_alnum_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Note-pack pipeline shared by every note-shaped endpoint
+/// (`NoteEntityService.pack(note, me, { detail })`): the row + author lite
+/// with the db follow-throughs — `files` (by `fileIds`, aid-derived
+/// createdAt), `poll` (Detail), nested `reply` (packed detail:false) /
+/// `renote` (packed detail:true), `emojis` (remote-only `{}` per
+/// populateEmoji's local-host null), and `myReaction` for the self-view.
+/// Ok(None) = row missing (top level maps to NO_SUCH_NOTE).
+async fn load_pack_note(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     note_id: &str,
-) -> Result<Value, Box<Response>> {
+    me_id: Option<&str>,
+    detail: bool,
+    depth: u32,
+) -> Result<Option<Value>, Box<Response>> {
+    const MAX_PACK_DEPTH: u32 = 8;
     let row = match mk_db::note::find_note_by_id(pool, note_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -2401,13 +2951,7 @@ async fn pack_note(
         }
     };
     let Some(row) = row else {
-        return Err(Box::new(api_err(ApiError::new(
-            404,
-            mk_types::api_error::ApiErrorKind::Client,
-            "NO_SUCH_NOTE",
-            "24fcbfc6-2e37-42b6-8388-c29b3861a08d",
-            "No such note.",
-        ))));
+        return Ok(None);
     };
     let user_lite = match note_user_lite(state, pool, &row.user_id).await {
         Ok(v) => v,
@@ -2416,16 +2960,154 @@ async fn pack_note(
     let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
-    // populated emoji URLs map is M2; the row field is the raw emoji-name array
-    let emojis = json!({});
-    Ok(mk_core::packers::note::note_pack_min(
+    // populateEmojis resolves against (name, noteUserHost); local notes pass
+    // host null → upstream keeps the field `undefined`; remote authors resolve
+    // nothing against the (empty) local emoji table → `{}`.
+    let emojis = row.user_host.is_some().then(|| json!({}));
+
+    // files: DriveFile pack (detail:false) in fileIds order.
+    let mut files: Vec<Value> = Vec::with_capacity(row.file_ids.len());
+    if !row.file_ids.is_empty() {
+        let frows =
+            match mk_db::drive_note::fetch_owned_files(pool, &row.user_id, &row.file_ids).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "fetch_owned_files");
+                    return Err(Box::new(api_err(ApiError::internal_error())));
+                }
+            };
+        for fid in &row.file_ids {
+            if let Some(f) = frows.iter().find(|f| &f.id == fid) {
+                let f_created = mk_types::id::parse_aid_date(&f.id)
+                    .map(mk_core::services::signup::ms_to_iso)
+                    .unwrap_or_default();
+                files.push(mk_core::packers::note::drive_file_pack(f, f_created));
+            }
+        }
+    }
+
+    // poll (Detail): populatePoll with the viewer's votes.
+    let poll = if detail && depth < MAX_PACK_DEPTH && row.has_poll {
+        match mk_db::poll::find_poll_by_note(pool, &row.id).await {
+            Ok(p) => p.map(|p| {
+                let expires = p.expires_at_ms.map(mk_core::services::signup::ms_to_iso);
+                let my_choices = me_id
+                    .map(|me| mk_db::poll::poll_votes_of_user(pool, &row.id, me))
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                mk_core::packers::note::poll_pack(&p, &my_choices, expires)
+            }),
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "find_poll_by_note");
+                return Err(Box::new(api_err(ApiError::internal_error())));
+            }
+        }
+    } else {
+        None
+    };
+
+    // reply (detail:false recursion) / renote (detail:true recursion):
+    // JOINed-but-missing rows pack as null upstream.
+    let (reply, renote) = if detail && depth < MAX_PACK_DEPTH {
+        let reply = if let Some(rid) = &row.reply_id {
+            match load_pack_note(state, pool, rid, me_id, false, depth + 1).await? {
+                Some(v) => Some(v),
+                None => Some(Value::Null),
+            }
+        } else {
+            None
+        };
+        let renote = if let Some(rid) = &row.renote_id {
+            match load_pack_note(state, pool, rid, me_id, true, depth + 1).await? {
+                Some(v) => Some(v),
+                None => Some(Value::Null),
+            }
+        } else {
+            None
+        };
+        (reply, renote)
+    } else {
+        (None, None)
+    };
+
+    // myReaction: Detail + me + non-empty reactions only (populateMyReaction).
+    let my_reaction = if detail && depth < MAX_PACK_DEPTH {
+        let reactions: Value = serde_json::from_str(&row.reactions).unwrap_or_else(|_| json!({}));
+        let total: i64 = reactions
+            .as_object()
+            .map(|m| m.values().filter_map(|v| v.as_i64()).sum())
+            .unwrap_or(0);
+        if total > 0 {
+            if let Some(me) = me_id {
+                match mk_db::note::find_note_reaction(pool, &row.id, me).await {
+                    Ok(Some(r)) => Some(json!(r.reaction)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::error!(target: "dbg_notes", error = %e, "find_note_reaction");
+                        return Err(Box::new(api_err(ApiError::internal_error())));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(Some(mk_core::packers::note::note_pack_full(
         &row,
-        user_lite,
-        created_at,
-        &row.mentions,
-        &row.tags,
-        emojis,
-    ))
+        &mk_core::packers::note::NotePackParts {
+            detail,
+            user_lite,
+            created_at_iso: created_at,
+            emojis,
+            files,
+            poll,
+            reply,
+            renote,
+            my_reaction,
+        },
+    )))
+}
+
+/// Viewer-less pack (notes/show + the social/freq slices that round-trip it).
+async fn pack_note(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    note_id: &str,
+) -> Result<Value, Box<Response>> {
+    match load_pack_note(state, pool, note_id, None, true, 0).await? {
+        Some(v) => Ok(v),
+        None => Err(Box::new(api_err(ApiError::new(
+            404,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_NOTE",
+            "24fcbfc6-2e37-42b6-8388-c29b3861a08d",
+            "No such note.",
+        )))),
+    }
+}
+
+/// Me-aware pack (poll isVoted + self-view myReaction need the viewer).
+async fn pack_note_for(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    note_id: &str,
+    me_id: Option<&str>,
+) -> Result<Value, Box<Response>> {
+    match load_pack_note(state, pool, note_id, me_id, true, 0).await? {
+        Some(v) => Ok(v),
+        None => Err(Box::new(api_err(ApiError::new(
+            404,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_NOTE",
+            "24fcbfc6-2e37-42b6-8388-c29b3861a08d",
+            "No such note.",
+        )))),
+    }
 }
 
 /// `POST /api/notes/show` — noteId lookup.

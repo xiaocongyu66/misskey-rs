@@ -137,3 +137,82 @@ mod tests {
         );
     }
 }
+
+/// `UtilityService.concatNoteContentsForKeyWordCheck`: cw/text join WITH no
+/// separator (contents may continue), then newline-separated poll choices.
+pub fn concat_note_contents_for_keyword_check(
+    cw: Option<&str>,
+    text: Option<&str>,
+    poll_choices: &[String],
+) -> String {
+    let mut s = String::new();
+    if let Some(cw) = cw {
+        s.push_str(cw);
+    }
+    if let Some(text) = text {
+        s.push_str(text);
+    }
+    s.push('\n');
+    s.push_str(&poll_choices.join("\n"));
+    s.push('\n');
+    s
+}
+
+/// `UtilityService.isKeyWordIncluded`: plain keywords are substring tests
+/// (space = AND of every word); `/pattern/flags` entries are regexps
+/// (upstream RE2; flags i/m/s/x ported onto rust regex inline flags).
+pub fn is_keyword_included(text: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() || text.is_empty() {
+        return false;
+    }
+    let regexp_regexp = regex::Regex::new(r"^/(.+)/(.*)$").unwrap();
+    keywords
+        .iter()
+        .any(|filter| match regexp_regexp.captures(filter) {
+            Some(caps) => {
+                let body = &caps[1];
+                let flags = &caps[2];
+                let mut inline = String::from("(?");
+                if flags.contains('i') {
+                    inline.push('i');
+                }
+                if flags.contains('m') {
+                    inline.push('m');
+                }
+                if flags.contains('s') {
+                    inline.push('s');
+                }
+                if flags.contains('x') {
+                    inline.push('x');
+                }
+                inline.push(')');
+                let pattern = if inline == "(?)" {
+                    body.to_string()
+                } else {
+                    format!("{inline}{body}")
+                };
+                regex::Regex::new(&pattern)
+                    .map(|re| re.is_match(text))
+                    .unwrap_or(false)
+            }
+            None => filter.split(' ').all(|kw| text.contains(kw)),
+        })
+}
+
+#[cfg(test)]
+mod keyword_tests {
+    use super::*;
+
+    #[test]
+    fn keyword_modes_match_upstream_fixtures() {
+        let words = vec!["test".to_string()];
+        assert!(is_keyword_included("hogetesthuge", &words));
+        assert!(!is_keyword_included("hoge", &words));
+
+        let re = vec!["/Test/i".to_string()];
+        assert!(is_keyword_included("hogetesthuge", &re));
+
+        let and = vec!["Test hoge".to_string()];
+        assert!(is_keyword_included("hogeTesthuge", &and));
+    }
+}

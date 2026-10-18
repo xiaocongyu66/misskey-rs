@@ -593,6 +593,72 @@ pub async fn hybrid_timeline_notes(
         .await
 }
 
+/// `endpoints/notes.ts` (the global list): db fallback for the
+/// note.ts census cases — `visibility='public'` + `localOnly=FALSE` rows with
+/// the reply/renote/withFiles/poll toggles and the optional `local`
+/// userHost IS NULL filter. Aid paging: EXCLUSIVE bounds, sinceId-only → ASC.
+#[allow(clippy::too_many_arguments)]
+pub async fn global_note_ids(
+    pool: &PgPool,
+    local: bool,
+    reply: Option<bool>,
+    renote: Option<bool>,
+    with_files: Option<bool>,
+    poll: Option<bool>,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
+    let mut sql = String::from(
+        r#"SELECT n."id" FROM "note" n WHERE n."visibility" = 'public' AND n."localOnly" = FALSE"#,
+    );
+    if local {
+        sql.push_str(r#" AND n."userHost" IS NULL"#);
+    }
+    if let Some(r) = reply {
+        sql.push_str(if r {
+            r#" AND n."replyId" IS NOT NULL"#
+        } else {
+            r#" AND n."replyId" IS NULL"#
+        });
+    }
+    if let Some(r) = renote {
+        sql.push_str(if r {
+            r#" AND n."renoteId" IS NOT NULL"#
+        } else {
+            r#" AND n."renoteId" IS NULL"#
+        });
+    }
+    if let Some(w) = with_files {
+        sql.push_str(if w {
+            r#" AND n."fileIds" != '{}'"#
+        } else {
+            r#" AND n."fileIds" = '{}'"#
+        });
+    }
+    if let Some(p) = poll {
+        sql.push_str(if p {
+            r#" AND n."hasPoll" = TRUE"#
+        } else {
+            r#" AND n."hasPoll" = FALSE"#
+        });
+    }
+    sql.push_str(
+        r#" AND ($1::varchar IS NULL OR n."id" > $1)
+            AND ($2::varchar IS NULL OR n."id" < $2)
+            ORDER BY n."id" "#,
+    );
+    sql.push_str(dir);
+    sql.push_str(r#" LIMIT $3"#);
+    sqlx::query_scalar(&sql)
+        .bind(since_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
 /// notes/replies db path: children of the given note; visibility + base
 /// filtering per viewer (guests see public/home only).
 #[allow(clippy::too_many_arguments)]

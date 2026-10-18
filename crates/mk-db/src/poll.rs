@@ -123,8 +123,12 @@ pub async fn bump_poll_vote(pool: &PgPool, note_id: &str, choice: i32) -> Result
 mod tests {
     use super::*;
 
-    #[sqlx::test(migrations = "./migrations")]
-    async fn poll_roundtrip_and_vote_bump(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn poll_roundtrip_and_vote_bump() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pool = crate::test_support::fresh_db("mkdb_poll_roundtrip").await;
         insert_poll(
             &pool,
             "n1",
