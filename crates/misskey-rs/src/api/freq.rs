@@ -399,12 +399,20 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
         }
         Ok(out)
     };
+    // `?` cannot ride through the Response return (E0277) — the param
+    // responses surface with an explicit match.
     let sensitive_words = match body.get("sensitiveWords") {
-        Some(v) => Some(word_list("sensitiveWords", v)?),
+        Some(v) => match word_list("sensitiveWords", v) {
+            Ok(list) => Some(list),
+            Err(resp) => return resp,
+        },
         None => None,
     };
     let prohibited_words = match body.get("prohibitedWords") {
-        Some(v) => Some(word_list("prohibitedWords", v)?),
+        Some(v) => match word_list("prohibitedWords", v) {
+            Ok(list) => Some(list),
+            Err(resp) => return resp,
+        },
         None => None,
     };
     if sensitive_words.is_some() || prohibited_words.is_some() {
