@@ -74,7 +74,7 @@ pub fn poll_pack(
 
 /// Assembled pack inputs for `note_pack_full` (the db-fetching pipeline in
 /// api/mod.rs::pack_note fills these).
-pub struct NotePackParts<'a> {
+pub struct NotePackParts {
     /// `{ detail: true }` upstream default; the nested reply pack uses
     /// detail:false (drops the reply/renote/poll/myReaction detail block —
     /// `hasPoll` itself is a core field and stays).
@@ -95,7 +95,7 @@ pub struct NotePackParts<'a> {
 }
 
 /// Full `NoteEntityService.pack(note, me, { detail: true })`.
-pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts<'_>) -> Value {
+pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
     let mut o = serde_json::Map::new();
     o.insert("id".into(), json!(row.id));
     o.insert("createdAt".into(), json!(parts.created_at_iso));
