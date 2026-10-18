@@ -459,6 +459,12 @@ async fn notes_create_and_show() {
     // default 0), while empty collections vanish (`mentions`/`tags`
     // `.length > 0 ? : undefined`, `emojis` local-host → undefined,
     // `visibleUserIds` only for specified).
+    let got = note
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     for absent in [
         "deletedAt",
         "mentions",
