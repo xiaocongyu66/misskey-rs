@@ -3726,7 +3726,9 @@ async fn freq_pack_silenced_user_equals_users_show() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {note}");
-    let note_id = note["id"].as_str().unwrap().to_string();
+    // notes/create answers `{ createdNote: <packed> }` (SignupApi/ApiCall
+    // shape the M1 port returns)
+    let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
     let (s, _) = post_json(
         app.clone(),
         "/api/notes/create",
