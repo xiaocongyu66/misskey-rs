@@ -48,13 +48,59 @@ fn expand(
     limit: u8,
     dir: &str,
 ) -> String {
-    sql.replace(":MELIST:", &format!("${me_list}"))
-        .replace(":ME:", &format!("${me}"))
-        .replace(":FOL:", &format!("${fol}"))
-        .replace(":UNTIL:", &format!("${until}"))
-        .replace(":SINCE:", &format!("${since}"))
-        .replace(":LIMIT:", &format!("${limit}"))
-        .replace(":DIR:", dir)
+    // Single-pass scanner: tokens are `:NAME:` with the closing colon as the
+    // delimiter. The one ambiguity is the bind-cast idiom `:MELIST::varchar[]`
+    // / `:UNTIL::varchar` — there the closing colon is the FIRST half of a
+    // postgres `::` cast, so the expansion must re-emit it ("$3" + ":" +
+    // ":varchar[]"). A blind `replace(":MELIST:", "$3")` ate that colon and
+    // produced `$3:varchar[]` — a postgres syntax error at the cast ("syntax
+    // error at or near "":""), the 500 behind timelines_matrix_home_local_hybrid.
+    // Longest-name-first matching keeps :ME: from clobbering :MELIST:.
+    const NAMES: [&str; 7] = ["MELIST", "ME", "FOL", "UNTIL", "SINCE", "LIMIT", "DIR"];
+    let bind_of = |name: &str| -> String {
+        match name {
+            "MELIST" => format!("${me_list}"),
+            "ME" => format!("${me}"),
+            "FOL" => format!("${fol}"),
+            "UNTIL" => format!("${until}"),
+            "SINCE" => format!("${since}"),
+            "LIMIT" => format!("${limit}"),
+            _ => dir.to_string(), // DIR
+        }
+    };
+
+    let mut out = String::with_capacity(sql.len() + 32);
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let mut matched = false;
+            for name in NAMES.iter() {
+                let rest = &sql[i + 1..];
+                if rest.starts_with(name) {
+                    let close = i + 1 + name.len();
+                    if bytes.get(close) == Some(&b':') {
+                        out.push_str(&bind_of(name));
+                        // `:NAME::…` — the closing colon is the cast's first
+                        // half; emit it so the following `:` completes `::`.
+                        if bytes.get(close + 1) == Some(&b':') {
+                            out.push(':');
+                        }
+                        i = close + 1;
+                        matched = true;
+                    }
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+        }
+        // Verbatim copy (single chars only; scans forward one at a time).
+        out.push_str(&sql[i..i + 1]);
+        i += 1;
+    }
+    out
 }
 
 fn dir_asc(since_id: Option<&str>) -> &'static str {
