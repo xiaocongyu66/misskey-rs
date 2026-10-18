@@ -935,8 +935,8 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert_eq!(arr5.len(), 1, "body: {list5}");
     assert_eq!(arr5[0]["type"], "mention");
 
-    // sinceId-only flips to oldest-first ASC: with the boundary at renote_id
-    // only rows strictly newer (mention, produced live) come back.
+    // sinceId-only flips to oldest-first ASC: follow was seeded after the
+    // renote, so only follow is strictly newer than the renote_id boundary.
     let (s, list6) = post_json(
         app.clone(),
         "/api/notifications",
@@ -946,7 +946,7 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert_eq!(s, StatusCode::OK, "body: {list6}");
     let arr6 = list6.as_array().unwrap();
     assert_eq!(arr6.len(), 1, "body: {list6}");
-    assert_eq!(arr6[0]["type"], "mention");
+    assert_eq!(arr6[0]["type"], "follow");
 
     // markAsRead:false leaves rows unread. All rows above were already
     // marked read (their calls used the markAsRead default), so seed a fresh
