@@ -2941,15 +2941,22 @@ fn is_alnum_id(s: &str) -> bool {
 /// Ok(None) = row missing (top level maps to NO_SUCH_NOTE).
 /// The reply/renote recursion needs indirection: boxed future via the
 /// `load_pack_note` wrapper (E0733), body lives in `load_pack_note_inner`.
-fn load_pack_note(
-    state: &AppState,
-    pool: &mk_db::sqlx::PgPool,
-    note_id: &str,
-    me_id: Option<&str>,
+/// Named pinned lifetime (multi-ref args defeat `'_` elision, E0106) and
+/// `+ Send` (endpoint handlers are tokio-spawned by axum).
+fn load_pack_note<'a>(
+    state: &'a AppState,
+    pool: &'a mk_db::sqlx::PgPool,
+    note_id: &'a str,
+    me_id: Option<&'a str>,
     detail: bool,
     depth: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Value>, Box<Response>>> + '_>>
-{
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Option<Value>, Box<Response>>>
+            + std::marker::Send
+            + 'a,
+    >,
+> {
     Box::pin(load_pack_note_inner(
         state, pool, note_id, me_id, detail, depth,
     ))
