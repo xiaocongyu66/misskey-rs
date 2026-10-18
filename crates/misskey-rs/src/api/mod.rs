@@ -808,7 +808,7 @@ async fn i_route(
 
     (
         StatusCode::OK,
-        ({
+        Json({
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
             v
@@ -1148,7 +1148,7 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
 
     (
         StatusCode::OK,
-        ({
+        Json({
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
             v
