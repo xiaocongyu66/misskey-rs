@@ -2028,7 +2028,7 @@ async fn pack_search_rows(
             target_is_root: row.username_lower == "root",
             viewer_is_moderator: viewer_mod,
         };
-        out.push(mk_core::services::user_pack::pack_inline_with_roles(
+        let mut packed = mk_core::services::user_pack::pack_inline_with_roles(
             row,
             &profile,
             is_me,
@@ -2036,7 +2036,15 @@ async fn pack_search_rows(
             ctx,
             false,
             Some(&role_pack),
-        ));
+        );
+        // Parity with the users/show arm: the memo column (viewer memo on the
+        // target) and the Me-role compat keys apply the same way here — the
+        // e2e compares list rows and hashtags rows against users/show output.
+        set_viewers_memo(pool, me_id, &row.id, &mut packed).await;
+        if is_me {
+            apply_me_role_compat(&mut packed);
+        }
+        out.push(packed);
     }
     Ok(out)
 }

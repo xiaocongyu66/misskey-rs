@@ -55,10 +55,6 @@ fn public_roles_value(rp: &RolePack<'_>) -> Vec<RoleLiteValue> {
     out
 }
 
-fn opt_json_string(v: &serde_json::Value) -> Option<String> {
-    v.as_str().map(|s| s.to_string())
-}
-
 fn fields_vec(v: &serde_json::Value) -> Vec<UserField> {
     v.as_array()
         .map(|a| {

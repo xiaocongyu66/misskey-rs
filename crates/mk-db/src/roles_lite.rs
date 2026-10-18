@@ -38,8 +38,9 @@ pub async fn create_role(
              "condFormula", "asBadge", "isExplorable",
              "preserveAssignmentOnMoveAccount", "canEditMembersByModerator",
              "displayOrder", "policies")
-        VALUES ($1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9,
-                $10::jsonb, $11, $12, $13, $14, $15, $16::jsonb)
+        VALUES ($1, now(), now(), $2, $3, $4, $5, $6, $7, $8,
+                $9::text::public.role_target_enum,
+                $10::jsonb, $11, $12, $13, $14, $15::int, $16::jsonb)
         "#,
     )
     .bind(id)
@@ -103,7 +104,8 @@ pub struct RoleRow {
 pub async fn find_role(pool: &PgPool, id: &str) -> Result<Option<RoleRow>, sqlx::Error> {
     sqlx::query_as::<_, RoleRow>(
         r#"
-        SELECT "id", "name", "description", "color", "iconUrl", "target",
+        SELECT "id", "name", "description", "color", "iconUrl",
+               "target"::text AS "target",
                "condFormula", "isPublic", "isAdministrator", "isModerator",
                "isExplorable", "asBadge", "preserveAssignmentOnMoveAccount",
                "canEditMembersByModerator", "displayOrder"::bigint AS "displayOrder",
