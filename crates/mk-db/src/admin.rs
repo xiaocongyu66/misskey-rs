@@ -73,6 +73,29 @@ pub async fn root_user_id(pool: &PgPool) -> Result<Option<String>, sqlx::Error> 
     Ok(v.flatten())
 }
 
+/// SignupService L160: `if (this.meta.rootUserId == null)
+/// await this.metaService.update({ rootUserId: account.id })` — the FIRST
+/// signup of an instance becomes root. NULL-rooted or missing meta row →
+/// stamp; an already-stamped row stays untouched (single meta row, id 'x',
+/// matching update_meta_pinned_users).
+pub async fn stamp_root_user_id_if_unset(pool: &PgPool, uid: &str) -> Result<(), sqlx::Error> {
+    let updated = sqlx::query(r#"UPDATE "meta" SET "rootUserId" = $1 WHERE "rootUserId" IS NULL"#)
+        .bind(uid)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        sqlx::query(
+            r#"INSERT INTO "meta" ("id", "rootUserId") VALUES ('x', $1)
+            ON CONFLICT ("id") DO NOTHING"#,
+        )
+        .bind(uid)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// `meta."policies"` (MetaService.fetch → `basePolicies` override source for
 /// policy computation; None when no meta row exists).
 pub async fn meta_policies(pool: &PgPool) -> Result<Option<serde_json::Value>, sqlx::Error> {

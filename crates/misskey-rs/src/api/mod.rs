@@ -671,6 +671,12 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
             tracing::error!(target: "dbg_signup", %err, "signup insert failed");
             return api_err(ApiError::internal_error());
         }
+        // SignupService L160-162: the first signup of an unset meta becomes
+        // root (admin gates resolve meta."rootUserId").
+        if let Err(err) = mk_db::admin::stamp_root_user_id_if_unset(pool, &outcome.user_id).await {
+            tracing::error!(target: "dbg_signup", %err, "rootUserId stamp failed");
+            return api_err(ApiError::internal_error());
+        }
     }
 
     let mut packed = serde_json::to_value(mk_core::services::me_detailed_fresh(
