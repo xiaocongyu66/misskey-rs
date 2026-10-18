@@ -158,6 +158,9 @@ pub struct LocalUserRow {
     pub token: String,
     #[sqlx(rename = "isSuspended")]
     pub is_suspended: bool,
+    // pack-fed me-view flag (UserEntityService.pack `isDeleted: user.isDeleted`)
+    #[sqlx(rename = "isDeleted")]
+    pub is_deleted: bool,
     #[sqlx(rename = "isLocked")]
     pub is_locked: bool,
     #[sqlx(rename = "isExplorable")]
@@ -194,7 +197,7 @@ pub struct LocalUserRow {
     pub is_cat: bool,
 }
 
-pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat""#;
+pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isDeleted", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat""#;
 
 pub async fn find_local_user_by_username(
     pool: &PgPool,

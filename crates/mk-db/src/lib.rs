@@ -7,6 +7,8 @@ use sqlx::postgres::PgPoolOptions;
 pub use sqlx;
 
 pub mod admin;
+// delete-account: i/delete-account + admin/delete-account soft-delete flag
+pub mod delete_account;
 // i/update tail wave: drive files (upload), note pinings, personal memos
 pub mod drive;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths

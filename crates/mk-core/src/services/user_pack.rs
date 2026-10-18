@@ -409,7 +409,7 @@ fn detailed_as_me(
         no_crawle: profile.no_crawle, // profile.noCrawle (pack L599)
         prevent_ai_learning: profile.prevent_ai_learning,
         is_explorable: row.is_explorable,
-        is_deleted: false,
+        is_deleted: row.is_deleted, // pack L603: `isDeleted: user.isDeleted`
         // profile.twoFactorBackupSecret?.length (pack L603)
         two_factor_backup_codes_stock: backup_stock(
             profile
@@ -516,6 +516,7 @@ mod tests {
             name: None,
             token: "0123456789abcdef".to_string(),
             is_suspended: false,
+            is_deleted: false,
             is_locked: false,
             is_explorable: true,
             hide_online_status: false,

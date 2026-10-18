@@ -26,6 +26,10 @@ mod drive;
 // gate-roles: minimal admin/roles/create + admin/roles/assign seeding the
 // users.ts role fixtures (Publicなロール/バッヂロール census)
 mod roles_lite;
+// delete-account: i/delete-account + admin/delete-account (削除済 census —
+// soft `isDeleted` flag + the me-view pack field); db path in
+// mk-db/src/delete_account.rs
+mod delete_account;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -195,6 +199,26 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return roles_lite::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END gate-roles DISPATCH ARM ====
+
+    // ==== delete-account DISPATCH ARM (i/delete-account + admin/delete-account) ====
+    // Self-contained block on the roles_lite-arm pattern: admin/delete-account
+    // must nose in ahead of the admin/* catch-all (delete_account owns only
+    // these two names). Method check, body parsing and token extraction live
+    // in the arm; the credential/admin gates + isDeleted short-circuits in
+    // api::delete_account.
+    if delete_account::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return delete_account::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END delete-account DISPATCH ARM ====
 
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
