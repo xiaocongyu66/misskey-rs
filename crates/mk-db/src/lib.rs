@@ -14,11 +14,20 @@ pub mod channel;
 pub mod delete_account;
 // i/update tail wave: drive files (upload), note pinings, personal memos
 pub mod drive;
+// note-agent: drive-file SQL for the note.ts slice (owned by-ids fetch +
+// drive/files/update write), kept separate from the drive-arena agent's
+// drive.rs
+pub mod drive_note;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
+// note-agent: meta row note-settings subset (sensitive/prohibited words +
+// the deeplAuthKey read the translate gate consumes)
+pub mod meta;
 pub mod memo;
 pub mod note;
 pub mod notification;
+// note-agent: poll + poll_vote (notes/create poll param + notes/polls/vote)
+pub mod poll;
 pub mod pin;
 pub mod relation;
 pub mod role;

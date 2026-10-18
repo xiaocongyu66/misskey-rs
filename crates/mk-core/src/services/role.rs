@@ -96,6 +96,12 @@ pub struct UserPolicy {
     pub antenna_limit: i64,
     #[serde(rename = "wordMuteLimit")]
     pub word_mute_limit: i64,
+    /// notes/create word forcing + drive upload/update alwaysMarkNsfw.
+    #[serde(rename = "alwaysMarkNsfw")]
+    pub always_mark_nsfw: bool,
+    /// notes/translate gate (default true).
+    #[serde(rename = "canUseTranslator")]
+    pub can_use_translator: bool,
 }
 
 /// Upstream `DEFAULT_POLICIES` for the mirrored keys.
@@ -110,6 +116,8 @@ impl UserPolicy {
             pin_limit: 5,
             antenna_limit: 5,
             word_mute_limit: 200,
+            always_mark_nsfw: false,
+            can_use_translator: true,
         }
     }
 
@@ -173,6 +181,12 @@ impl UserPolicy {
             pin_limit: merge_max(assigned, base.pin_limit, "pinLimit"),
             antenna_limit: merge_max(assigned, base.antenna_limit, "antennaLimit"),
             word_mute_limit: merge_max(assigned, base.word_mute_limit, "wordMuteLimit"),
+            always_mark_nsfw: merge_any_true(assigned, base.always_mark_nsfw, "alwaysMarkNsfw"),
+            can_use_translator: merge_any_true(
+                assigned,
+                base.can_use_translator,
+                "canUseTranslator",
+            ),
         }
     }
 

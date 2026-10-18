@@ -13,6 +13,8 @@ use sqlx::PgPool;
 pub struct NewNote<'a> {
     pub id: &'a str,
     pub text: Option<&'a str>,
+    /// `cw` param (upstream note.cw; null when unset).
+    pub cw: Option<&'a str>,
     pub user_id: &'a str,
     pub visibility: &'a str,
     pub reply_id: Option<&'a str>,
@@ -27,6 +29,17 @@ pub struct NewNote<'a> {
     pub mentions: &'a [String],
     /// hashtags extracted from text (merged into user.tags)
     pub hashtags: &'a [String],
+    /// `fileIds` (md-order preserved; upstream also denormalizes
+    /// `attachedFileTypes` from the fetched drive rows).
+    pub file_ids: &'a [String],
+    pub attached_file_types: &'a [String],
+    /// `visibleUserIds` for visibility='specified' rows only (upstream inserts
+    /// an empty array otherwise).
+    pub visible_user_ids: &'a [String],
+    /// `hasPoll` flag (+ the poll row itself lives in mk_db::poll).
+    pub has_poll: bool,
+    /// `localOnly` param (reply/renote of a localOnly row inherits it).
+    pub local_only: bool,
 }
 
 /// Bumps user counters after a note insert (`NoteCreateService`
@@ -77,10 +90,10 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
           ("id", "text", "userId", "replyId", "replyUserId", "replyUserHost", "threadId",
            "localOnly", "renoteCount", "repliesCount", "reactions", "visibility",
            "fileIds", "attachedFileTypes", "visibleUserIds", "mentions", "emojis",
-           "tags", "hasPoll", "pageCount")
-        VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, 0, 0, '{}'::jsonb,
-                $8::note_visibility_enum, '{}'::varchar[], '{}'::varchar[],
-                '{}'::varchar[], $9, '{}'::varchar[], '{}'::varchar[], FALSE, 0)
+           "tags", "hasPoll", "pageCount", "cw")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, '{}'::jsonb,
+                $9::note_visibility_enum, $10, $11, $12, $13, '{}'::varchar[],
+                '{}'::varchar[], $14, 0, $15)
         "#,
     )
     .bind(n.id)
@@ -90,8 +103,14 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     .bind(n.reply_user_id)
     .bind(n.reply_user_host)
     .bind(n.thread_id)
+    .bind(n.local_only)
     .bind(n.visibility)
+    .bind(n.file_ids)
+    .bind(n.attached_file_types)
+    .bind(n.visible_user_ids)
     .bind(n.mentions)
+    .bind(n.has_poll)
+    .bind(n.cw)
     .execute(pool)
     .await?;
     Ok(())
@@ -112,7 +131,7 @@ pub async fn bump_replies_count(
 }
 
 /// Columns carried by the detail-with-reactions note pack.
-pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
+pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct NoteRow {
@@ -122,6 +141,10 @@ pub struct NoteRow {
     pub text: Option<String>,
     pub cw: Option<String>,
     pub user_id: String,
+    /// Denormalized author host (None → local); drives the pack `emojis`
+    /// presence rule and the remote-word checks.
+    #[sqlx(rename = "user_host")]
+    pub user_host: Option<String>,
     pub local_only: bool,
     pub visibility: String,
     pub mentions: Vec<String>,
@@ -182,19 +205,29 @@ pub async fn thread_muted(
 // decrementing the parent's repliesCount for replies.
 // ---------------------------------------------------------------------------
 
-/// `notesRepository.delete({ id, userId })` — author-scoped: 0 rows affected
-/// when the id exists but the caller is not the author.
+/// `NoteDeleteService.delete` repo part: hard-DELETE the author's row, then
+/// decrement the parent note's `repliesCount` when the deleted row was a
+/// reply (upstream `notesRepository.decrement({ id: note.replyId },
+/// 'repliesCount', 1)`). Returns rows affected.
 pub async fn delete_note(
     pool: &PgPool,
     note_id: &str,
     author_id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(r#"DELETE FROM "note" WHERE "id" = $1 AND "userId" = $2"#)
-        .bind(note_id)
-        .bind(author_id)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
+    let reply_id: Option<Option<String>> = sqlx::query_scalar(
+        r#"DELETE FROM "note" WHERE "id" = $1 AND "userId" = $2 RETURNING "replyId""#,
+    )
+    .bind(note_id)
+    .bind(author_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(affected) = reply_id else {
+        return Ok(0);
+    };
+    if let Some(parent) = affected {
+        let _ = bump_replies_count(pool, &parent, -1).await;
+    }
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +410,9 @@ const PAGER: &str = r#" AND ($UNTIL::varchar IS NULL OR n."id" < $UNTIL)
             ORDER BY n."id" {DIR} LIMIT $LIMIT"#;
 
 /// Token substitution for the numbered placeholders of the enclosing query.
+/// $MELIST must be rewritten BEFORE $ME — `$ME` is a prefix of `$MELIST`, so
+/// the reverse order mangles `$MELIST` into `$2LIST` (postgres: "trailing
+/// junk after parameter").
 fn expand(
     sql: &str,
     p_me: u8,
@@ -387,8 +423,8 @@ fn expand(
     p_limit: u8,
     dir: &str,
 ) -> String {
-    sql.replace("$ME", &format!("${p_me}"))
-        .replace("$MELIST", &format!("${p_me_list}"))
+    sql.replace("$MELIST", &format!("${p_me_list}"))
+        .replace("$ME", &format!("${p_me}"))
         .replace("$FOL", &format!("${p_followees}"))
         .replace("$UNTIL", &format!("${p_until}"))
         .replace("$SINCE", &format!("${p_since}"))

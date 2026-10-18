@@ -1,64 +1,117 @@
-//! Note pack — M1 minimal slice.
+//! Note pack — `NoteEntityService.pack` field semantics for the note.ts
+//! acceptance slice (field presence + Detail recursion).
 //!
-//! TODO(M2): replace the JSON assembly with a full `Packed<Note>` struct
-//! (`src/models/json-schema/note.ts`, all 35 fields incl. reply/renote
-//! recursion, poll, files, clips).
+//! Upstream presence rules (Packed<'Note> optional:true fields are ABSENT
+//! when upstream would emit `undefined`; plain `null` stays `null`):
+//! - `text`/`cw` always present (cw null when unset).
+//! - `replyId`/`renoteId` always present (null when unset).
+//! - `mentions`/`tags` only when non-empty.
+//! - `visibleUserIds` only for visibility='specified'.
+//! - `fileIds`/`files` always (`files` = DriveFile pack detail:false).
+//! - `channelId`/`uri`/`url` only when set.
+//! - `hasPoll` only when true; the `poll` object is Detail-only.
+//! - `emojis` only for remote authors (local → undefined upstream).
+//! - Detail adds `clippedCount`, `reply` (detail:false recursion), `renote`
+//!   (detail:true recursion), `poll`, and `myReaction` (self-view, only when
+//!   the note carries reactions).
 
 use mk_db::note::NoteRow;
 use serde_json::{Value, json};
 
-fn string_vec(v: &serde_json::Value) -> Vec<String> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Draft of one `files` entry (DriveFileEntityService.pack, detail:false).
+/// `createdAtIso` derives from the aid; storage columns feed the rest.
+pub fn drive_file_pack(row: &mk_db::drive_note::NoteDriveFileRow, created_at_iso: String) -> Value {
+    json!({
+        "id": row.id,
+        "createdAt": created_at_iso,
+        "name": row.name,
+        "type": row.file_type,
+        "md5": row.md5,
+        "size": row.size,
+        "isSensitive": row.is_sensitive,
+        "blurhash": row.blurhash,
+        "properties": row.properties,
+        "url": row.webpublic_url.clone().unwrap_or_else(|| row.url.clone()),
+        // image thumbs point at the stored url; the rest stay null
+        "thumbnailUrl": row.thumbnail_url.clone().or_else(|| {
+            row.file_type.starts_with("image/")
+                .then(|| row.webpublic_url.clone().unwrap_or_else(|| row.url.clone()))
+        }),
+        "comment": row.comment,
+        "folderId": Value::Null,
+        "folder": Value::Null,
+        "userId": Value::Null,
+        "user": Value::Null,
+    })
 }
 
-/// `NoteEntityService.pack` field presence mirrored for the M1 subset:
-/// schema `optional: true` fields whose upstream value would be
-/// `undefined` are ABSENT; everything else always serialized.
-pub fn note_pack_min(
-    row: &NoteRow,
-    user_lite: Value,
-    created_at_iso: String,
-    mentions: &[String],
-    tags: &[String],
-    emojis: Value,
+/// `NoteEntityService.populatePoll`: `{ multiple, expiresAt, choices:[{
+/// text, votes, isVoted }] }` with the viewer's votes flagged `isVoted`.
+/// ` expiresAt` is `null` when the poll never expires.
+pub fn poll_pack(
+    poll: &mk_db::poll::PollRow,
+    my_choices: &[i32],
+    expires_at_iso: Option<String>,
 ) -> Value {
-    let visibility = match row.visibility.as_str() {
-        "home" | "followers" | "specified" => row.visibility.clone(),
-        _ => "public".to_string(),
-    };
+    let choices: Vec<Value> = poll
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            json!({
+                "text": text,
+                "votes": poll.votes.get(i).copied().unwrap_or(0),
+                "isVoted": my_choices.contains(&(i as i32)),
+            })
+        })
+        .collect();
+    json!({
+        "multiple": poll.multiple,
+        "expiresAt": expires_at_iso.map(Value::String).unwrap_or(Value::Null),
+        "choices": choices,
+    })
+}
 
+/// Assembled pack inputs for `note_pack_full` (the db-fetching pipeline in
+/// api/mod.rs::pack_note fills these).
+pub struct NotePackParts<'a> {
+    /// `{ detail: true }` upstream default; the nested reply pack uses
+    /// detail:false (drops the reply/renote/poll/myReaction detail block —
+    /// `hasPoll` itself is a core field and stays).
+    pub detail: bool,
+    pub user_lite: Value,
+    pub created_at_iso: String,
+    /// Remote authors → `Some(map)` (empty `populatedEmojis`), local →
+    /// `None` (field absent upstream).
+    pub emojis: Option<Value>,
+    pub files: Vec<Value>,
+    pub poll: Option<Value>,
+    /// Nested reply pack (Some(Value::Null) → replyId set, target missing).
+    pub reply: Option<Value>,
+    /// Nested renote pack (Some(Value::Null) → renoteId set, target missing).
+    pub renote: Option<Value>,
+    /// `myReaction` (Detail + me + non-empty reactions only).
+    pub my_reaction: Option<Value>,
+}
+
+/// Full `NoteEntityService.pack(note, me, { detail: true })`.
+pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts<'_>) -> Value {
     let mut o = serde_json::Map::new();
     o.insert("id".into(), json!(row.id));
-    o.insert("createdAt".into(), json!(created_at_iso));
-    // deletedAt: note.deletedAt ?? undefined → absent (never set in M1)
-    o.insert("text".into(), json!(row.text));
-    if let Some(cw) = &row.cw {
-        o.insert("cw".into(), json!(cw));
-    }
+    o.insert("createdAt".into(), json!(parts.created_at_iso));
     o.insert("userId".into(), json!(row.user_id));
-    o.insert("user".into(), user_lite);
-    if let Some(rid) = &row.reply_id {
-        o.insert("replyId".into(), json!(rid));
-    }
-    if let Some(rid) = &row.renote_id {
-        o.insert("renoteId".into(), json!(rid));
-    }
-    o.insert("visibility".into(), json!(visibility));
-    o.insert("mentions".into(), json!(mentions));
-    o.insert("visibleUserIds".into(), json!(Vec::<String>::new()));
-    o.insert("fileIds".into(), json!(Vec::<String>::new()));
-    o.insert("files".into(), json!(Vec::<Value>::new()));
-    o.insert("tags".into(), json!(tags));
-    if row.has_poll {
-        o.insert("hasPoll".into(), json!(true));
-        // poll body is M2
-    }
+    o.insert("user".into(), parts.user_lite.clone());
+    o.insert("text".into(), json!(row.text));
+    o.insert("cw".into(), json!(row.cw));
+    o.insert("replyId".into(), json!(row.reply_id));
+    o.insert("renoteId".into(), json!(row.renote_id));
+    o.insert(
+        "visibility".into(),
+        json!(match row.visibility.as_str() {
+            "home" | "followers" | "specified" => row.visibility.clone(),
+            _ => "public".to_string(),
+        }),
+    );
     o.insert("localOnly".into(), json!(row.local_only));
     o.insert(
         "reactionAcceptance".into(),
@@ -67,42 +120,82 @@ pub fn note_pack_min(
             .map(|s| json!(s))
             .unwrap_or(Value::Null),
     );
+    if row.visibility == "specified" {
+        o.insert("visibleUserIds".into(), json!(row.visible_user_ids));
+    }
+    o.insert("renoteCount".into(), json!(row.renote_count));
+    o.insert("repliesCount".into(), json!(row.replies_count));
+    let reactions: Value = serde_json::from_str(&row.reactions).unwrap_or_else(|_| json!({}));
+    let reaction_count = reactions
+        .as_object()
+        .map(|m| m.values().filter_map(|v| v.as_i64()).sum::<i64>())
+        .unwrap_or(0);
+    o.insert("reactionCount".into(), json!(reaction_count));
+    o.insert("reactions".into(), reactions);
     o.insert("reactionEmojis".into(), json!({}));
-    let _ = &emojis;
-    o.insert("emojis".into(), emojis);
-    o.insert("reactions".into(), json!({}));
-    o.insert("reactionCount".into(), json!(0));
-    o.insert("renoteCount".into(), json!(0));
-    o.insert("repliesCount".into(), json!(0));
+    if let Some(emojis) = &parts.emojis {
+        o.insert("emojis".into(), emojis.clone());
+    }
+    if !row.tags.is_empty() {
+        o.insert("tags".into(), json!(row.tags));
+    }
+    o.insert("fileIds".into(), json!(row.file_ids));
+    o.insert("files".into(), json!(parts.files));
+    if !row.mentions.is_empty() {
+        o.insert("mentions".into(), json!(row.mentions));
+    }
+    if row.has_poll {
+        o.insert("hasPoll".into(), json!(true));
+    }
+    if let Some(uri) = &row.uri {
+        o.insert("uri".into(), json!(uri));
+    }
+    if let Some(url) = &row.url {
+        o.insert("url".into(), json!(url));
+    }
+    // channel: absent (no channel rows produced by this server slice).
+    // Detail block (`opts.detail`):
+    if parts.detail {
+        o.insert("clippedCount".into(), json!(row.clipped_count));
+        if let Some(reply) = &parts.reply {
+            o.insert("reply".into(), reply.clone());
+        }
+        if let Some(renote) = &parts.renote {
+            o.insert("renote".into(), renote.clone());
+        }
+        if let Some(poll) = &parts.poll {
+            o.insert("poll".into(), poll.clone());
+        }
+        if let Some(my_reaction) = &parts.my_reaction {
+            o.insert("myReaction".into(), my_reaction.clone());
+        }
+    }
     Value::Object(o)
 }
 
-/// Field-set contract for unit tests (e2e deepStrictEqual harness parity).
-pub fn m1_note_fields() -> &'static [&'static str] {
-    &[
-        "id",
-        "createdAt",
-        "text",
-        "userId",
-        "user",
-        "visibility",
-        "mentions",
-        "visibleUserIds",
-        "fileIds",
-        "files",
-        "tags",
-        "localOnly",
-        "reactionAcceptance",
-        "reactionEmojis",
-        "emojis",
-        "reactions",
-        "reactionCount",
-        "renoteCount",
-        "repliesCount",
-    ]
-}
-
-#[allow(dead_code)]
-fn _tag_fixup(v: &Value) -> Vec<String> {
-    string_vec(v)
+/// Legacy entry point shared by the co-agent timelines / notifications /
+/// freq paths (no db recursion: no nested reply/renote, no poll body, no
+/// files). Presence rules mirror `note_pack_full`.
+pub fn note_pack_min(
+    row: &NoteRow,
+    user_lite: Value,
+    created_at_iso: String,
+    mentions: &[String],
+    tags: &[String],
+    emojis: Value,
+) -> Value {
+    note_pack_full(
+        row,
+        &NotePackParts {
+            detail: true,
+            user_lite,
+            created_at_iso,
+            emojis: (!emojis.is_null()).then_some(emojis),
+            files: Vec::new(),
+            poll: None,
+            reply: None,
+            renote: None,
+            my_reaction: None,
+        },
+    )
 }
