@@ -466,7 +466,7 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
                 return api_err(ApiError::internal_error());
             }
         }
-        Some(_) => return Err(invalid("enableFanoutTimeline", "must be a boolean")),
+        Some(_) => return invalid("enableFanoutTimeline", "must be a boolean"),
     }
 
     let parse_words = |param: &str| -> Result<Option<Vec<String>>, Response> {
