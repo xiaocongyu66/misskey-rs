@@ -453,6 +453,22 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
         ));
     }
 
+    // ftt2: bodies that carry the fanout flag are ROUTED here by
+    // takes_update_meta (timelines.ts L104 flips it per describe.each arm) —
+    // persist it or the arm swallows the key and the pushToTl gate never
+    // opens. Param shape = the freq::update_meta mirror (non-nullable
+    // boolean; patch semantics — absent keys untouched).
+    match body.get("enableFanoutTimeline") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(v)) => {
+            if let Err(e) = mk_db::meta::update_meta_enable_fanout_timeline(pool, *v).await {
+                tracing::error!(target: "dbg_notes", error = %e, "update_meta_enable_fanout_timeline");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        Some(_) => return Err(invalid("enableFanoutTimeline", "must be a boolean")),
+    }
+
     let parse_words = |param: &str| -> Result<Option<Vec<String>>, Response> {
         match body.get(param) {
             None | Some(Value::Null) => Ok(None),
