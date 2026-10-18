@@ -171,6 +171,14 @@ pub struct NoteRow {
     pub url: Option<String>,
 }
 
+/// Author-host scalar (mention fallback `m.host ?? user.host`).
+pub async fn user_host_of(pool: &PgPool, user_id: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+}
+
 pub async fn find_note_by_id(pool: &PgPool, id: &str) -> Result<Option<NoteRow>, sqlx::Error> {
     sqlx::query_as::<_, NoteRow>(&format!(
         r#"SELECT {} FROM "note" WHERE "id" = $1"#,

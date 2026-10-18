@@ -206,7 +206,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         // note-agent: the sensitiveWords/prohibitedWords patch of update-meta
         // (note.ts census keeps those lists in the meta row via this arm;
         // pinnedUsers and the rest still flow to the freq arm below).
-        if name == "admin/update-meta" && note_extras::takes_update_meta(body) {
+        if name == "admin/update-meta" && note_extras::takes_update_meta(&body) {
             return note_extras::update_meta(&state, &body, token.as_deref()).await;
         }
         if name == "admin/update-meta" {
@@ -2402,7 +2402,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         Some(_) => return invalid_param("localOnly", "must be a boolean"),
     };
     let reaction_acceptance = match body.get("reactionAcceptance").and_then(|v| v.as_str()) {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(
             v @ ("likeOnly"
             | "likeOnlyForRemote"
@@ -2996,10 +2996,12 @@ async fn load_pack_note(
         match mk_db::poll::find_poll_by_note(pool, &row.id).await {
             Ok(p) => p.map(|p| {
                 let expires = p.expires_at_ms.map(mk_core::services::signup::ms_to_iso);
-                let my_choices = me_id
-                    .map(|me| mk_db::poll::poll_votes_of_user(pool, &row.id, me))
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default();
+                let my_choices = match me_id {
+                    Some(me) => mk_db::poll::poll_votes_of_user(pool, &row.id, me)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 mk_core::packers::note::poll_pack(&p, &my_choices, expires)
             }),
             Err(e) => {

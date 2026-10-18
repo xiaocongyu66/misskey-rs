@@ -141,7 +141,7 @@ pub(crate) mod streaming {
                 Message::Text(t) => serde_json::from_str(t.as_str()).unwrap_or(Value::Null),
                 Message::Close(_) => break,
                 _ => continue,
-            },) else {
+            }) else {
                 continue;
             };
             if obj.get("type").and_then(Value::as_str) != Some("connect") {

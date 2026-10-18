@@ -10,6 +10,7 @@
 //! UNAVAILABLE ladder), `endpoints/admin/update-meta.ts` (requireAdministrator
 //! + the word-list params the meta row carries).
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
