@@ -268,10 +268,17 @@ const WITH_FILES: &str = r#" AND n."fileIds" != '{}' "#;
 /// channelMuting renote-side gate (L192-201, ChannelMutingService.list keeps
 /// only live mutes): a renote/quote of a MUTED channel's note drops out
 /// (channel notes themselves are already excluded by the `channelId IS NULL`
-/// plane).
-const RENOTE_CHANNEL_MUTE: &str = r#" AND (n."renoteChannelId" IS NULL OR n."renoteChannelId" NOT IN (
-              SELECT "channelId" FROM "channel_muting" WHERE "userId" = $2
-                AND ("expiresAt" IS NULL OR "expiresAt" > now())))"#;
+/// plane). The renote PARENT's channel is read via the renoteId join — the
+/// timelines.rs RENOTE_CHANNEL_MUTE precedent: upstream stamps
+/// `renoteChannelId = renote.channelId` at insert time and channelId rows are
+/// never re-scoped afterwards, so the two forms are equivalent without
+/// depending on the sibling lane's denormalization write.
+const RENOTE_CHANNEL_MUTE: &str = r#" AND (n."renoteId" IS NULL OR NOT EXISTS (
+              SELECT 1 FROM "note" rc WHERE rc."id" = n."renoteId"
+                AND rc."channelId" IS NOT NULL
+                AND rc."channelId" IN (
+                    SELECT "channelId" FROM "channel_muting" WHERE "userId" = $2
+                      AND ("expiresAt" IS NULL OR "expiresAt" > now()))))"#;
 
 /// notes/user-list-timeline — membership-join timeline over the list's
 /// members (the list TL shows member notes with visible*Ids independent of

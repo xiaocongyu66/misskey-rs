@@ -6187,7 +6187,14 @@ async fn user_list_timeline_filters_pager_channel() {
     let n_ch_renote2 = note_post(&app, json!({ "renoteId": n_ch_note, "i": bt })).await;
     let res = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
     assert!(lacks(&res, &n_ch_renote2), "muted channel renote drops out");
-    assert!(has(&res, &n_ch_renote), "pre-mute renote unaffected");
+    // The gate is applied at read time (getFromDb L192-201 brackets the whole
+    // query), so the pre-mute renote — whose renoteChannelId resolves to the
+    // muted channel — drops as well (matches the upstream チャンネルミュート
+    // legs, which assert .some(...) === false for every renote after muted).
+    assert!(
+        lacks(&res, &n_ch_renote),
+        "read-time gate drops the pre-mute renote too"
+    );
 
     // -- withFiles: true keeps the file notes only ------------------------
     let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
