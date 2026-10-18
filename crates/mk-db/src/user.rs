@@ -99,11 +99,13 @@ pub async fn find_local_user_id_by_token(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-    let id: Option<String> =
-        sqlx::query_scalar(r#"SELECT "id" FROM "user" WHERE "token" = $1 AND "host" IS NULL"#)
-            .bind(token)
-            .fetch_optional(pool)
-            .await?;
+    // tl-tail: AuthenticateService.ts L49-51 — the native-token lookup is
+    // `findOneBy({ token })` with NO host filter, so the test-mode remote
+    // signup users (signup({ host: genHost() }) legs) authenticate too.
+    let id: Option<String> = sqlx::query_scalar(r#"SELECT "id" FROM "user" WHERE "token" = $1"#)
+        .bind(token)
+        .fetch_optional(pool)
+        .await?;
     Ok(id)
 }
 
