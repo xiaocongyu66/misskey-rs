@@ -4498,10 +4498,15 @@ async fn announcements_invalid_dates_and_read_flow() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list.as_array().unwrap()[0]["id"], json!(global_id));
+    // present userId = just that user's rows. The personal row is
+    // read-DEACTIVATED (AnnouncementService.read L280-284 flips isActive for
+    // a personal announcement once its target reads it), so the default
+    // 'active' scope filters it back out upstream too — the present-userId
+    // shape asserts over status 'all'
     let (s, list) = post_json(
         app.clone(),
         "/api/admin/announcements/list",
-        json!({ "userId": user_id, "i": token }),
+        json!({ "status": "all", "userId": user_id, "i": token }),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
