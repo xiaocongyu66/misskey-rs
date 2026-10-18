@@ -6802,7 +6802,7 @@ async fn tl_tail_remote_host_and_channel_renote_shapes() {
     // -- renote stamp shapes: a payload-channelId renote shows in the
     //    channel TL, and muted-channel renotes drop from the users/notes and
     //    user-list-timeline gates ------------------------------------------
-    let (s, carol) = signup(&app, &uname("ttc")).await;
+    let carol = signup(&app, &uname("ttc")).await;
     let (c_id, ct) = (
         carol["id"].as_str().unwrap().to_string(),
         carol["token"].as_str().unwrap().to_string(),
