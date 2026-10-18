@@ -208,10 +208,9 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Option<Vec<Part>> {
     while let Some(rel) = find(&body[piece_start..], &delim) {
         let piece = &body[piece_start..piece_start + rel];
         piece_start = piece_start + rel + delim.len();
-        // The delimiter that ends the whole body is followed by "--".
-        if body[piece_start..].starts_with(b"--") {
-            break;
-        }
+        // The delimiter that ends the whole body is followed by "--"; it
+        // still terminates the final part's data, so parse this piece first.
+        let final_delim = body[piece_start..].starts_with(b"--");
         // piece = \r\n<header block>\r\n\r\n<data>\r\n
         let piece = piece.strip_prefix(b"\r\n")?;
         let piece = piece.strip_suffix(b"\r\n").unwrap_or(piece);
@@ -240,6 +239,9 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Option<Vec<Part>> {
             content_type: part_type,
             data: data.to_vec(),
         });
+        if final_delim {
+            break;
+        }
     }
     Some(parts)
 }
@@ -295,7 +297,7 @@ fn md5_hex(data: &[u8]) -> String {
 
     let mut state = [0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32];
 
-    let rotr = |x: u32, n: u32| x.rotate_right(n);
+    let rotl = |x: u32, n: u32| x.rotate_left(n);
     for chunk in msg.chunks_exact(64) {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
@@ -313,7 +315,7 @@ fn md5_hex(data: &[u8]) -> String {
             d = c;
             c = b;
             let sum = a.wrapping_add(f).wrapping_add(k[i]).wrapping_add(m[g]);
-            b = b.wrapping_add(rotr(sum, s));
+            b = b.wrapping_add(rotl(sum, s));
             a = tmp;
         }
         state[0] = state[0].wrapping_add(a);

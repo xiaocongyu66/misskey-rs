@@ -662,7 +662,8 @@ async fn seed_drive_file(pool: &mk_db::sqlx::PgPool, user_id: &str, file_type: &
         webpublic_url: None,
         properties: json!({}),
     };
-    mk_db::drive::insert_drive_file(pool, &row, "accesskey123")
+    let access_key = format!("seedkey{}{}", mk_types::id::gen_aid_now(), id);
+    mk_db::drive::insert_drive_file(pool, &row, &access_key)
         .await
         .unwrap();
     id
