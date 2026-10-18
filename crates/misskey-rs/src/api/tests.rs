@@ -6383,3 +6383,289 @@ async fn users_notes_user_tl_channel_plane_legs() {
         "guest view keeps the channel renote: {res}"
     );
 }
+
+// ===== ul-tl2: user-list-timeline follow-ups ================================
+//
+// Companion legs to the // ===== ul-tl: section above (pinned upstream
+// timelines.ts User List TL + notes/user-list-timeline.ts getFromDb): the
+// membership-invisible specified plane (visibleUserIds, both directions),
+// the followers-visibility reply-addressed-to-me arm of
+// generateVisibilityQuery, the makePaginationQuery both-bounds window
+// (exclusive bounds, DESC order per QueryService.ts L46), and withFiles.
+
+#[tokio::test]
+async fn user_list_timeline_ul_tl2_specified_pager_window_withfiles() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkul_tl2_specified").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("u2a")).await;
+    let bob = signup(&app, &uname("u2b")).await;
+    let carol = signup(&app, &uname("u2c")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let c = carol["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+    let ct = carol["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_tl(app: &axum::Router, mut params: Value, token: &str) -> Value {
+        params["i"] = json!(token);
+        let (s, v) = post_json(app.clone(), "/api/notes/user-list-timeline", params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "list", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list_id = list["id"].as_str().unwrap().to_string();
+    for uid in [b, c] {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/users/lists/push",
+            json!({ "listId": list_id, "userId": uid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+
+    // -- membership visibility, specified plane: a member's specified note
+    //    addressed to ME rides even without a follow; the same member's
+    //    specified note addressed to the OTHER member stays out ------------
+    let n_spec_me = note_post(
+        &app,
+        json!({ "text": "dm-ride", "visibility": "specified", "visibleUserIds": [a], "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    assert!(has(&res, &n_spec_me), "specified addressed to me rides");
+    let n_spec_other = note_post(
+        &app,
+        json!({ "text": "dm-hold", "visibility": "specified", "visibleUserIds": [c], "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    assert!(
+        lacks(&res, &n_spec_other),
+        "specified addressed to the other member stays out"
+    );
+
+    // -- followers plane, reply arm: a member's followers-visibility REPLY
+    //    to my note rides with no follow (replyUserId = me in
+    //    generateVisibilityQuery) ------------------------------------------
+    let n_a_home = note_post(&app, json!({ "text": "root", "i": at })).await;
+    let n_b_folreply = note_post(
+        &app,
+        json!({ "text": "fol-reply", "visibility": "followers", "replyId": n_a_home, "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_tl(&app, json!({ "listId": list_id, "limit": 100 }), at).await;
+    assert!(
+        has(&res, &n_b_folreply),
+        "followers reply addressed to me rides unfollowed"
+    );
+
+    // -- pager both-bounds window: makePaginationQuery keeps
+    //    sinceId < note < untilId (exclusive) with DESC order ---------------
+    let n1 = note_post(&app, json!({ "text": "w1", "i": bt })).await;
+    let n2 = note_post(&app, json!({ "text": "w2", "i": bt })).await;
+    let n3 = note_post(&app, json!({ "text": "w3", "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        json!({ "listId": list_id, "sinceId": n1, "untilId": n3, "limit": 100 }),
+        at,
+    )
+    .await;
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "both-bounds window is exclusive: {res}");
+    assert_eq!(arr[0]["id"], json!(n2), "in-window note");
+    let n4 = note_post(&app, json!({ "text": "w4", "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        json!({ "listId": list_id, "sinceId": n1, "untilId": n4, "limit": 100 }),
+        at,
+    )
+    .await;
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "window across n4 bound: {res}");
+    assert_eq!(arr[0]["id"], json!(n3), "both-bounds order is DESC");
+    assert_eq!(arr[1]["id"], json!(n2));
+
+    // -- withFiles: true over the member mix keeps file notes only ---------
+    let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
+    let n_txt = note_post(&app, json!({ "text": "plain", "i": bt })).await;
+    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        json!({ "listId": list_id, "withFiles": true, "limit": 100 }),
+        at,
+    )
+    .await;
+    assert!(lacks(&res, &n_txt), "withFiles drops text-only notes");
+    assert!(has(&res, &n_file), "withFiles keeps the file note");
+    let _ = ct;
+}
+
+// ===== chan-note2: notes/create channel legs + the TL channel folds ==========
+// upstream NoteCreateService: fetchAndCreate L413-420 (findOneBy
+// { id, isArchived: false } → NO_SUCH_CHANNEL), create() L449-470 (the reply
+// re-scope; a channel note is forced public + localOnly, visibleUsers
+// dropped) and the timeline.ts / local-timeline.ts getFromDb channel brackets
+// (followed channels fold into HTL; local keeps `channelId IS NULL`).
+
+#[tokio::test]
+async fn notes_create_channel_legs_and_tl_folds() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchan_note2").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("cn2a")).await;
+    let bob = signup(&app, &uname("cn2b")).await;
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // bob owns the channel (channels/create is the e2e fixture path).
+    let (s, channel) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "chan-note2", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {channel}");
+    let channel_id = channel["id"].as_str().unwrap().to_string();
+
+    // validation: a missing channel id rejects with NO_SUCH_CHANNEL
+    // (fetchAndCreate L413-420 → create.ts meta.errors.noSuchChannel).
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "x", "channelId": "nonexistent0000000001", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_CHANNEL"));
+
+    // forcing (create() L468-470): the row stores channelId, followers
+    // collapses to public, localOnly is forced on, and the pack carries the
+    // channelId (NoteEntityService.pack's conditional entry).
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "in-channel",
+            "channelId": channel_id,
+            "visibility": "followers",
+            "localOnly": false,
+            "i": bt
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    let created = &note["createdNote"];
+    let note_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        created["channelId"],
+        json!(channel_id),
+        "the row stores channelId and the pack emits it"
+    );
+    assert_eq!(created["visibility"], json!("public"), "L468 force-public");
+    assert_eq!(created["localOnly"], json!(true), "L470 force-localOnly");
+
+    // channels/timeline lists the note (timeline.ts getFromDb, channelId
+    // reader over the stored column).
+    let (s, ctl) = post_json(
+        app.clone(),
+        "/api/channels/timeline",
+        json!({ "channelId": channel_id, "i": bt, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ctl}");
+    let arr = ctl.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], json!(note_id));
+    assert_eq!(arr[0]["channelId"], json!(channel_id));
+
+    // before the follow the channel note stays out of alice's HTL
+    // (upstream case B keeps channelId IS NULL off the user plane).
+    let (s, htl) = post_json(
+        app.clone(),
+        "/api/notes/timeline",
+        json!({ "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {htl}");
+    assert!(
+        !htl.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == json!(note_id)),
+        "unfollowed channel note stays out of HTL"
+    );
+
+    // LTL excludes channel rows (local-timeline.ts getFromDb L157
+    // `channelId IS NULL`), for the author too.
+    let (s, ltl) = post_json(
+        app.clone(),
+        "/api/notes/local-timeline",
+        json!({ "i": bt, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ltl}");
+    assert!(
+        !ltl.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == json!(note_id)),
+        "channel note is absent from LTL"
+    );
+
+    // alice follows the channel → the followed-channel fold
+    // (timeline.ts getFromDb followingChannels brackets) lets it flow.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/follow",
+        json!({ "channelId": channel_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, htl2) = post_json(
+        app.clone(),
+        "/api/notes/timeline",
+        json!({ "i": at, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {htl2}");
+    assert!(
+        htl2.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == json!(note_id)),
+        "followed channel note folds into HTL"
+    );
+
+    let _ = pool;
+}

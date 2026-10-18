@@ -24,6 +24,9 @@ pub mod drive;
 pub mod drive_note;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
+// ul-tl-agent: users/lists/* + notes/user-list-timeline domain (user_list /
+// user_list_membership tables ship in the 0001 baseline)
+pub mod lists;
 // note-agent: meta row note-settings subset (sensitive/prohibited words +
 // the deeplAuthKey read the translate gate consumes)
 pub mod memo;
