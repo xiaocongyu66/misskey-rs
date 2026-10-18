@@ -41,6 +41,10 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
-        run: cargo test --workspace
+        # serial suite: concurrent fresh-db pools were wedging the runner
+        # (silent Test-step deaths at ~7m, zero completions after the first
+        # db tests — pre-existing on main; serial run also names the test
+        # that hangs, if any single test is at fault)
+        run: cargo test --workspace -- --test-threads=1
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
