@@ -17,13 +17,14 @@
 //! `NoteCreateService.pushToTl` + the endpoint `noteFilter`); the home gate
 //! below encodes exactly that pair.
 //!
-//! Deliberate divergence from upstream: channel notes are excluded from all
-//! three timelines here (`channelId IS NULL`; the renote side keeps flowing
-//! minus the `renoteChannelId` channel-muting gate — `isChannelRelated` /
-//! `note.renoteChannelId NOT IN mutedChannelIds` in the db paths). Upstream
-//! folds followed channels into home/hybrid, so its Channel-inclusion legs
-//! relying on that stay red (they belong to the channels lane); the
-//! Redis-literal `FTT:` probes likewise need the push pipeline.
+//! Channel fold (chan-note): the db paths fold a viewer's followed channels
+//! (minus the viewer's `channel_muting` rows) into home/hybrid —
+//! `timeline.ts`/`hybrid-timeline.ts` `getFromDb` channel brackets; local
+//! keeps `channelId IS NULL` (upstream local-timeline.ts L157). The renote
+//! side's `renoteChannelId` channel-mute gate reads the renote PARENT's
+//! channel — the insert-time denormalization (`renoteChannelId ==
+//! renote.channelId`) belongs to the shared renote insert (sibling lane).
+//! The `FTT:` Redis-literal probes still need the push pipeline (red here).
 //!
 //! Aid ids sort monotonically as plain strings, so sinceId/untilId paging is
 //! a string compare; bounds are EXCLUSIVE (`makePaginationQuery`),
@@ -193,10 +194,18 @@ const BASE_GUEST: &str = r#" AND u."isSuspended" = FALSE"#;
 
 /// channelMuting renote-side gate (db paths' `note.renoteChannelId IS NULL OR
 /// NOT IN mutedChannelIds`; fanout isChannelRelated): a renote/quote of a
-/// muted channel's note drops out. Binds NULL for guests — the sub-select
-/// degrades to no-op, matching the me!=null-only upstream application.
-const RENOTE_CHANNEL_MUTE: &str = r#" AND (n."renoteChannelId" IS NULL OR n."renoteChannelId" NOT IN (
-              SELECT "channelId" FROM "channel_muting" WHERE "userId" = :ME:))"#;
+/// muted channel's note drops out. chan-note: the denormalized
+/// `renoteChannelId` column is written by the shared renote insert (sibling
+/// lane), so the fold reads the renote parent's channel — upstream writes
+/// `renoteChannelId = renote.channelId` at insert time and channelId rows are
+/// never re-scoped afterwards, making the two forms equivalent. Binds NULL
+/// for guests — the sub-select degrades to no-op, matching the me!=null-only
+/// upstream application.
+const RENOTE_CHANNEL_MUTE: &str = r#" AND (n."renoteId" IS NULL OR NOT EXISTS (
+              SELECT 1 FROM "note" rc WHERE rc."id" = n."renoteId"
+                AND rc."channelId" IS NOT NULL
+                AND rc."channelId" IN (
+                    SELECT "channelId" FROM "channel_muting" WHERE "userId" = :ME:)))"#;
 
 /// Reply plane for the home/hybrid timelines:
 /// - non-replies and self-replies always pass (the `getFromDb` reply filter);
@@ -259,7 +268,19 @@ pub async fn timeline_notes(
     let asc = since_id.is_some();
 
     let mut inner = String::from(INNER);
-    inner.push_str(r#"n."channelId" IS NULL AND n."userId" = ANY(:FOL:)"#);
+    // chan-note: followed-channel fold (timeline.ts getFromDb following-
+    // Channels brackets) — non-channel rows ride the user plane, rows of the
+    // viewer's followed channels (minus their channelMuting rows) flow for
+    // any author. A channel note of a followed USER still stays out when the
+    // CHANNEL is not followed (upstream case B keeps channelId IS NULL on
+    // the user plane).
+    inner.push_str(
+        r#"( (n."channelId" IS NULL AND n."userId" = ANY(:FOL:))
+          OR n."channelId" IN (SELECT cf."followeeId" FROM "channel_following" cf
+                WHERE cf."followerId" = :ME:
+                  AND cf."followeeId" NOT IN (
+                      SELECT "channelId" FROM "channel_muting" WHERE "userId" = :ME:)) )"#,
+    );
     inner.push_str(REPLY_GATE_ME);
     inner.push_str(VIS_ME);
     inner.push_str(BASE_ME);
@@ -356,9 +377,16 @@ pub async fn hybrid_timeline_notes(
     let asc = since_id.is_some();
 
     let mut inner = String::from(INNER);
+    // chan-note: followed-channel fold (hybrid-timeline.ts getFromDb) —
+    // followed channels (minus the viewer's channelMuting rows) join the
+    // user/local public plane; without follows the channel plane stays NULL.
     inner.push_str(
         r#"( ( n."userId" = ANY(:FOL:) OR ((n."visibility" = 'public') AND (n."userHost" IS NULL)) )
-             AND n."channelId" IS NULL )"#,
+             AND ( n."channelId" IS NULL
+                   OR n."channelId" IN (SELECT cf."followeeId" FROM "channel_following" cf
+                         WHERE cf."followerId" = :ME:
+                           AND cf."followeeId" NOT IN (
+                               SELECT "channelId" FROM "channel_muting" WHERE "userId" = :ME:)) ) )"#,
     );
     if !with_replies {
         inner.push_str(REPLY_GATE_ME);

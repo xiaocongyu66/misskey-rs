@@ -424,6 +424,21 @@ pub async fn timeline_notes(
                     SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2))
               AND (n."renoteUserId" IS NULL OR n."renoteUserId" NOT IN (
                     SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2))
+              -- chan-note: timeline.ts getFromDb muting brackets — the viewed
+              -- channel flows even when muted (mute list minus this channel)
+              -- and a renote whose PARENT sits in another muted channel drops
+              -- (the renoteChannelId column is denormalized == parent
+              -- .channelId; the fold reads the parent since the shared renote
+              -- insert is a sibling lane's file).
+              AND ($2::varchar IS NULL OR n."channelId" NOT IN (
+                    SELECT "channelId" FROM "channel_muting"
+                     WHERE "userId" = $2 AND "channelId" != $1))
+              AND ($2::varchar IS NULL OR n."renoteId" IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM "note" rc WHERE rc."id" = n."renoteId"
+                      AND rc."channelId" IS NOT NULL
+                      AND rc."channelId" IN (
+                        SELECT "channelId" FROM "channel_muting"
+                         WHERE "userId" = $2 AND "channelId" != $1)))
               AND ($3::varchar IS NULL OR n."id" < $3)
               AND ($4::varchar IS NULL OR n."id" > $4)
             ORDER BY n."id" {dir} LIMIT $5
@@ -438,6 +453,105 @@ pub async fn timeline_notes(
         .bind(limit)
         .fetch_all(pool)
         .await
+}
+
+// ---------------------------------------------------------------------------
+// chan-note: notes/create channel legs (upstream NoteCreateService
+// fetchAndCreate/create channel paths) — the write side of note channelId
+// storage. `NewNote`/`insert_note` (note.rs) are the unit-fix3 lane's
+// territory, so the channel column rides as a post-insert stamp; the final
+// row state is identical to carrying the column through the INSERT.
+// ---------------------------------------------------------------------------
+
+/// scalar read of a note's channel (`reply.channelId` / `renote.channelId`
+/// legs of create()). Missing row ⇒ NULL — the caller's existence ladder
+/// (renote/reply targets) keeps the upstream error precedence.
+pub async fn note_channel_of(pool: &PgPool, note_id: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<Option<String>> =
+        sqlx::query_scalar(r#"SELECT "channelId" FROM "note" WHERE "id" = $1"#)
+            .bind(note_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.flatten())
+}
+
+/// data.channel != null insert leg: stamp `note.channelId`.
+pub async fn set_note_channel(
+    pool: &PgPool,
+    note_id: &str,
+    channel_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "note" SET "channelId" = $2 WHERE "id" = $1"#)
+        .bind(note_id)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Renote-row denormalization (`insertNote`'s `renoteChannelId:
+/// data.renote.channelId` + the channel-renote `channelId`). The shared
+/// renote insert lives in social.rs (sibling lane), so the newest
+/// (userId, renoteId) row is stamped after the delegated insert — serial
+/// e2e execution makes the freshest row the one just created.
+#[allow(clippy::too_many_arguments)]
+pub async fn stamp_newest_renote(
+    pool: &PgPool,
+    user_id: &str,
+    renote_id: &str,
+    channel_id: Option<&str>,
+    renote_channel_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE "note" SET
+            "channelId" = $3,
+            "renoteChannelId" = $4
+        WHERE "id" = (
+            SELECT "id" FROM "note"
+             WHERE "userId" = $1 AND "renoteId" = $2
+             ORDER BY "id" DESC LIMIT 1
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(renote_id)
+    .bind(channel_id)
+    .bind(renote_channel_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// NoteCreateService post-insert channel counters (L927-943): notesCount +1
+/// and lastNotedAt touch, usersCount +1 when this is the author's first note
+/// in the channel (upstream counts after insert: total == 1).
+pub async fn count_note_in_channel(
+    pool: &PgPool,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE "channel" SET "notesCount" = "notesCount" + 1, "lastNotedAt" = now()
+         WHERE "id" = $1
+        "#,
+    )
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE "channel" SET "usersCount" = "usersCount" + 1
+         WHERE "id" = $1
+           AND (SELECT count(*) FROM "note" WHERE "userId" = $2 AND "channelId" = $1) = 1
+        "#,
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// `ChannelEntityService.pack`'s pinnedNotes bucket: the pinned note rows in

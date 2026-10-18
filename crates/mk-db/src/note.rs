@@ -40,6 +40,11 @@ pub struct NewNote<'a> {
     pub has_poll: bool,
     /// `localOnly` param (reply/renote of a localOnly row inherits it).
     pub local_only: bool,
+    /// chan-note2: channelId — the insert lane of the channel legs
+    /// (NoteCreateService insertNote `channelId: data.channel
+    /// ? data.channel.id : null`, L651); the channel TL + the home/hybrid
+    /// followed-channel folds key off this column.
+    pub channel_id: Option<&'a str>,
 }
 
 /// Bumps user counters after a note insert (`NoteCreateService`
@@ -90,10 +95,10 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
           ("id", "text", "userId", "replyId", "replyUserId", "replyUserHost", "threadId",
            "localOnly", "renoteCount", "repliesCount", "reactions", "visibility",
            "fileIds", "attachedFileTypes", "visibleUserIds", "mentions", "emojis",
-           "tags", "hasPoll", "pageCount", "cw")
+           "tags", "hasPoll", "pageCount", "cw", "channelId")
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, '{}'::jsonb,
                 $9::note_visibility_enum, $10, $11, $12, $13, '{}'::varchar[],
-                '{}'::varchar[], $14, 0, $15)
+                '{}'::varchar[], $14, 0, $15, $16)
         "#,
     )
     .bind(n.id)
@@ -111,6 +116,7 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     .bind(n.mentions)
     .bind(n.has_poll)
     .bind(n.cw)
+    .bind(n.channel_id) // chan-note2
     .execute(pool)
     .await?;
     Ok(())

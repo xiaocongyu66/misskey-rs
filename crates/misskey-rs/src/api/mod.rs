@@ -2491,6 +2491,14 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         Some(Value::String(s)) if is_alnum_id(s) => Some(s.as_str()),
         Some(_) => return invalid_param("replyId", "must be an alphanumeric id"),
     };
+    // chan-note2: channelId param (create.ts paramDef L144 — a nullable
+    // `misskey:id` string, so malformed ids fall through to the service
+    // existence check like the other id params).
+    let channel_id_in: Option<String> = match body.get("channelId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if is_alnum_id(s) => Some(s.to_string()),
+        Some(_) => return invalid_param("channelId", "must be an alphanumeric id"),
+    };
     let visible_user_ids_in: Vec<String> = match body.get("visibleUserIds") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => {
@@ -2725,6 +2733,29 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         }
     }
 
+    // chan-note2: fetchAndCreate channel leg (NoteCreateService L413-420) —
+    // findOneBy({ id, isArchived: false }); an archived channel resolves the
+    // same NO_SUCH_CHANNEL as a missing one (create.ts meta.errors
+    // .noSuchChannel, thrown off IdentifiableError bfa3905b).
+    if let Some(cid) = &channel_id_in {
+        match mk_db::channel::find_channel(pool, cid).await {
+            Ok(Some(c)) if !c.is_archived => {}
+            Ok(_) => {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "NO_SUCH_CHANNEL",
+                    "b1653923-5453-4edc-b786-7c4f39bb0bbb",
+                    "No such channel.",
+                ));
+            }
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "find_channel");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    }
+
     // ---- create() ----
     let mut text: Option<String> = raw_text.map(|t| t.trim().to_string());
     if let Some(t) = &text {
@@ -2732,6 +2763,24 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             text = None;
         }
     }
+
+    // chan-note2: create() channel scope/force legs (NoteCreateService
+    // L449-470). A reply re-scopes the note into the reply target's channel —
+    // the L451-457 (out-of-channel reply) and L461-463 (into-channel reply)
+    // branches both reduce to "the reply's channelId wins" (an equal-id
+    // payload channel never survives the existence check above). Any channel
+    // note is forced public (L468) with its visibleUsers dropped (L469) and
+    // localOnly on (L470); the sensitiveWords/canPublicNote home downgrade
+    // below keeps the upstream `channel == null` gate (L472).
+    let mut channel_id = channel_id_in;
+    if let Some(reply_row) = &reply {
+        channel_id = reply_row.channel_id.clone();
+    }
+    let visible_user_ids_in = if channel_id.is_some() {
+        Vec::new()
+    } else {
+        visible_user_ids_in
+    };
 
     // assigned-role policies (mentionLimit / canPublicNote).
     let assigned = match mk_db::role::user_assigned_roles(pool, &me_id).await {
@@ -2752,8 +2801,15 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             }
         };
 
-    let mut visibility = visibility.to_string();
-    if visibility == "public" {
+    // chan-note2: L468 — a channel note is always public, and the
+    // sensitiveWords/canPublicNote force-home only ever applies to
+    // non-channel notes (L472 `channel == null`).
+    let mut visibility = if channel_id.is_some() {
+        "public".to_string()
+    } else {
+        visibility.to_string()
+    };
+    if visibility == "public" && channel_id.is_none() {
         let cw_or_text = cw.or(raw_text).unwrap_or("");
         if mk_core::services::misc::is_keyword_included(cw_or_text, &sensitive_words) {
             visibility = "home".to_string();
@@ -2779,7 +2835,9 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     }
 
     // reply visibility cascade (NoteCreateService data.reply switch).
-    let mut local_only = local_only;
+    // chan-note2: L470 forces localOnly on channel notes; the reply localOnly
+    // leg carries the upstream `channel == null` gate (L568).
+    let mut local_only = local_only || channel_id.is_some();
     if let Some(reply_row) = &reply {
         match reply_row.visibility.as_str() {
             "home" if visibility == "public" => visibility = "home".to_string(),
@@ -2789,7 +2847,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             _ => {}
         }
         // ローカルのみにリプライしたらローカルのみにする
-        if reply_row.local_only {
+        if reply_row.local_only && channel_id.is_none() {
             local_only = true;
         }
     }
@@ -2911,12 +2969,22 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             },
             has_poll: poll.is_some(),
             local_only,
+            // chan-note2
+            channel_id: channel_id.as_deref(),
         },
     )
     .await
     {
         tracing::error!(target: "dbg_notes", error = %e, "insert_note");
         return api_err(ApiError::internal_error());
+    }
+    // chan-note2: channel counters (NoteCreateService L927-943) — notesCount
+    // +1 with the lastNotedAt touch, usersCount +1 when this is the author's
+    // first note in the channel.
+    if let Some(cid) = &channel_id {
+        if let Err(e) = mk_db::channel::count_note_in_channel(pool, cid, &me_id).await {
+            tracing::error!(target: "dbg_notes", error = %e, "count_note_in_channel");
+        }
     }
     if let Some(p) = &poll {
         if let Err(e) = mk_db::poll::insert_poll(
