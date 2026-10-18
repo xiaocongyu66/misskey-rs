@@ -3872,8 +3872,14 @@ async fn channels_slice_roundtrip() {
     mk_db::run_migrations(&pool).await.unwrap();
     let app = crate::build_router(test_state(pool));
 
-    let (a_token, _) = channels_signup(app.clone(), "alice").await;
+    // the OWNER registers first: upstream SignupService L160-162 stamps the
+    // first signup as meta.rootUserId and RoleService.isModerator (L461)
+    // grants that holder moderator powers, which channels/update accepts as
+    // an owner (update.ts L92 `channel.userId !== me.id && !iAmModerator`)
+    // — a first-registered alice would make the non-owner update below pass
+    // instead of mirroring the ACCESS_DENIED shape
     let (b_token, _) = channels_signup(app.clone(), "bobby").await;
+    let (a_token, _) = channels_signup(app.clone(), "alice").await;
 
     // bob owns the channel; alice follows + favorites it
     let (s, ch) = post_json(
