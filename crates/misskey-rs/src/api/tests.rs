@@ -4471,11 +4471,14 @@ async fn announcements_invalid_dates_and_read_flow() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(shown["isRead"], json!(true));
-    // reads counted on the admin list
+    // reads counted on the admin list — upstream scopes the list by userId
+    // when present and to GLOBALS ONLY when absent (admin/announcements/
+    // list.ts L144-147), so the personal row rides the user-scoped call
+    // (the very next block asserts the absent-userId globals-only shape)
     let (s, list) = post_json(
         app.clone(),
         "/api/admin/announcements/list",
-        json!({ "status": "all", "i": token }),
+        json!({ "status": "all", "userId": user_id, "i": token }),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
