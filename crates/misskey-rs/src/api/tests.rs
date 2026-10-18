@@ -661,6 +661,7 @@ async fn seed_drive_file(pool: &mk_db::sqlx::PgPool, user_id: &str, file_type: &
         url: "http://127.0.0.1:3000/files/accesskey123/192.jpg".to_string(),
         webpublic_url: None,
         properties: json!({}),
+        ..Default::default()
     };
     let access_key = format!("seedkey{}{}", mk_types::id::gen_aid_now(), id);
     mk_db::drive::insert_drive_file(pool, &row, &access_key)
@@ -3763,4 +3764,219 @@ async fn freq_pack_silenced_user_equals_users_show() {
     assert_eq!(s, StatusCode::OK, "body: {show}");
     assert_eq!(entry["user"], show, "freq pack must equal users/show");
     assert_eq!(entry["user"]["isSilenced"], json!(true));
+}
+
+// ---------------------------------------------------------------------------
+// channels slice (upstream test/e2e/channel.ts arena)
+// ---------------------------------------------------------------------------
+
+async fn channels_signup(app: axum::Router, name: &str) -> (String, String) {
+    let username = format!("{name}{}", mk_types::id::gen_aid_now());
+    let (_, body) = post_json(
+        app,
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    assert!(!body.is_null(), "signup must return a body: {body}");
+    let token = body["token"].as_str().unwrap().to_string();
+    let id = body["id"].as_str().unwrap().to_string();
+    (token, id)
+}
+
+/// The test/e2e/channel.ts Follow describe: `channels/create` from alice,
+/// then a re-follow of the same channel must hit ALREADY_FOLLOWING while the
+/// first follow round-trips 204.
+#[tokio::test]
+async fn channels_follow_arena() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_channels_follow").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, _) = channels_signup(app.clone(), "alice").await;
+
+    // fixture: `channels/create { name: 'follow-test-channel' }` — packed
+    // Channel shape back (ChannelEntityService.pack)
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "follow-test-channel", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    assert_eq!(ch["name"], json!("follow-test-channel"));
+    assert_eq!(ch["isFollowing"], json!(false));
+    assert_eq!(ch["isFavorited"], json!(false));
+    assert_eq!(ch["isMuting"], json!(false));
+    assert_eq!(ch["hasUnreadNote"], json!(false));
+    assert_eq!(ch["notesCount"], json!(0));
+    assert_eq!(ch["usersCount"], json!(0));
+    let channel_id = ch["id"].as_str().unwrap().to_string();
+
+    let (s, empty) = post_json(
+        app.clone(),
+        "/api/channels/follow",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {empty}");
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/channels/follow",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_FOLLOWING"));
+}
+
+/// The wider channels/* slice: show/followed/timeline/favorite/unfavorite/
+/// unfollow round-trips over the shared pack.
+#[tokio::test]
+async fn channels_slice_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_channels_slice").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, _) = channels_signup(app.clone(), "alice").await;
+    let (b_token, _) = channels_signup(app.clone(), "bobby").await;
+
+    // bob owns the channel; alice follows + favorites it
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "slice-channel", "description": "a channel", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    let channel_id = ch["id"].as_str().unwrap().to_string();
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/follow",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // followed (alice) now packs the channel with her me-flags
+    let (s, followed) = post_json(
+        app.clone(),
+        "/api/channels/followed",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {followed}");
+    let followed = followed.as_array().unwrap();
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0]["id"], json!(channel_id));
+    assert_eq!(followed[0]["isFollowing"], json!(true));
+
+    // a to-become note lives in the channel via the arena write path
+    // (notes/create { channelId } — the row's channelId column). notes/create
+    // is note-core's file: until the coordinator applies the NewNote
+    // .channelId extension, the param is ignored and the branch below is
+    // skipped — this test must pass in both states.
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hi", "channelId": channel_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    if note["createdNote"]["channelId"] == json!(channel_id) {
+        let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
+        let (s, tl) = post_json(
+            app.clone(),
+            "/api/channels/timeline",
+            json!({ "channelId": channel_id, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {tl}");
+        let tl = tl.as_array().unwrap();
+        assert_eq!(tl.len(), 1);
+        assert_eq!(tl[0]["id"], json!(note_id));
+        assert_eq!(tl[0]["channelId"], json!(channel_id));
+    }
+
+    // owner update lane (update.ts owner check)
+    let (s, upd) = post_json(
+        app.clone(),
+        "/api/channels/update",
+        json!({ "channelId": channel_id, "name": "renamed", "description": null, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {upd}");
+    assert_eq!(upd["name"], json!("renamed"));
+    assert_eq!(upd["description"], Value::Null);
+    // non-owner update denied (update.ts ACCESS_DENIED)
+    let (s_nte, body) = post_json(
+        app.clone(),
+        "/api/channels/update",
+        json!({ "channelId": channel_id, "name": "nope", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s_nte, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+
+    // favorite → my-favorites → unfavorite (favorite.ts / my-favorites.ts)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/favorite",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, favs) = post_json(
+        app.clone(),
+        "/api/channels/my-favorites",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {favs}");
+    assert_eq!(favs.as_array().unwrap().len(), 1);
+    assert_eq!(favs[0]["id"], json!(channel_id));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/unfavorite",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // unfollow lands back on an empty followed list
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/unfollow",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, followed) = post_json(
+        app.clone(),
+        "/api/channels/followed",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {followed}");
+    assert_eq!(followed.as_array().unwrap().len(), 0);
+
+    // unknown channel → NO_SUCH_CHANNEL (channels/show)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/channels/show",
+        json!({ "channelId": "x".repeat(32) }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_CHANNEL"));
 }

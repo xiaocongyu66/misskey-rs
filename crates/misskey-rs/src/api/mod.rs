@@ -30,6 +30,9 @@ mod roles_lite;
 // soft `isDeleted` flag + the me-view pack field); db path in
 // mk-db/src/delete_account.rs
 mod delete_account;
+// channels-agent: channels/* domain (channels/create ../favorite slice of
+// upstream endpoints/channels/*) — db paths in mk-db/src/channel.rs
+mod channel;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -288,6 +291,40 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         return social::route(&state, name.as_str(), &body, token, credential_declared).await;
     }
+
+    // ==== channels DISPATCH ARM (channels/* slice) ====
+    // channels-agent: all 13 `channels/*` names route into api::channel on
+    // the roles_lite/delete-account arm pattern — method check, body
+    // parsing, token extraction and the credential-declared probe live in
+    // this arm; the requireCredential gates + endpoint bodies in
+    // api::channel (db paths in mk-db/src/channel.rs).
+    if channel::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return channel::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END channels DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());

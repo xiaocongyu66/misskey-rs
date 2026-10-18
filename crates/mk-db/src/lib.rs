@@ -7,6 +7,9 @@ use sqlx::postgres::PgPoolOptions;
 pub use sqlx;
 
 pub mod admin;
+// channels-agent: channels/* domain (channel/channel_following/channel_favorite
+// tables + the channels/timeline note db path)
+pub mod channel;
 // delete-account: i/delete-account + admin/delete-account soft-delete flag
 pub mod delete_account;
 // i/update tail wave: drive files (upload), note pinings, personal memos
