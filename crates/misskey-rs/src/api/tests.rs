@@ -4924,8 +4924,16 @@ async fn notes_create_word_ladders() {
     assert_eq!(note["createdNote"]["visibility"], json!("home"));
 
     // 禁止ワード (単語/正規表現/スペースアンド → 400 CONTAINS_PROHIBITED_WORDS;
-    // poll choices ride the same check)
-    for words in [json!(["test"]), json!(["/Test/i"]), json!(["Test hoge"])] {
+    // poll choices ride the same check). Upstream pairs each word form with
+    // its exact fixture casing (note.ts L719-763): the plain word and the
+    // /regex/ forms hit lowercase 'hogetesthuge' (isKeyWordIncluded is
+    // CASE-SENSITIVE includes for non-regex forms — UtilityService L92-94),
+    // only the space-AND form uses 'hogeTesthuge'.
+    for (words, text) in [
+        (json!(["test"]), "hogetesthuge"),
+        (json!(["/Test/i"]), "hogetesthuge"),
+        (json!(["Test hoge"]), "hogeTesthuge"),
+    ] {
         let (s, _) = post_json(
             app.clone(),
             "/api/admin/update-meta",
@@ -4936,10 +4944,10 @@ async fn notes_create_word_ladders() {
         let (s, err) = post_json(
             app.clone(),
             "/api/notes/create",
-            json!({ "text": "hogeTesthuge", "i": a_token }),
+            json!({ "text": text, "i": a_token }),
         )
         .await;
-        assert_eq!(s, StatusCode::BAD_REQUEST, "words: {words}");
+        assert_eq!(s, StatusCode::BAD_REQUEST, "words: {words} text: {text}");
         assert_eq!(
             err["error"]["code"],
             json!("CONTAINS_PROHIBITED_WORDS"),
