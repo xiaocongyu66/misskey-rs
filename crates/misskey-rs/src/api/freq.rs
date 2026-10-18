@@ -383,6 +383,43 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
         ));
     }
 
+    // notes.ts word ladders: admin/update-meta carries the moderation word
+    // lists the notes/create force-home / CONTAINS_PROHIBITED_WORDS legs
+    // read back (MetaService.update partial patch — absent keys untouched).
+    let word_list = |key: &str, v: &Value| -> Result<Vec<String>, Response> {
+        let Some(arr) = v.as_array() else {
+            return Err(super::invalid_param(key, "expected an array of strings"));
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            match item.as_str() {
+                Some(s) => out.push(s.to_string()),
+                None => return Err(super::invalid_param(key, "expected an array of strings")),
+            }
+        }
+        Ok(out)
+    };
+    let sensitive_words = match body.get("sensitiveWords") {
+        Some(v) => Some(word_list("sensitiveWords", v)?),
+        None => None,
+    };
+    let prohibited_words = match body.get("prohibitedWords") {
+        Some(v) => Some(word_list("prohibitedWords", v)?),
+        None => None,
+    };
+    if sensitive_words.is_some() || prohibited_words.is_some() {
+        if let Err(e) = mk_db::meta::update_meta_word_lists(
+            pool,
+            sensitive_words.as_deref(),
+            prohibited_words.as_deref(),
+        )
+        .await
+        {
+            tracing::error!(target: "dbg_freq", error = %e, "update_meta_word_lists");
+            return api_err(ApiError::internal_error());
+        }
+    }
+
     if let Some(pinned) = body.get("pinnedUsers") {
         let Some(arr) = pinned.as_array() else {
             return super::invalid_param("pinnedUsers", "expected an array of strings");
