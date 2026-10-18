@@ -814,9 +814,9 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     let (s, err) = post_json(app.clone(), "/api/notifications", json!({})).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
 
-    // A posts the mention text. M1 notes/create has no mention parsing, so
-    // the notification row is inserted through the truthful mk-db path
-    // (the same INSERT upstream NotificationService lands in).
+    // A posts the mention text. notes/create resolves the mention itself
+    // (M2 mention wiring): the notification row is produced by the live
+    // endpoint, no manual seed needed.
     let (s, nb) = post_json(
         app.clone(),
         "/api/notes/create",
@@ -825,21 +825,6 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     .await;
     assert_eq!(s, StatusCode::OK, "body: {nb}");
     let note_id = nb["createdNote"]["id"].as_str().unwrap().to_string();
-
-    let mention_id = mk_types::id::gen_aid_now();
-    mk_db::notification::insert_notification(
-        &pool,
-        &mk_db::notification::NewNotification {
-            id: &mention_id,
-            r#type: "mention",
-            user_id: &b_id,
-            notifier_id: Some(a["id"].as_str().unwrap()),
-            note_id: Some(&note_id),
-            reaction: None,
-        },
-    )
-    .await
-    .unwrap();
 
     // First read: unreadOnly + default markAsRead=true → mention packed
     // (type/userId/user/note), then everything marked read.
@@ -853,7 +838,7 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     let arr = list.as_array().unwrap();
     assert_eq!(arr.len(), 1, "body: {list}");
     let n = &arr[0];
-    assert_eq!(n["id"], mention_id.as_str());
+    assert!(n["id"].as_str().is_some(), "body: {n}");
     assert_eq!(n["type"], "mention");
     assert!(n["createdAt"].as_str().is_some());
     assert_eq!(n["userId"], a["id"]);
@@ -950,18 +935,18 @@ async fn notifications_mention_reaction_and_mark_as_read() {
     assert_eq!(arr5.len(), 1, "body: {list5}");
     assert_eq!(arr5[0]["type"], "mention");
 
-    // sinceId-only flips to oldest-first ASC: mention comes after renote.
+    // sinceId-only flips to oldest-first ASC: with the boundary at renote_id
+    // only rows strictly newer (mention, produced live) come back.
     let (s, list6) = post_json(
         app.clone(),
         "/api/notifications",
-        json!({ "i": token_b, "sinceId": mention_id, "markAsRead": false }),
+        json!({ "i": token_b, "sinceId": renote_id, "markAsRead": false }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list6}");
     let arr6 = list6.as_array().unwrap();
-    assert_eq!(arr6.len(), 2, "body: {list6}");
-    assert_eq!(arr6[0]["type"], "renote");
-    assert_eq!(arr6[1]["type"], "follow");
+    assert_eq!(arr6.len(), 1, "body: {list6}");
+    assert_eq!(arr6[0]["type"], "mention");
 
     // markAsRead:false leaves rows unread. All rows above were already
     // marked read (their calls used the markAsRead default), so seed a fresh
