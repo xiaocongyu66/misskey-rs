@@ -128,8 +128,14 @@ impl From<AdminListRow> for AnnouncementRow {
 /// caller's job; this is the first-registereds-user id probe used by the
 /// moderator gate (see api::announcement, upstream SignupService L160
 /// `if (meta.rootUserId == null) update({ rootUserId: account.id })`).
+///
+/// `user` has NO `createdAt` column (MiUser only carries the nullable
+/// `updatedAt`; upstream v2025 moved the creation stamp into the aid id).
+/// Aid ids sort monotonically as plain strings, so `ORDER BY "id" ASC` is the
+/// first-registered account (an `ORDER BY "createdAt"` here 500s every admin
+/// announcement call on a fresh meta).
 pub async fn first_registered_user_id(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(r#"SELECT "id" FROM "user" ORDER BY "createdAt" ASC LIMIT 1"#)
+    sqlx::query_scalar(r#"SELECT "id" FROM "user" ORDER BY "id" ASC LIMIT 1"#)
         .fetch_optional(pool)
         .await
 }
