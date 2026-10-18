@@ -7066,16 +7066,12 @@ async fn ftt2_redis_home_timeline_push_shape() {
     let bob_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{b_id}"))
         .await
         .unwrap();
-    assert!(
-        bob_list.iter().any(|n| n == &note),
-        "FTT: ローカルユーザーの HTL にはプッシュされる — bob's list: {bob_list:?}"
-    );
     let alice_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{a_id}"))
         .await
         .unwrap();
     assert!(
-        alice_list.iter().any(|n| n == &note),
-        "self push — alice's list: {alice_list:?}"
+        bob_list.iter().any(|n| n == &note) && alice_list.iter().any(|n| n == &note),
+        "FTT: ローカルユーザーの HTL にはプッシュされる — note={note} bob={bob_list:?} alice={alice_list:?}"
     );
 
     // flag off (leg false arm: exists == 0) — fresh posts push nothing
