@@ -6,7 +6,7 @@
 use sqlx::PgPool;
 
 /// Columns consumed by the api layer (drive pack + avatar/banner swap).
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Default, sqlx::FromRow)]
 pub struct DriveFileRow {
     pub id: String,
     #[sqlx(rename = "userId")]
