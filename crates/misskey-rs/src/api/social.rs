@@ -881,6 +881,44 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
     {
         return db_err("renote insert", e);
     }
+    // utl-misc (users/notes [チャンネル外リノート] チャンネルミュート leg +
+    // the channels/timeline renote legs): insertNote's channel denormalization
+    // (NoteCreateService.ts L651/L680) — the renote row carries its payload
+    // channel in channelId and the parent's channel in renoteChannelId; the
+    // channel-mute renote gates and the channels/timeline channelId join read
+    // both. The shared renote INSERT is a sibling lane's file, so the fresh
+    // row rides the channel lane's post-insert stamp (channel.rs
+    // stamp_newest_renote). A payload channelId resolves like the text lane's
+    // fetchAndCreate leg: NO_SUCH_CHANNEL (b1653923) when missing/archived.
+    let channel_id_in: Option<String> = match body.get("channelId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if super::is_alnum_id(s) => Some(s.to_string()),
+        Some(_) => return super::invalid_param("channelId", "must be an alphanumeric id"),
+    };
+    if let Some(cid) = &channel_id_in {
+        match mk_db::channel::find_channel(pool, cid).await {
+            Ok(Some(c)) if !c.is_archived => {}
+            Ok(_) => {
+                return meta_err(
+                    "NO_SUCH_CHANNEL",
+                    "b1653923-5453-4edc-b786-7c4f39bb0bbb",
+                    "No such channel.",
+                );
+            }
+            Err(e) => return db_err("renote find_channel", e),
+        }
+    }
+    if let Err(e) = mk_db::channel::stamp_newest_renote(
+        pool,
+        me_id,
+        &id,
+        channel_id_in.as_deref(),
+        target.channel_id.as_deref(),
+    )
+    .await
+    {
+        return db_err("renote channel stamp", e);
+    }
     // incNotesCount + tag merge (a textless renote carries no hashtags)
     let hashtags = text
         .map(mk_core::services::misc::extract_hashtags)

@@ -3064,7 +3064,7 @@ pub(crate) async fn note_is_visible_for_me(
 }
 
 /// ajv `misskey:id` format (`/^[a-zA-Z0-9]+$/` — endpoint-base.ts L20).
-fn is_alnum_id(s: &str) -> bool {
+pub(crate) fn is_alnum_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 

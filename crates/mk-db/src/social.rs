@@ -356,6 +356,11 @@ pub struct RenoteTarget {
     pub visibility: String,
     #[sqlx(rename = "localOnly")]
     pub local_only: bool,
+    // utl-misc (users/notes [チャンネル外リノート] チャンネルミュート leg):
+    // the parent's channel feeds the renote-row denormalization
+    // (`renoteChannelId: data.renote.channelId`, NoteCreateService.ts L680).
+    #[sqlx(rename = "channelId")]
+    pub channel_id: Option<String>,
 }
 
 pub async fn find_renote_target(
@@ -367,7 +372,7 @@ pub async fn find_renote_target(
         SELECT "id", ("userId") AS "userId", ("userHost") AS "userHost",
                ("renoteId") AS "renoteId", "text", "cw", ("replyId") AS "replyId",
                "hasPoll", "fileIds", ("visibility"::text) AS "visibility",
-               "localOnly"
+               "localOnly", ("channelId") AS "channelId"
         FROM "note" WHERE "id" = $1
         "#,
     )
