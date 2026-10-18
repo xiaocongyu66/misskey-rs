@@ -101,7 +101,7 @@ pub(crate) async fn debug_lrange(
     // — a half-shutdown alone never makes the read loop terminate (redis
     // serves more commands on the same connection until it is told to quit).
     let cmd = format!(
-        "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$1\r\n-1\r\n*1\r\n$4\r\nQUIT\r\n",
+        "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n-1\r\n*1\r\n$4\r\nQUIT\r\n",
         key.len(),
         key
     );
@@ -109,9 +109,7 @@ pub(crate) async fn debug_lrange(
     conn.shutdown().await?;
 
     let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 1024];
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
+    let mut chunk = [0u8; 4096];
     tokio::time::timeout(BULK_READ_TIMEOUT, async {
         loop {
             let n = conn.read(&mut chunk).await?;
