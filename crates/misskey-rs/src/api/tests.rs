@@ -4784,7 +4784,10 @@ async fn notes_create_reply_ladder_and_delete_truth() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.replies_count, 2);
+    // 承カウント: upstream NoteCreateService.saveReply (L1015-1019) increments
+    // the parent unconditionally for EVERY reply — bob's opening 'bar' counts
+    // (the earlier ladder: bar + reply one + reply two = 3)
+    assert_eq!(row.replies_count, 3);
     // reply created by alice here; delete needs bob's reply? both by alice — fine
     let (s, _) = post_json(
         app.clone(),
@@ -4797,7 +4800,7 @@ async fn notes_create_reply_ladder_and_delete_truth() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.replies_count, 1);
+    assert_eq!(row.replies_count, 2);
     let (s, _) = post_json(
         app.clone(),
         "/api/notes/delete",
@@ -4809,7 +4812,7 @@ async fn notes_create_reply_ladder_and_delete_truth() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.replies_count, 0);
+    assert_eq!(row.replies_count, 1);
     let (_s, gone) = post_json(app.clone(), "/api/notes/show", json!({ "noteId": ids[0] })).await;
     assert_eq!(gone["error"]["code"], json!("NO_SUCH_NOTE"), "body: {gone}");
     let _ = reply_id;
