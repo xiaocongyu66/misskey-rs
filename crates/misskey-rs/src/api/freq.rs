@@ -12,6 +12,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::{json, Value};
 
 use crate::error::{api_err, ApiError};
@@ -131,7 +132,7 @@ pub(crate) async fn frequently_replied(
     }
     (
         StatusCode::OK,
-        serde_json::to_value(out).unwrap_or(json!([])),
+        Json(serde_json::to_value(out).unwrap_or(json!([]))),
     )
         .into_response()
 }
@@ -183,7 +184,7 @@ pub(crate) async fn pinned_users(state: &AppState, token: Option<&str>) -> Respo
     }
     (
         StatusCode::OK,
-        serde_json::to_value(out).unwrap_or(json!([])),
+        Json(serde_json::to_value(out).unwrap_or(json!([]))),
     )
         .into_response()
 }
@@ -255,7 +256,7 @@ pub(crate) async fn user_notes(state: &AppState, body: &Value, token: Option<&st
     }
     (
         StatusCode::OK,
-        serde_json::to_value(out).unwrap_or(json!([])),
+        Json(serde_json::to_value(out).unwrap_or(json!([]))),
     )
         .into_response()
 }
