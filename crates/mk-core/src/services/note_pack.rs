@@ -105,10 +105,7 @@ pub fn pack_note_lite(inp: &NotePackIn<'_>) -> Value {
         o.insert("renoteId".into(), json!(rid));
     }
     o.insert("visibility".into(), json!(visibility));
-    o.insert(
-        "mentions".into(),
-        json!(row.mentions),
-    );
+    o.insert("mentions".into(), json!(row.mentions));
     // upstream: present only for 'specified'; M1 pin keeps it always (see above)
     o.insert("visibleUserIds".into(), json!(Vec::<String>::new()));
     o.insert("fileIds".into(), json!(row.file_ids));

@@ -53,7 +53,7 @@ fn meta_err(code: &str, id: &str, message: &str) -> Response {
 /// no credential at all → CREDENTIAL_REQUIRED; present-but-unresolvable
 /// native token → AUTHENTICATION_FAILED; suspended user →
 /// YOUR_ACCOUNT_SUSPENDED. Returns the resolved me id.
-async fn require_checked_user(
+pub(crate) async fn require_checked_user(
     pool: &mk_db::sqlx::PgPool,
     token: Option<&str>,
     credential_declared: bool,
@@ -159,6 +159,45 @@ fn user_id_param<'a>(body: &'a Value) -> Result<&'a str, Response> {
             "reason": "expected a string (misskey:id)",
         })))
     })
+}
+
+/// NotificationService.createNotification gates for note-reasoned
+/// notifications (mention/reply/renote/quote/reaction): a notifier cannot
+/// notify itself and is dropped when the notifiee mutes it (recieveConfig /
+/// suspended-notifier pack filtering not modeled — TODO(M2+)).
+pub(crate) async fn notify_note_event(
+    pool: &mk_db::sqlx::PgPool,
+    notifiee_id: &str,
+    notifier_id: &str,
+    reason: &str,
+    note_id: &str,
+) {
+    if notifiee_id == notifier_id {
+        return;
+    }
+    match mk_db::social::muting_exists(pool, notifiee_id, notifier_id).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "notify_note_event muting_exists");
+            return;
+        }
+    }
+    if let Err(e) = mk_db::notification::insert_notification(
+        pool,
+        &mk_db::notification::NewNotification {
+            id: &mk_types::id::gen_aid_now(),
+            r#type: reason,
+            user_id: notifiee_id,
+            notifier_id: Some(notifier_id),
+            note_id: Some(note_id),
+            reaction: None,
+        },
+    )
+    .await
+    {
+        tracing::error!(target: "dbg_social", error = %e, "notify_note_event insert");
+    }
 }
 
 fn with_replies_param(body: &Value) -> Result<bool, Response> {
@@ -774,7 +813,19 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
             Ok(true) => {}
             Err(e) => tracing::error!(target: "dbg_social", error = %e, "renote user_is_bot"),
         }
-        // TODO(M2+): 'renote' notification (notifications family scope)
+        // NoteCreateService non-AP notify branch: renote target author
+        // (local) is notified as 'renote' — or 'quote' when the new row
+        // carries text. Gates (notifiee == notifier, actor muted by the
+        // notifiee) mirror NotificationService.createNotification; thread
+        // muting only applies to replies upstream, not renotes.
+        notify_note_event(
+            pool,
+            &target.user_id,
+            me_id,
+            if text.is_some() { "quote" } else { "renote" },
+            &id,
+        )
+        .await;
     }
 
     // TODO(M2+): replyId+renoteId quote-combo reply-target validation
@@ -782,4 +833,336 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
         Ok(n) => (StatusCode::OK, Json(json!({ "createdNote": n }))).into_response(),
         Err(r) => *r,
     }
+}
+
+// ===== notes domain (timeline trio / reactions / delete) ====================
+
+/// `POST /api/notes/timeline` (requireCredential): myself + followees.
+pub(crate) async fn notes_timeline(
+    state: &crate::api::AppState,
+    body: &Value,
+    me_id: &str,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let followees = match mk_db::social::followee_ids(pool, me_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "followee_ids");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    };
+    run_list(
+        state,
+        pool,
+        mk_db::note::timeline_notes(
+            pool,
+            me_id,
+            &followees,
+            opt_id(body, "sinceId"),
+            opt_id(body, "untilId"),
+            opt_i(body, "limit", 10).clamp(1, 100),
+            body.get("withFiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            body.get("withRenotes")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        ),
+    )
+    .await
+}
+
+/// `POST /api/notes/local-timeline` (guest ok): public local notes.
+pub(crate) async fn notes_local_timeline(
+    state: &crate::api::AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let me_id: Option<String> = require_checked_user(pool, token, false).await.ok();
+    run_list(
+        state,
+        pool,
+        mk_db::note::local_timeline_notes(
+            pool,
+            me_id.as_deref(),
+            opt_id(body, "sinceId"),
+            opt_id(body, "untilId"),
+            opt_i(body, "limit", 10).clamp(1, 100),
+            body.get("withFiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            body.get("withReplies")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        ),
+    )
+    .await
+}
+
+/// `POST /api/notes/hybrid-timeline` (requireCredential): social timeline.
+pub(crate) async fn notes_hybrid_timeline(
+    state: &crate::api::AppState,
+    body: &Value,
+    me_id: &str,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let followees = match mk_db::social::followee_ids(pool, me_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "followee_ids");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    };
+    run_list(
+        state,
+        pool,
+        mk_db::note::hybrid_timeline_notes(
+            pool,
+            me_id,
+            &followees,
+            opt_id(body, "sinceId"),
+            opt_id(body, "untilId"),
+            opt_i(body, "limit", 10).clamp(1, 100),
+            body.get("withFiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            body.get("withReplies")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        ),
+    )
+    .await
+}
+
+/// Shared list plumbing: fetch rows then pack each through the M1 pipeline.
+async fn run_list(
+    state: &crate::api::AppState,
+    pool: &mk_db::sqlx::PgPool,
+    rows: Result<Vec<mk_db::note::NoteRow>, mk_db::sqlx::Error>,
+) -> Response {
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "timeline query");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match pack_note_row_social(state, pool, row).await {
+            Ok(v) => out.push(v),
+            Err(resp) => return *resp,
+        }
+    }
+    (axum::http::StatusCode::OK, axum::Json(json!(out))).into_response()
+}
+
+async fn pack_note_row_social(
+    state: &crate::api::AppState,
+    pool: &mk_db::sqlx::PgPool,
+    row: &mk_db::note::NoteRow,
+) -> Result<Value, Box<Response>> {
+    let user_lite = super::note_user_lite(state, pool, &row.user_id)
+        .await
+        .map_err(Box::new)?;
+    let created_at = mk_types::id::parse_aid_date(&row.id)
+        .map(mk_core::services::signup::ms_to_iso)
+        .unwrap_or_default();
+    let emojis = json!({});
+    Ok(mk_core::packers::note::note_pack_min(
+        row,
+        user_lite,
+        created_at,
+        &row.mentions,
+        &row.tags,
+        emojis,
+    ))
+}
+
+fn opt_id<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key).and_then(|v| v.as_str())
+}
+
+fn opt_i(body: &Value, key: &str, dflt: i64) -> i64 {
+    body.get(key).and_then(|v| v.as_i64()).unwrap_or(dflt)
+}
+
+/// `POST /api/notes/reactions` — reaction list for one note.
+pub(crate) async fn notes_reactions(state: &crate::api::AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let Some(note_id) = opt_id(body, "noteId") else {
+        return crate::api::api_err(crate::api::ApiError::invalid_param(
+            json!({ "param": "noteId", "reason": "required" }),
+        ));
+    };
+    let rows = mk_db::note::list_note_reactions(
+        pool,
+        note_id,
+        body.get("type").and_then(|v| v.as_str()),
+        opt_id(body, "sinceId"),
+        opt_id(body, "untilId"),
+        opt_i(body, "limit", 10).clamp(1, 100),
+    )
+    .await;
+    match rows {
+        Ok(r) => {
+            let out: Vec<Value> = r
+                .iter()
+                .map(|n| {
+                    json!({
+                        "id": n.id,
+                        "type": n.reaction,
+                        "createdAt": mk_types::id::parse_aid_date(&n.id)
+                            .map(mk_core::services::signup::ms_to_iso)
+                            .unwrap_or_default(),
+                        "noteId": note_id,
+                        "userId": n.user_id,
+                    })
+                })
+                .collect();
+            (axum::http::StatusCode::OK, axum::Json(json!(out))).into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "list_note_reactions");
+            crate::api::api_err(crate::api::ApiError::internal_error())
+        }
+    }
+}
+
+/// `POST /api/notes/reactions/create` — toggle-my-reaction semantics
+/// (NoteReactionService: existing mine → delete, else create; jsonb map bump).
+pub(crate) async fn notes_reactions_create(
+    state: &crate::api::AppState,
+    body: &Value,
+    me_id: &str,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let Some(note_id) = opt_id(body, "noteId") else {
+        return crate::api::api_err(crate::api::ApiError::invalid_param(
+            json!({ "param": "noteId", "reason": "required" }),
+        ));
+    };
+    let Some(reaction) = opt_id(body, "reaction") else {
+        return crate::api::api_err(crate::api::ApiError::invalid_param(
+            json!({ "param": "reaction", "reason": "required" }),
+        ));
+    };
+    match mk_db::note::find_note_reaction(pool, note_id, me_id).await {
+        Ok(Some(_mine)) => {
+            if let Err(e) = mk_db::note::delete_note_reaction(pool, note_id, me_id).await {
+                tracing::error!(target: "dbg_notes", error = %e, "delete_note_reaction");
+                return crate::api::api_err(crate::api::ApiError::internal_error());
+            }
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, reaction, -1).await {
+                tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
+            }
+        }
+        Ok(None) => {
+            if let Err(e) = mk_db::note::insert_note_reaction(pool, me_id, note_id, reaction).await
+            {
+                tracing::error!(target: "dbg_notes", error = %e, "insert_note_reaction");
+                return crate::api::api_err(crate::api::ApiError::internal_error());
+            }
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, reaction, 1).await {
+                tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
+            }
+            // reaction notification (notifiee = note author, local)
+            if let Ok(Some(note)) = mk_db::note::find_note_by_id(pool, note_id).await {
+                notify_note_event(pool, &note.user_id, me_id, "reaction", note_id).await;
+            }
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "find_note_reaction");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    }
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/notes/delete` — author-only delete (upstream 403 on others).
+pub(crate) async fn notes_delete(
+    state: &crate::api::AppState,
+    body: &Value,
+    me_id: &str,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let Some(note_id) = opt_id(body, "noteId") else {
+        return crate::api::api_err(crate::api::ApiError::invalid_param(
+            json!({ "param": "noteId", "reason": "required" }),
+        ));
+    };
+    match mk_db::note::delete_note(pool, note_id, me_id).await {
+        Ok(1) => {
+            if let Err(e) = mk_db::note::dec_note_count(pool, me_id).await {
+                tracing::error!(target: "dbg_notes", error = %e, "dec_note_count");
+            }
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(_) => crate::api::api_err(crate::api::ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_NOTE",
+            "24fcbfc6-2e37-42b6-8388-c29b3861a08d",
+            "No such note.",
+        )),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "delete_note");
+            crate::api::api_err(crate::api::ApiError::internal_error())
+        }
+    }
+}
+
+/// token → me (requireCredential chain) for the note-agent timeline pair.
+pub(crate) async fn timeline_or_hybrid(
+    state: &AppState,
+    name: &str,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_checked_user(pool, token, true).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if name == "notes/timeline" {
+        notes_timeline(state, body, &me_id).await
+    } else {
+        notes_hybrid_timeline(state, body, &me_id).await
+    }
+}
+
+/// Credential gate for simple (me, body) note endpoints.
+pub(crate) async fn credential_gate<F, Fut>(
+    state: &AppState,
+    body: &Value,
+    token: Option<&str>,
+    handler: F,
+) -> Response
+where
+    F: FnOnce(&AppState, &Value, &str) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_checked_user(pool, token, true).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    handler(state, body, &me_id).await
 }

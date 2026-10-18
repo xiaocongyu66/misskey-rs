@@ -1,6 +1,7 @@
 //! Services ported from `src/core/`.
 
 pub mod misc;
+pub mod note_pack;
 pub mod notification_pack;
 pub mod role;
 pub mod search_bridge;

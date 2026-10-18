@@ -53,6 +53,14 @@ pub async fn blocking_exists(
     Ok(n > 0)
 }
 
+/// `UserFollowingService.getFollowees(me)` — ids only, for the timeline union.
+pub async fn followee_ids(pool: &PgPool, follower_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "followeeId" FROM "following" WHERE "followerId" = $1"#)
+        .bind(follower_id)
+        .fetch_all(pool)
+        .await
+}
+
 /// `user.isBot` scalar (LocalUserRow does not carry it; reading a plain
 /// column, no join needed).
 pub async fn user_is_bot(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {

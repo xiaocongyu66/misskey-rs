@@ -75,6 +75,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         // -- notifications slice (M2): param line + arm kept at the END of
         // -- the dispatch group so co-agent rebases stay trivial
         || name == "notifications"
+        // note-agent: note domain (local-timeline guest-ok)
+        || name == "notes/timeline"
+        || name == "notes/local-timeline"
+        || name == "notes/hybrid-timeline"
+        || name == "notes/reactions"
+        || name == "notes/reactions/create"
+        || name == "notes/delete"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -118,6 +125,30 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return notifications_route(&state, &body, token).await;
         }
         // -- end notifications slice --
+
+        // note-agent arms
+        if name == "notes/local-timeline" {
+            return social::notes_local_timeline(&state, &body, token.as_deref()).await;
+        }
+        if name == "notes/timeline" || name == "notes/hybrid-timeline" {
+            return social::timeline_or_hybrid(&state, name.as_str(), &body, token.as_deref())
+                .await;
+        }
+        if name == "notes/reactions" {
+            return social::notes_reactions(&state, &body).await;
+        }
+        if name == "notes/reactions/create" {
+            return social::credential_gate(&state, &body, token.as_deref(), |s, b, me| {
+                social::notes_reactions_create(s, b, me)
+            })
+            .await;
+        }
+        if name == "notes/delete" {
+            return social::credential_gate(&state, &body, token.as_deref(), |s, b, me| {
+                social::notes_delete(s, b, me)
+            })
+            .await;
+        }
         return users_show(&state, &body, token).await;
     }
 
@@ -1503,6 +1534,28 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     }
     if let Err(e) = mk_db::note::credit_note_to_user(pool, &me_id, &hashtags).await {
         tracing::error!(target: "dbg_notes", error = %e, "credit_note_to_user");
+    }
+
+    // NoteCreateService non-AP notify branch for reply: the replied-to
+    // author (local, not self) gets a 'reply' notification when the target
+    // still exists.
+    if let Some(rid) = reply_id {
+        if let Ok(Some(target)) = mk_db::note::find_note_by_id(pool, rid).await {
+            social::notify_note_event(pool, &target.user_id, &me_id, "reply", &id).await;
+        }
+    }
+    // Mentions: every resolved local username distinct from the author.
+    for (username, host) in mk_core::services::misc::extract_mentions(text) {
+        if host.is_some() {
+            continue; // remote mentions need AP resolution — TODO(M4)
+        }
+        if let Ok(Some(target)) =
+            mk_db::user::find_local_user_by_username(pool, &username.to_lowercase()).await
+        {
+            if target.id != me_id {
+                social::notify_note_event(pool, &target.id, &me_id, "mention", &id).await;
+            }
+        }
     }
 
     let note = match pack_note(state, pool, &id).await {
