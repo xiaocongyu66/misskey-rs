@@ -22,13 +22,13 @@ pub mod drive_note;
 pub mod freq;
 // note-agent: meta row note-settings subset (sensitive/prohibited words +
 // the deeplAuthKey read the translate gate consumes)
-pub mod meta;
 pub mod memo;
+pub mod meta;
 pub mod note;
 pub mod notification;
 // note-agent: poll + poll_vote (notes/create poll param + notes/polls/vote)
-pub mod poll;
 pub mod pin;
+pub mod poll;
 pub mod relation;
 pub mod role;
 // gate-roles: minimal admin/roles/create + assign SQL support
