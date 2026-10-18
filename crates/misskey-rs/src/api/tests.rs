@@ -5250,6 +5250,16 @@ async fn timelines_matrix_home_local_hybrid() {
     // -- Home: followers-visibility REPLY-TARGET gate (endpoint noteFilter):
     //    the reply rides the withReplies push but the followers parent must
     //    be one I follow (or my own) ---------------------------------
+    // bob follows carol — the upstream fixture carries BOTH follows here
+    // (timelines.ts L222-225), because a non-follower cannot even reply to a
+    // followers note (NoteCreateService.fetchAndCreate L385 isVisibleForMe)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": c, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
     let n_carol_fol = note_post(
         &app,
         json!({ "text": "hi", "visibility": "followers", "i": ct }),
