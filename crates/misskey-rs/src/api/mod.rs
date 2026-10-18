@@ -149,7 +149,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return notes_create(&state, &body, token).await;
         }
         if name == "notes/show" {
-            return notes_show(&state, &body, token).await;
+            return notes_show(&state, &body, token.as_deref()).await;
         }
         if name == "users/search" {
             return users_search(&state, &body, token).await;
