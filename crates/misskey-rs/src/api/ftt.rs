@@ -30,6 +30,10 @@ use std::time::Duration;
 
 use crate::AppState;
 
+/// debug_lrange's bounded drain window (the QUIT-pipeline close is the
+/// primary terminator; this only defends a wedged socket).
+const BULK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One pipelined LPUSH batch. Fire-and-forget like upstream's `r.exec()`
 /// (whose individual replies are never inspected): encode, write, shutdown
 /// the write half, drop. Pipeline correctness is pinned by the tests.rs
@@ -69,8 +73,11 @@ pub(crate) async fn debug_lrange(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut conn = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
+    // QUIT rides the pipeline so redis answers LRANGE, then +OK, then CLOSES
+    // — a half-shutdown alone never makes the read loop terminate (redis
+    // serves more commands on the same connection until it is told to quit).
     let cmd = format!(
-        "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$1\r\n-1\r\n",
+        "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$1\r\n-1\r\n*1\r\n$4\r\nQUIT\r\n",
         key.len(),
         key
     );
@@ -79,13 +86,18 @@ pub(crate) async fn debug_lrange(
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    loop {
-        let n = conn.read(&mut chunk).await?;
-        if n == 0 {
-            break;
+    tokio::time::timeout(BULK_READ_TIMEOUT, async {
+        loop {
+            let n = conn.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
         }
-        buf.extend_from_slice(&chunk[..n]);
-    }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_or(Ok(())); // timeout → best-effort partial parse
     parse_resp_array(&buf)
 }
 
@@ -148,9 +160,11 @@ pub(crate) async fn push_to_tl(
         }
     };
     if !enable {
+        tracing::info!(target: "dbg_ftt", note = %note_id, "fanout: flag off, no push");
         return;
     }
     let Some(redis_cfg) = &state.config.redis else {
+        tracing::warn!(target: "dbg_ftt", "fanout: config.redis missing, cannot push");
         return;
     };
 
@@ -229,16 +243,18 @@ pub(crate) async fn push_to_tl(
     }
 
     if pushes.is_empty() {
+        tracing::info!(target: "dbg_ftt", note = %note_id, author = %author_id, "fanout: zero pushes");
         return;
     }
-    if let Err(e) =
-        tokio::time::timeout(Duration::from_millis(2000), push_all(redis_cfg, &pushes)).await
-    {
-        tracing::warn!(
-            target: "dbg_ftt",
-            error = %e,
-            pushes = pushes.len(),
-            "fanout lpush (best-effort)"
-        );
+    match tokio::time::timeout(Duration::from_millis(2000), push_all(redis_cfg, &pushes)).await {
+        Ok(Ok(())) => {
+            tracing::info!(target: "dbg_ftt", pushes = pushes.len(), note = %note_id, "fanout lpush ok");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "dbg_ftt", error = %e, pushes = pushes.len(), "fanout lpush io error (best-effort)");
+        }
+        Err(e) => {
+            tracing::warn!(target: "dbg_ftt", error = %e, pushes = pushes.len(), "fanout lpush timed out (best-effort)");
+        }
     }
 }
