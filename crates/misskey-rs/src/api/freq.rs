@@ -442,6 +442,25 @@ pub(crate) async fn update_meta(state: &AppState, body: &Value, token: Option<&s
         }
     }
 
+    // ftt2: the timelines.ts describe.each arms flip the fanout flag via
+    // admin/update-meta (timelines.ts L104) and the pushToTl gate reads the
+    // persisted meta back. update-meta paramDef carries
+    // enableFanoutTimeline as a non-nullable boolean → non-bool values are
+    // param-rejected; patch semantics: absent keys untouched.
+    let enable_fanout = match body.get("enableFanoutTimeline") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return super::invalid_param("enableFanoutTimeline", "must be a boolean");
+        }
+    };
+    if let Some(v) = enable_fanout {
+        if let Err(e) = mk_db::meta::update_meta_enable_fanout_timeline(pool, v).await {
+            tracing::error!(target: "dbg_freq", error = %e, "update_meta_enable_fanout_timeline");
+            return api_err(ApiError::internal_error());
+        }
+    }
+
     if let Some(pinned) = body.get("pinnedUsers") {
         let Some(arr) = pinned.as_array() else {
             return super::invalid_param("pinnedUsers", "expected an array of strings");

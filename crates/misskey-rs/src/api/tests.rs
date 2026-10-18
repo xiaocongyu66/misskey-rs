@@ -6905,3 +6905,82 @@ async fn tl_tail_remote_host_and_channel_renote_shapes() {
 
     let _ = pool;
 }
+
+// ===== ftt2: the FTT flag leg (timelines.ts L104 + L941-953) ================
+//
+// admin/update-meta persists enableFanoutTimeline (update-meta.ts paramDef
+// non-nullable boolean) and mk_db::meta reads it back for the pushToTl gate —
+// the e2e `FTT:` Redis probes ride this flag per describe.each arm (the
+// fanout:false leg asserts `exists == 0`, so the gate must persist false).
+// The Redis push itself is config-redis-gated (test_state carries redis:
+// None → no-op), so these asserts cover the meta plumbing that flips the
+// arms; the push semantics land with the e2e harness. (~4 asserts per the
+// ftt2 brief.)
+
+#[tokio::test]
+async fn ftt2_enable_fanout_timeline_meta_flag() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkftt2").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    // first signup of an instance is root (SignupService L160) — update-meta
+    // is requireAdministrator.
+    let root = signup(&app, &uname("f2r")).await;
+    let rt = root["token"].as_str().unwrap();
+
+    // off → persists (fanout:false arm, timelines.ts L104/L951)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": rt, "enableFanoutTimeline": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(
+        !mk_db::meta::enable_fanout_timeline(&pool).await.unwrap(),
+        "enableFanoutTimeline persists false"
+    );
+
+    // on → persists (fanout:true arm) — and non-bool rejects (paramDef type)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": rt, "enableFanoutTimeline": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(
+        mk_db::meta::enable_fanout_timeline(&pool).await.unwrap(),
+        "enableFanoutTimeline persists true"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": rt, "enableFanoutTimeline": "yes" }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "non-boolean flag → invalid param: {v}"
+    );
+
+    // patch semantics: a pinnedUsers-only update-meta leaves the flag alone
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": rt, "pinnedUsers": ["@root"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(
+        mk_db::meta::enable_fanout_timeline(&pool).await.unwrap(),
+        "absent key leaves the flag (partial patch)"
+    );
+
+    let _ = pool;
+}

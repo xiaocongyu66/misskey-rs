@@ -52,6 +52,10 @@ mod drive_note;
 // paths in mk-db/src/lists.rs (user_list / user_list_membership ship in the
 // 0001 baseline).
 mod lists;
+// ftt2: the FTT Redis push pipeline (NoteCreateService.pushToTl +
+// FanoutTimelineService.push; the timelines.ts `FTT:` probes read
+// `list:homeTimeline:*` Redis lists literally).
+mod ftt;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -3022,6 +3026,25 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     if let Err(e) = mk_db::note::credit_note_to_user(pool, &me_id, &hashtags).await {
         tracing::error!(target: "dbg_notes", error = %e, "credit_note_to_user");
     }
+
+    // ftt2: NoteCreateService.pushToTl (create() L779 — right after
+    // incNotesCountOfUser; body L1068) — the upstream `FTT:` probes read the
+    // `list:homeTimeline:*` Redis lists literally; the flag gate is
+    // meta."enableFanoutTimeline" (timelines.ts L104 arm switch). Best-effort:
+    // never fails the note creation.
+    ftt::push_to_tl(
+        state,
+        pool,
+        &id,
+        &me_id,
+        me_host.as_deref(),
+        &visibility,
+        &visible_user_ids,
+        reply.as_ref().map(|r| r.user_id.as_str()),
+        file_ids.len(),
+        channel_id.as_deref(),
+    )
+    .await;
 
     // NoteCreateService non-AP notify branch: reply → target author;
     // mentioned local users → 'mention' (gates live in the social helper).

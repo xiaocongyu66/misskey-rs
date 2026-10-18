@@ -67,6 +67,50 @@ pub async fn update_meta_word_lists(
     Ok(())
 }
 
+/// meta."enableFanoutTimeline" as the pushToTl gate reads it (ftt2 lane;
+/// timelines.ts L104 flips it per describe.each arm via admin/update-meta):
+/// absent row → schema/upstream default TRUE.
+pub async fn enable_fanout_timeline(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let v: Option<bool> = sqlx::query_scalar(
+        r#"SELECT "enableFanoutTimeline" FROM "meta" ORDER BY "id" DESC LIMIT 1"#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(v.unwrap_or(true))
+}
+
+/// admin/update-meta persist for the fanout flag (MetaService.update partial
+/// patch: the sentinel row is updated in place, or seeded on first write —
+/// same shape as update_meta_word_lists).
+pub async fn update_meta_enable_fanout_timeline(
+    pool: &PgPool,
+    enable: bool,
+) -> Result<(), sqlx::Error> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE "meta" SET "enableFanoutTimeline" = $1
+        WHERE "id" = (SELECT "id" FROM "meta" ORDER BY "id" DESC LIMIT 1)
+        "#,
+    )
+    .bind(enable)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO "meta" ("id", "enableFanoutTimeline") VALUES ('x', $1)
+            ON CONFLICT ("id") DO UPDATE SET "enableFanoutTimeline" = $1
+            "#,
+        )
+        .bind(enable)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
