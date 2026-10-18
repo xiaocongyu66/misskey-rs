@@ -485,7 +485,7 @@ mod tests {
         .expect("insert user");
     }
 
-    fn ch(id: &str, owner: &str) -> NewChannel<'_> {
+    fn ch<'a>(id: &'a str, owner: &'a str) -> NewChannel<'a> {
         NewChannel {
             id,
             user_id: owner,
