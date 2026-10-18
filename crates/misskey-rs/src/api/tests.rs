@@ -3242,10 +3242,11 @@ async fn frequently_replied_orders_and_gates() {
     }
 
     // top list: carol (weight 2/2) before bob (1/2), packed == users/show
+    // (both viewer views: alice token — relation block present on both sides)
     let (s, body) = post_json(
         app.clone(),
         "/api/users/get-frequently-replied-users",
-        json!({ "userId": a_id, "limit": 10 }),
+        json!({ "userId": a_id, "limit": 10, "i": a_token }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
