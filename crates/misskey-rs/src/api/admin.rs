@@ -671,7 +671,7 @@ async fn show_users(state: &AppState, body: &Value, token: Option<&str>) -> ApiR
         .map_err(db_err)?;
 
     let me_id = ctx.me.id.clone();
-    let packed = pack_search_rows(state, pool, rows, Some(me_id.as_str()))
+    let packed = pack_search_rows(state, pool, rows, Some(me_id.as_str()), true)
         .await
         .map_err(|r| *r)?;
     Ok((StatusCode::OK, Json(json!(packed))).into_response())

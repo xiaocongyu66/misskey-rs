@@ -218,13 +218,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
+        let headers = req.headers().clone();
         let body = match parse_json_body(req).await {
             Ok(b) => b,
             Err(resp) => return resp,
         };
         // These routes carry no shared token-extraction quirks: `i` body
         // field only (the e2e client sends `i`; Bearer handled for parity).
-        let headers = req.headers().clone();
         let token = extract_token(&body, &headers);
         return match name.as_str() {
             "i/pin" => i_pin(&state, &body, token).await,
@@ -1860,7 +1860,7 @@ async fn avatar_banner_op(
                 blurhash: file.blurhash.clone(),
             })
         }
-        Some(_) => Err(api_err(ApiError::invalid_param(json!({
+        _ => Err(api_err(ApiError::invalid_param(json!({
             "param": if is_avatar { "avatarId" } else { "bannerId" },
             "reason": "expected a string or null",
         })))),
