@@ -113,6 +113,14 @@ mod tests {
         // table is missing (42P01).
         let pool = crate::test_support::fresh_db("mkdb_drive_note").await;
         crate::run_migrations(&pool).await.unwrap();
+        // FK seed: drive_file.userId → user (the baseline schema carries the
+        // constraint; the channel/role test seed idiom).
+        sqlx::query(
+            r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ('u1', 'u1', 'u1')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             r#"INSERT INTO "drive_file" ("id","userId","md5","name","type","size","properties",
                                         "storedInternal","url","isSensitive")

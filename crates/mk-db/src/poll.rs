@@ -135,6 +135,24 @@ mod tests {
         // explicit migrations (the api-side fresh_pool contract).
         let pool = crate::test_support::fresh_db("mkdb_poll_roundtrip").await;
         crate::run_migrations(&pool).await.unwrap();
+        // FK seeds: poll.noteId → note(userId → user), poll_vote.userId → user
+        // (the baseline schema carries the constraints; the channel/role test
+        // seed idiom).
+        for uid in ["u1", "u2"] {
+            sqlx::query(
+                r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $1, $1)"#,
+            )
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ('n1', 'u1', 'public')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         insert_poll(
             &pool,
             "n1",
