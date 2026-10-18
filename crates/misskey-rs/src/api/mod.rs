@@ -2321,6 +2321,12 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
             thread_id: thread_id.as_deref(),
             mentions: &mention_names,
             hashtags: &hashtags,
+            cw: None,
+            file_ids: &[],
+            attached_file_types: &[],
+            visible_user_ids: &[],
+            has_poll: false,
+            local_only: false,
         },
     )
     .await

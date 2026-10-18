@@ -97,11 +97,11 @@ fn invalid_param(param: &str, reason: &str) -> Response {
     })))
 }
 
-fn opt_str(body: &Value, key: &str) -> Option<&str> {
+fn opt_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key).and_then(|v| v.as_str())
 }
 
-fn opt_id(body: &Value, key: &str) -> Option<&str> {
+fn opt_id<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key).and_then(|v| v.as_str())
 }
 
@@ -316,7 +316,7 @@ async fn create(
             let owned = mk_db::drive::find_drive_file(pool, bid)
                 .await
                 .map_err(|e| db_err("create find_drive_file", e))?
-                .filter(|f| f.user_id == me_id);
+                .filter(|f| f.user_id.as_deref() == Some(me_id));
             if owned.is_none() {
                 return Err(meta_err(
                     "NO_SUCH_FILE",
@@ -426,7 +426,7 @@ async fn update(
             let owned = mk_db::drive::find_drive_file(pool, bid)
                 .await
                 .map_err(|e| db_err("update find_drive_file", e))?
-                .filter(|f| f.user_id == me_id);
+                .filter(|f| f.user_id.as_deref() == Some(me_id));
             if owned.is_none() {
                 return Err(meta_err(
                     "NO_SUCH_FILE",
