@@ -136,9 +136,13 @@ pub async fn set_note_files(
 }
 
 /// `endpoints/drive/files/attached-notes.ts`: ids of notes whose
-/// `note.fileIds` array CONTAINS the file (`:file <@ note.fileIds` with
-/// param `[file.id]`), through `makePaginationQuery`: both bounds exclusive,
-/// sinceId-only → oldest-first ASC, otherwise newest-first DESC.
+/// `note.fileIds` array CONTAINS the file (upstream `:file <@ note.fileIds`
+/// with param `[file.id]` — for a single element equivalent to
+/// `$1 = ANY("fileIds")`, which is the shape used here: a scalar bind. The
+/// array literal binds as `text[]` while note.fileIds is `varchar[]`, and
+/// `varying[] @> text[]` has no Postgres operator — e2e-verified).
+/// `makePaginationQuery` paging: both bounds exclusive, sinceId-only →
+/// oldest-first ASC, otherwise newest-first DESC.
 pub async fn note_ids_attaching_file(
     pool: &PgPool,
     file_id: &str,
@@ -146,9 +150,9 @@ pub async fn note_ids_attaching_file(
     until_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let file_id_param = [file_id.to_string()];
-    let mut q = sqlx::QueryBuilder::new(r#"SELECT "id" FROM "note" WHERE "fileIds" @> "#);
-    q.push_bind(&file_id_param[..]);
+    let mut q = sqlx::QueryBuilder::new(r#"SELECT "id" FROM "note" WHERE "#);
+    q.push_bind(file_id);
+    q.push(r#" = ANY("fileIds")"#);
     if let Some(since) = since_id {
         q.push(r#" AND "id" > "#).push_bind(since);
     }
