@@ -89,16 +89,24 @@ pub async fn dec_note_count(pool: &PgPool, user_id: &str) -> Result<(), sqlx::Er
 }
 
 pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Error> {
+    // tl-remote: the denormalized `note.userHost` rides the insert the way
+    // NoteCreateService.ts insertNote writes `userHost: user.host` — the
+    // local/social timeline planes' `(visibility='public') AND (userHost
+    // IS NULL)` gates (timelines.ts L1172/L1747 リモートユーザーのノートが
+    // 含まれない + the Social TL 凍結(リモート) L2204 leg) read this column.
+    // Sub-select keeps the author host verbatim from the user row (same
+    // value the signup test-mode host legs store).
     sqlx::query(
         r#"
         INSERT INTO "note"
           ("id", "text", "userId", "replyId", "replyUserId", "replyUserHost", "threadId",
            "localOnly", "renoteCount", "repliesCount", "reactions", "visibility",
            "fileIds", "attachedFileTypes", "visibleUserIds", "mentions", "emojis",
-           "tags", "hasPoll", "pageCount", "cw", "channelId")
+           "tags", "hasPoll", "pageCount", "cw", "channelId", "userHost")
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, '{}'::jsonb,
                 $9::note_visibility_enum, $10, $11, $12, $13, '{}'::varchar[],
-                '{}'::varchar[], $14, 0, $15, $16)
+                '{}'::varchar[], $14, 0, $15, $16,
+                (SELECT "host" FROM "user" WHERE "id" = $3))
         "#,
     )
     .bind(n.id)

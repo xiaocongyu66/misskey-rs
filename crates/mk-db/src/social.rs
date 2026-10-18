@@ -392,15 +392,20 @@ pub async fn insert_renote_note(
     visibility: &str,
     local_only: bool,
 ) -> Result<(), sqlx::Error> {
+    // tl-remote: author host denormalization on the renote row too
+    // (insertNote `userHost: user.host`) — a remote author's renote must not
+    // ride the local planes' `userHost IS NULL` gates.
     sqlx::query(
         r#"
         INSERT INTO "note"
           ("id", "renoteId", "text", "userId", "renoteUserId", "renoteUserHost", "localOnly",
            "renoteCount", "repliesCount", "reactions", "visibility", "fileIds",
-           "attachedFileTypes", "visibleUserIds", "mentions", "emojis", "tags", "hasPoll", "pageCount")
+           "attachedFileTypes", "visibleUserIds", "mentions", "emojis", "tags", "hasPoll",
+           "pageCount", "userHost")
         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, '{}'::jsonb, $8::note_visibility_enum,
                 '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[],
-                '{}'::varchar[], '{}'::varchar[], FALSE, 0)
+                '{}'::varchar[], '{}'::varchar[], FALSE, 0,
+                (SELECT "host" FROM "user" WHERE "id" = $4))
         "#,
     )
     .bind(id)
