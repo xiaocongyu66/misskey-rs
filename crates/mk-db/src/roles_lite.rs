@@ -67,6 +67,7 @@ pub async fn create_role(
 /// `"updatedAt"` is fetched as SQL text (timestamptz::text) — the Role pack
 /// renders ISO strings; the handler reuses this only as a placeholder string
 /// the e2e consumers never datetime-parse.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RoleRow {
     pub id: String,
     pub name: String,

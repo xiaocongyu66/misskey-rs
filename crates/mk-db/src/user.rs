@@ -673,12 +673,12 @@ pub async fn search_users_by_username_and_host(
             (_, true) => {
                 r#"("updatedAt" IS NOT NULL AND "updatedAt" > now() - interval '30 days')"#
             }
-            ("following", false) | ("anonymous", false) => {
-                r#"("updatedAt" IS NULL OR "updatedAt" <= now() - interval '30 days')"#
-            }
             ("not-following", false) => {
                 r#"("updatedAt" IS NOT NULL AND "updatedAt" <= now() - interval '30 days')"#
             }
+            // following-inactive / anonymous-inactive (and any other kind):
+            // NULL updatedAt rows live in the inactive leg only for these.
+            _ => r#"("updatedAt" IS NULL OR "updatedAt" <= now() - interval '30 days')"#,
         };
         let mut where_ = format!(r#""isSuspended" = FALSE AND ({gate})"#);
         if let Some(p) = &pattern {
