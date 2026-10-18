@@ -274,7 +274,7 @@ pub(crate) async fn push_to_tl(
     }
     match tokio::time::timeout(Duration::from_millis(2000), push_all(redis_cfg, &pushes)).await {
         Ok(Ok(())) => {
-            tracing::info!(target: "dbg_ftt", pushes = pushes.len(), note = %note_id, "fanout lpush ok");
+            tracing::info!(target: "dbg_ftt", pushes = %serde_json::to_string(&pushes).unwrap_or_default(), note = %note_id, author = %author_id, "fanout lpush ok");
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "dbg_ftt", error = %e, pushes = pushes.len(), "fanout lpush io error (best-effort)");
