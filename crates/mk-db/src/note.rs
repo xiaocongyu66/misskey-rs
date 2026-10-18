@@ -172,11 +172,15 @@ pub struct NoteRow {
 }
 
 /// Author-host scalar (mention fallback `m.host ?? user.host`).
+/// Local users carry `host = NULL` — the scalar MUST decode as an Option
+/// (query_scalar + fetch_optional otherwise type-params the scalar as plain
+/// `String` and 500s every local-note creation; e2e-verified on drive.ts).
 pub async fn user_host_of(pool: &PgPool, user_id: &str) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
+    sqlx::query_scalar::<_, Option<String>>(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
         .bind(user_id)
         .fetch_optional(pool)
         .await
+        .map(|rows| rows.flatten())
 }
 
 pub async fn find_note_by_id(pool: &PgPool, id: &str) -> Result<Option<NoteRow>, sqlx::Error> {
