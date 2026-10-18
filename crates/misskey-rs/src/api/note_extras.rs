@@ -348,9 +348,13 @@ async fn translate(state: &AppState, body: &Value, token: Option<&str>) -> Respo
     )
 }
 
-/// Arm pick: the update-meta request carries one of the note-word keys.
+/// Arm pick: the update-meta request carries one of the keys the note-side
+/// lanes persist (word lists + the FTT flag, whose write arm lives in
+/// freq::update_meta — admin.rs update-meta has no fanout branch).
 pub(crate) fn takes_update_meta(body: &Value) -> bool {
-    body.get("sensitiveWords").is_some() || body.get("prohibitedWords").is_some()
+    body.get("sensitiveWords").is_some()
+        || body.get("prohibitedWords").is_some()
+        || body.get("enableFanoutTimeline").is_some()
 }
 
 /// `POST /api/admin/update-meta` — the word-list patch
