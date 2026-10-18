@@ -2606,3 +2606,268 @@ async fn admin_meta_server_info_stats() {
         json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
     );
 }
+
+// --- freq-agent: users/get-frequently-replied-users + pinned-users slice ---
+
+#[tokio::test]
+async fn frequently_replied_orders_and_gates() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("freq_replied").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let alice = signup(&app, "fqa").await;
+    let a_token = alice["token"].as_str().unwrap();
+    let a_id = alice["id"].as_str().unwrap();
+    let bob = signup(&app, "fqb").await;
+    let b_token = bob["token"].as_str().unwrap();
+    let b_id = bob["id"].as_str().unwrap();
+    let carol = signup(&app, "fqc").await;
+    let c_token = carol["token"].as_str().unwrap();
+    let c_id = carol["id"].as_str().unwrap();
+    let dave = signup(&app, "fqd").await;
+    let d_token = dave["token"].as_str().unwrap();
+    let mallory = signup(&app, "fqm").await;
+    let m_token = mallory["token"].as_str().unwrap();
+    let m_id = mallory["id"].as_str().unwrap();
+
+    // targets post one note each
+    let note_of = |body: Value| body["createdNote"]["id"].as_str().unwrap().to_string();
+    let (_, nb) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "b", "i": b_token }),
+    )
+    .await;
+    assert!(nb["createdNote"]["id"].is_string(), "body: {nb}");
+    let b1 = note_of(nb);
+    let (_, nc) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "c", "i": c_token }),
+    )
+    .await;
+    let c1 = note_of(nc);
+    let (_, nd) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "d", "i": d_token }),
+    )
+    .await;
+    let d1 = note_of(nd);
+    let (_, nm) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "m", "i": m_token }),
+    )
+    .await;
+    let m1 = note_of(nm);
+
+    // alice: 1 reply to bob, 2 to carol
+    for target in [&b1, &c1, &c1] {
+        let (s, body) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": "re", "replyId": target, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {body}");
+    }
+
+    // top list: carol (weight 2/3) before bob (1/3), packed == users/show
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": a_id, "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "body: {body}");
+    assert_eq!(arr[0]["user"]["id"], json!(c_id));
+    assert_eq!(arr[1]["user"]["id"], json!(b_id));
+    assert_eq!(arr[0]["weight"], json!(2.0 / 3.0), "body: {body}");
+    assert_eq!(arr[1]["weight"], json!(1.0 / 3.0), "body: {body}");
+    let (_, show_carol) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": c_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(arr[0]["user"], show_carol, "pack must equal users/show");
+
+    // limit=1
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": a_id, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 1, "body: {body}");
+
+    // requireCredential: false — guest request works
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": a_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "body: {body}");
+
+    // a user who never replied gets an empty list
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": b_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!([]), "body: {body}");
+
+    // unknown target → NO_SUCH_USER (endpoint-specific id)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": "zzzzzzzzzzzzzzzz" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("e6965129-7b2a-40a4-bae2-cd84cd434822")
+    );
+
+    // emergent block gate: dave blocks alice → excluded from her list even
+    // though this server still accepted the reply at creation time;
+    // mallory (blocked BY alice) stays included
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({ "userId": a_id, "i": d_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({ "userId": m_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    for target in [&d1, &m1] {
+        let (s, body) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": "re2", "replyId": target, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {body}");
+    }
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/users/get-frequently-replied-users",
+        json!({ "userId": a_id, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["user"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&dave["id"].as_str().unwrap()),
+        "blocker of the target must be excluded: {body}"
+    );
+    assert!(
+        ids.contains(&mallory["id"].as_str().unwrap()),
+        "blocked-by-me must stay included: {body}"
+    );
+
+    // users/notes requisite: guest fetch of a user's notes (id DESC)
+    let (s, body) = post_json(app.clone(), "/api/users/notes", json!({ "userId": b_id })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let notes = body.as_array().unwrap();
+    assert_eq!(notes.len(), 1, "body: {body}");
+    assert_eq!(notes[0]["id"], json!(b1));
+    assert_eq!(notes[0]["userId"], json!(b_id));
+}
+
+#[tokio::test]
+async fn pinned_users_lists_meta_accts() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("freq_pinned").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap();
+    let bob = signup(&app, "fpb").await;
+    let b_id = bob["id"].as_str().unwrap();
+    let carol = signup(&app, "fpc").await;
+    let c_id = carol["id"].as_str().unwrap();
+    let plain = signup(&app, "fpplain").await;
+    let plain_token = plain["token"].as_str().unwrap();
+
+    // requireAdministrator: plain caller → ROLE_PERMISSION_DENIED (admin gate)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "pinnedUsers": ["fpb"], "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61")
+    );
+
+    // root pins [fpb, @fpc, ghost] → resolved in order, unknown acct skipped
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({
+            "pinnedUsers": [bob["username"], format!("@{}", carol["username"].as_str().unwrap()), "ghostnothere"],
+            "i": root_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    let (s, body) = post_json(app.clone(), "/api/pinned-users", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(b_id));
+    assert_eq!(arr[1]["id"], json!(c_id));
+    // pack identical to users/show
+    let (_, show_bob) = post_json(app.clone(), "/api/users/show", json!({ "userId": b_id })).await;
+    assert_eq!(arr[0], show_bob, "pack must equal users/show");
+
+    // update path: re-pin with only @fpc (row now exists → UPDATE branch)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "pinnedUsers": ["@fpc"], "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(app.clone(), "/api/pinned-users", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(c_id));
+
+    // requireCredential: false — guest works
+    let (s, _) = post_json(app.clone(), "/api/pinned-users", json!({})).await;
+    assert_eq!(s, StatusCode::OK);
+}

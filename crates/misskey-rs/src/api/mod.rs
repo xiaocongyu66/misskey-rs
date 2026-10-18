@@ -16,6 +16,10 @@ use crate::AppState;
 
 // social-agent: follow/mute/block/renote social actions (M2 truthful slice)
 mod social;
+// freq-agent: users/get-frequently-replied-users + pinned-users (users.ts
+// census slice) — db paths in mk-db/src/freq.rs; the users/notes guest path
+// and the admin/update-meta pinnedUsers slice ride along as requisites.
+mod freq;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -82,6 +86,12 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/reactions"
         || name == "notes/reactions/create"
         || name == "notes/delete"
+        // freq-agent: users/get-frequently-replied-users slice + requisites
+        // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
+        || name == "users/get-frequently-replied-users"
+        || name == "pinned-users"
+        || name == "users/notes"
+        || name == "admin/update-meta"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -145,6 +155,20 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
                 token.as_deref(),
             )
             .await;
+        }
+        // freq-agent arms: users/get-frequently-replied-users slice; the
+        // admin/update-meta arm shadows the admin/* arm below for that name.
+        if name == "users/get-frequently-replied-users" {
+            return freq::frequently_replied(&state, &body, token.as_deref()).await;
+        }
+        if name == "pinned-users" {
+            return freq::pinned_users(&state, token.as_deref()).await;
+        }
+        if name == "users/notes" {
+            return freq::user_notes(&state, &body, token.as_deref()).await;
+        }
+        if name == "admin/update-meta" {
+            return freq::update_meta(&state, &body, token.as_deref()).await;
         }
         return users_show(&state, &body, token).await;
     }

@@ -7,6 +7,8 @@ use sqlx::PgPool;
 pub use sqlx;
 
 pub mod admin;
+// freq-agent: users/get-frequently-replied-users + pinned-users db paths
+pub mod freq;
 pub mod note;
 pub mod notification;
 pub mod relation;
