@@ -136,7 +136,8 @@ pub(crate) mod streaming {
 
         // Recv loop: parse client frames; only `connect` matters here.
         while let Some(Ok(msg)) = source.next().await {
-            // (parens: a block-like scrutinee in a let-else needs them)
+            // (parens: a block-like scrutinee in a let-else needs them — no
+            // trailing comma, or the parens make a tuple)
             let Value::Object(obj) = (match msg {
                 Message::Text(t) => serde_json::from_str(t.as_str()).unwrap_or(Value::Null),
                 Message::Close(_) => break,
@@ -536,13 +537,13 @@ async fn files_upload_from_url(state: &AppState, body: &Value, token: Option<Str
         .get("comment")
         .and_then(Value::as_str)
         .map(|s| s.chars().take(512).collect::<String>());
-    let force = body.get("force").and_then(Value::as_bool) == Some(true);
+    // force has no same-hash dedupe to bypass (TODO(M4): md5 dedupe when the
+    // byte store lands) so the flag stays param-parity only.
+    let _force = body.get("force").and_then(Value::as_bool);
     let folder_id = body
         .get("folderId")
         .and_then(Value::as_str)
         .map(String::from);
-    // force has no same-hash dedupe to bypass (TODO(M4): md5 dedupe when the
-    // byte store lands) — parsed for param parity.
 
     let pool = pool.clone();
     let instance_url = state.config.url.clone();
