@@ -102,9 +102,17 @@ pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
     o.insert("userId".into(), json!(row.user_id));
     o.insert("user".into(), parts.user_lite.clone());
     o.insert("text".into(), json!(row.text));
-    o.insert("cw".into(), json!(row.cw));
-    o.insert("replyId".into(), json!(row.reply_id));
-    o.insert("renoteId".into(), json!(row.renote_id));
+    // upstream pack: optional fields are ABSENT when unset (e2e exact-field
+    // sets) — cw/replyId/renoteId/channelId only when set.
+    if let Some(cw) = &row.cw {
+        o.insert("cw".into(), json!(cw));
+    }
+    if let Some(reply_id) = &row.reply_id {
+        o.insert("replyId".into(), json!(reply_id));
+    }
+    if let Some(renote_id) = &row.renote_id {
+        o.insert("renoteId".into(), json!(renote_id));
+    }
     o.insert(
         "visibility".into(),
         json!(match row.visibility.as_str() {
@@ -153,10 +161,16 @@ pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
     if let Some(url) = &row.url {
         o.insert("url".into(), json!(url));
     }
-    // channel: absent (no channel rows produced by this server slice).
+    // channelId only when set (channels-agent: notes/create { channelId }
+    // arena; upstream `...(note.channelId != null ? { channelId } : {})`).
+    if let Some(channel_id) = &row.channel_id {
+        o.insert("channelId".into(), json!(channel_id));
+    }
     // Detail block (`opts.detail`):
     if parts.detail {
-        o.insert("clippedCount".into(), json!(row.clipped_count));
+        if row.clipped_count > 0 {
+            o.insert("clippedCount".into(), json!(row.clipped_count));
+        }
         if let Some(reply) = &parts.reply {
             o.insert("reply".into(), reply.clone());
         }
