@@ -76,7 +76,10 @@ mod tests {
         if std::env::var("DATABASE_URL").is_err() {
             return;
         }
+        // fresh_db only provisions the database; the meta table rides the
+        // explicit migrations (the api-side fresh_pool contract).
         let pool = crate::test_support::fresh_db("mkdb_meta_words").await;
+        crate::run_migrations(&pool).await.unwrap();
         let (s, p, d) = note_content_moderation_words(&pool).await.unwrap();
         assert!(s.is_empty() && p.is_empty() && d.is_none());
 

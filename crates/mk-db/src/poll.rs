@@ -131,7 +131,10 @@ mod tests {
         if std::env::var("DATABASE_URL").is_err() {
             return;
         }
+        // fresh_db only provisions the database; the poll table rides the
+        // explicit migrations (the api-side fresh_pool contract).
         let pool = crate::test_support::fresh_db("mkdb_poll_roundtrip").await;
+        crate::run_migrations(&pool).await.unwrap();
         insert_poll(
             &pool,
             "n1",

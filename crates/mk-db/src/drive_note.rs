@@ -108,7 +108,11 @@ mod tests {
         if std::env::var("DATABASE_URL").is_err() {
             return;
         }
+        // fresh_db only provisions the database — migrations ride explicitly
+        // (the api-side fresh_pool contract); without them the drive_file
+        // table is missing (42P01).
         let pool = crate::test_support::fresh_db("mkdb_drive_note").await;
+        crate::run_migrations(&pool).await.unwrap();
         sqlx::query(
             r#"INSERT INTO "drive_file" ("id","userId","md5","name","type","size","properties",
                                         "storedInternal","url","isSensitive")
