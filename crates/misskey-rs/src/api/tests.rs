@@ -3220,8 +3220,17 @@ async fn frequently_replied_orders_and_gates() {
     .await;
     let m1 = note_of(nm);
 
-    // alice: 1 reply to bob, 2 to carol
-    for target in [&b1, &c1, &c1] {
+    // alice: 1 reply to a bob note, 2 to distinct carol notes. Upstream
+    // counts DISTINCT reply-target notes per author (`note.id IN (...)`
+    // row semantics), so the two carol replies must hit different notes.
+    let (_, nc2) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "c2", "i": c_token }),
+    )
+    .await;
+    let c2 = note_of(nc2);
+    for target in [&b1, &c1, &c2] {
         let (s, body) = post_json(
             app.clone(),
             "/api/notes/create",
@@ -3231,7 +3240,7 @@ async fn frequently_replied_orders_and_gates() {
         assert_eq!(s, StatusCode::OK, "body: {body}");
     }
 
-    // top list: carol (weight 2/3) before bob (1/3), packed == users/show
+    // top list: carol (weight 2/2) before bob (1/2), packed == users/show
     let (s, body) = post_json(
         app.clone(),
         "/api/users/get-frequently-replied-users",
@@ -3243,8 +3252,8 @@ async fn frequently_replied_orders_and_gates() {
     assert_eq!(arr.len(), 2, "body: {body}");
     assert_eq!(arr[0]["user"]["id"], json!(c_id));
     assert_eq!(arr[1]["user"]["id"], json!(b_id));
-    assert_eq!(arr[0]["weight"], json!(2.0 / 3.0), "body: {body}");
-    assert_eq!(arr[1]["weight"], json!(1.0 / 3.0), "body: {body}");
+    assert_eq!(arr[0]["weight"], json!(1.0), "body: {body}");
+    assert_eq!(arr[1]["weight"], json!(0.5), "body: {body}");
     let (_, show_carol) = post_json(
         app.clone(),
         "/api/users/show",

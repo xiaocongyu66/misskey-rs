@@ -52,6 +52,11 @@ const TARGET_BLOCKER_GATE: &str = r#" AND {alias}."userId" NOT IN (
 /// users/get-frequently-replied-users projection: reply-target author counts
 /// over the target user's recent replies, sorted by count DESC with stable
 /// ties (first-appearance order, like the upstream object-key sort).
+///
+/// Counting unit: DISTINCT reply-target notes per author — upstream scans
+/// `note.id IN (:replyIds)` rows (one row per existing target note), so two
+/// replies hitting one note count once. step 2 below returns each target
+/// note once, preserving that semantics.
 pub async fn frequent_replied_counts(
     pool: &PgPool,
     target: &str,
