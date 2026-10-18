@@ -178,3 +178,51 @@ pub async fn count_assignments(pool: &PgPool, role_id: &str) -> Result<i64, sqlx
     .fetch_one(pool)
     .await
 }
+
+/// `RoleService.unassign` (L614-634): only a LIVE assignment counts — an
+/// expired row is swept but reports NotAssigned (Ok(false)); the live row is
+/// deleted by (roleId, userId) and the role's lastUsedAt touched.
+pub async fn unassign_role(
+    pool: &PgPool,
+    user_id: &str,
+    role_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let expired: Option<bool> = sqlx::query_scalar(
+        r#"SELECT ("expiresAt" IS NOT NULL AND "expiresAt" <= now()) FROM "role_assignment"
+           WHERE "roleId" = $1 AND "userId" = $2"#,
+    )
+    .bind(role_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(expired) = expired else {
+        tx.rollback().await.ok();
+        return Ok(false);
+    };
+    sqlx::query(r#"DELETE FROM "role_assignment" WHERE "roleId" = $1 AND "userId" = $2"#)
+        .bind(role_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(r#"UPDATE "role" SET "lastUsedAt" = now() WHERE "id" = $1"#)
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(!expired)
+}
+
+/// `RoleService.delete` (L722-724): the role row goes; the baseline schema
+/// carries no FK on role_assignment, so the assignments sweep explicitly.
+pub async fn delete_role(pool: &PgPool, role_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "role_assignment" WHERE "roleId" = $1"#)
+        .bind(role_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(r#"DELETE FROM "role" WHERE "id" = $1"#)
+        .bind(role_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

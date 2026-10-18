@@ -17,7 +17,10 @@ use crate::error::{ApiError, api_err};
 type ApiResult = Result<Response, Response>;
 
 pub(super) fn handles(name: &str) -> bool {
-    matches!(name, "admin/roles/create" | "admin/roles/assign")
+    matches!(
+        name,
+        "admin/roles/create" | "admin/roles/assign" | "admin/roles/unassign" | "admin/roles/delete"
+    )
 }
 
 /// Entry from the `// gate-roles` dispatch arm in mod.rs (body pre-parsed,
@@ -30,7 +33,9 @@ pub(super) async fn handle(
 ) -> Response {
     let result: ApiResult = match name {
         "admin/roles/create" => create(state, body, token.as_deref()).await,
-        _ => assign(state, body, token.as_deref()).await,
+        "admin/roles/assign" => assign(state, body, token.as_deref()).await,
+        "admin/roles/unassign" => unassign(state, body, token.as_deref()).await,
+        _ => delete_role(state, body, token.as_deref()).await,
     };
     match result {
         Ok(resp) => resp,
@@ -352,5 +357,104 @@ async fn assign(state: &AppState, body: &Value, token: Option<&str>) -> ApiResul
         return Err(api_err(ApiError::internal_error()));
     }
     // Void result → ApiCallService.send answers 204.
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/admin/roles/unassign` (upstream unassign.ts: role lookup →
+/// canEditMembersByModerator/isAdministrator → user lookup →
+/// RoleService.unassign; NotAssignedError is private → the 500 shape).
+async fn unassign(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, true).await?;
+    let Some(pool) = &state.pool else {
+        return Err(api_err(ApiError::internal_error()));
+    };
+    let Some(role_id) = body.get("roleId").and_then(|v| v.as_str()) else {
+        return Err(api_err(ApiError::invalid_param(json!({
+            "param": "roleId",
+            "reason": "required",
+        }))));
+    };
+    let Some(user_id) = body.get("userId").and_then(|v| v.as_str()) else {
+        return Err(api_err(ApiError::invalid_param(json!({
+            "param": "userId",
+            "reason": "required",
+        }))));
+    };
+    let role = mk_db::roles_lite::find_role(pool, role_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "dbg_roles", error = %e, "find_role[unassign]");
+            api_err(ApiError::internal_error())
+        })?
+        .ok_or_else(no_such_role)?;
+    let meta_root = match mk_db::admin::root_user_id(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_roles", error = %e, "root_user_id[unassign]");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    };
+    let is_admin = ctx.me.username_lower == "root"
+        || meta_root.as_deref() == Some(ctx.me.id.as_str())
+        || {
+            let assigned = mk_db::role::user_assigned_roles(pool, &ctx.me.id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(target: "dbg_roles", error = %e, "user_assigned_roles[unassign]");
+                    api_err(ApiError::internal_error())
+                })?;
+            mk_core::services::role::has_administrator_role(&assigned)
+        };
+    if !role.can_edit_members_by_moderator && !is_admin {
+        return Err(access_denied());
+    }
+    match mk_db::user::find_user_by_id(pool, user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(no_such_user()),
+        Err(e) => {
+            tracing::error!(target: "dbg_roles", error = %e, "find_user_by_id[unassign]");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    }
+    let unassigned = {
+        match mk_db::roles_lite::unassign_role(pool, user_id, role_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(target: "dbg_roles", error = %e, "unassign_role");
+                return Err(api_err(ApiError::internal_error()));
+            }
+        }
+    };
+    if !unassigned {
+        // RoleService.NotAssignedError (private → 500 shape).
+        return Err(api_err(ApiError::internal_error()));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/admin/roles/delete` (upstream delete.ts: role lookup →
+/// RoleService.delete; void → 204).
+async fn delete_role(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, true).await?;
+    let Some(pool) = &state.pool else {
+        return Err(api_err(ApiError::internal_error()));
+    };
+    let Some(role_id) = body.get("roleId").and_then(|v| v.as_str()) else {
+        return Err(api_err(ApiError::invalid_param(json!({
+            "param": "roleId",
+            "reason": "required",
+        }))));
+    };
+    mk_db::roles_lite::find_role(pool, role_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "dbg_roles", error = %e, "find_role[delete]");
+            api_err(ApiError::internal_error())
+        })?
+        .ok_or_else(no_such_role)?;
+    if let Err(e) = mk_db::roles_lite::delete_role(pool, role_id).await {
+        tracing::error!(target: "dbg_roles", error = %e, "delete_role");
+        return Err(api_err(ApiError::internal_error()));
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
