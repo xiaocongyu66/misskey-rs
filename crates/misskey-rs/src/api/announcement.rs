@@ -339,6 +339,8 @@ fn pack_announcement(
 /// now)` — the archive queue's effect without a queue), autoArchiveAt as ISO
 /// string/null and the per-row reads count.
 fn pack_admin_row(row: mk_db::announcement::AnnouncementRow, reads: i64, now_ms: i64) -> Value {
+    // computed before the json! below starts moving fields out of the row
+    let is_active = mk_db::announcement::computed_is_active(&row, now_ms);
     let created_at = mk_types::id::parse_aid_date(&row.id)
         .map(mk_core::services::signup::ms_to_iso)
         .unwrap_or_default();
@@ -361,7 +363,7 @@ fn pack_admin_row(row: mk_db::announcement::AnnouncementRow, reads: i64, now_ms:
         "imageUrl": row.image_url,
         "icon": row.icon,
         "display": row.display,
-        "isActive": mk_db::announcement::computed_is_active(&row, now_ms),
+        "isActive": is_active,
         "autoArchiveAt": auto_archive_at,
         "forExistingUsers": row.for_existing_users,
         "silence": row.silence,
@@ -398,8 +400,10 @@ async fn announcements_list(
     .map_err(|e| db_err("list_public", e))?;
     let packed: Vec<Value> = rows
         .into_iter()
-        .map(|(row, _for_you, is_read)| {
+        .map(|r| {
             // isRead rides only with a me; guests still resolve forYou=false.
+            let is_read = r.is_read;
+            let row: mk_db::announcement::AnnouncementRow = r.into();
             let read = me_id.map(|_| is_read);
             pack_announcement(row, me_id, read)
         })
@@ -529,13 +533,14 @@ async fn admin_create(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> 
 
     // Fire-and-forget moderation log (moderator present). The personal
     // variant looks the target user up (`findOneByOrFail` — a miss is a 500
-    // after the insert, like upstream).
+    // after the insert, like upstream). Logged fields are clones — the row
+    // itself feeds the response pack below.
     let mut log_info = json!({
-        "announcementId": row.id,
+        "announcementId": row.id.clone(),
         "announcement": {
-            "id": row.id,
-            "title": row.title,
-            "text": row.text,
+            "id": row.id.clone(),
+            "title": row.title.clone(),
+            "text": row.text.clone(),
             "isActive": row.is_active,
         },
     });
@@ -602,7 +607,11 @@ async fn admin_list(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> Ch
     let _ = me_id; // the list is not me-scoped beyond the userId param
     let packed: Vec<Value> = rows
         .into_iter()
-        .map(|(row, reads)| pack_admin_row(row, reads, now))
+        .map(|r| {
+            let reads = r.reads;
+            let row: mk_db::announcement::AnnouncementRow = r.into();
+            pack_admin_row(row, reads, now)
+        })
         .collect();
     Ok(Json(packed).into_response())
 }
@@ -674,22 +683,21 @@ async fn admin_update(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> 
         .map_err(|e| db_err("find_by_id[updated]", e))?;
 
     // ModerationLogService.log (fire-and-forget), global vs user variant.
-    let compact = |tag: &str, r: &Option<mk_db::announcement::AnnouncementRow>| {
-        r.as_ref()
-            .map(|row| {
-                json!({
-                    "id": row.id,
-                    "isActive": row.is_active,
-                    "autoArchiveAt": row.auto_archive_at_ms,
-                    "stage": tag,
-                })
-            })
-            .unwrap_or(Value::Null)
+    // Everything borrows (the closure takes refs; ids clone) — nothing here
+    // partially moves `before` so the reads below stay whole-struct clean.
+    let compact = |tag: &str, r: Option<&mk_db::announcement::AnnouncementRow>| match r {
+        Some(row) => json!({
+            "id": row.id,
+            "isActive": row.is_active,
+            "autoArchiveAt": row.auto_archive_at_ms,
+            "stage": tag,
+        }),
+        None => Value::Null,
     };
     let mut log_info = json!({
-        "announcementId": before.id,
-        "before": compact("before", &Some(before.clone())),
-        "after": compact("after", &after),
+        "announcementId": before.id.clone(),
+        "before": compact("before", Some(&before)),
+        "after": compact("after", after.as_ref()),
     });
     if before.user_id.is_some() {
         log_info["userId"] = json!(before.user_id);
@@ -726,10 +734,10 @@ async fn admin_delete(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> 
         .map_err(|e| db_err("delete_announcement", e))?;
 
     let mut log_info = json!({
-        "announcementId": announcement.id,
+        "announcementId": announcement.id.clone(),
         "announcement": {
-            "id": announcement.id,
-            "title": announcement.title,
+            "id": announcement.id.clone(),
+            "title": announcement.title.clone(),
             "isActive": announcement.is_active,
         },
     });

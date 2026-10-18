@@ -41,6 +41,88 @@ pub struct AnnouncementRow {
     pub user_id: Option<String>,
 }
 
+/// `list_public` SELECT shape: the flat announcement columns plus the
+/// me-side flags. A struct rather than a tuple row because FromRow-derived
+/// structs do not implement `Decode` (the `(AnnouncementRow, bool, bool)`
+/// tuple shape needs exactly that).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PublicListRow {
+    pub id: String,
+    pub updated_at_ms: Option<i64>,
+    pub text: String,
+    pub title: String,
+    pub image_url: Option<String>,
+    pub icon: String,
+    pub display: String,
+    pub need_confirmation_to_read: bool,
+    pub is_active: bool,
+    pub auto_archive_at_ms: Option<i64>,
+    pub for_existing_users: bool,
+    pub silence: bool,
+    pub user_id: Option<String>,
+    pub for_you: bool,
+    pub is_read: bool,
+}
+
+impl From<PublicListRow> for AnnouncementRow {
+    fn from(r: PublicListRow) -> Self {
+        AnnouncementRow {
+            id: r.id,
+            updated_at_ms: r.updated_at_ms,
+            text: r.text,
+            title: r.title,
+            image_url: r.image_url,
+            icon: r.icon,
+            display: r.display,
+            need_confirmation_to_read: r.need_confirmation_to_read,
+            is_active: r.is_active,
+            auto_archive_at_ms: r.auto_archive_at_ms,
+            for_existing_users: r.for_existing_users,
+            silence: r.silence,
+            user_id: r.user_id,
+        }
+    }
+}
+
+/// `list_admin` SELECT shape: the flat announcement columns + the read count.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AdminListRow {
+    pub id: String,
+    pub updated_at_ms: Option<i64>,
+    pub text: String,
+    pub title: String,
+    pub image_url: Option<String>,
+    pub icon: String,
+    pub display: String,
+    pub need_confirmation_to_read: bool,
+    pub is_active: bool,
+    pub auto_archive_at_ms: Option<i64>,
+    pub for_existing_users: bool,
+    pub silence: bool,
+    pub user_id: Option<String>,
+    pub reads: i64,
+}
+
+impl From<AdminListRow> for AnnouncementRow {
+    fn from(r: AdminListRow) -> Self {
+        AnnouncementRow {
+            id: r.id,
+            updated_at_ms: r.updated_at_ms,
+            text: r.text,
+            title: r.title,
+            image_url: r.image_url,
+            icon: r.icon,
+            display: r.display,
+            need_confirmation_to_read: r.need_confirmation_to_read,
+            is_active: r.is_active,
+            auto_archive_at_ms: r.auto_archive_at_ms,
+            for_existing_users: r.for_existing_users,
+            silence: r.silence,
+            user_id: r.user_id,
+        }
+    }
+}
+
 /// The `createdAt` every announcement pack carries is the id's own timestamp
 /// (`idService.parse(announcement.id).date`) — join across crates is the
 /// caller's job; this is the first-registereds-user id probe used by the
@@ -121,9 +203,9 @@ pub async fn find_by_id(pool: &PgPool, id: &str) -> Result<Option<AnnouncementRo
 /// the global ones (upstream Brackets `userId = meId OR userId IS NULL`),
 /// the `isActive` switch driving the two archive-window halves (`isActive`
 /// default true: `isActive AND (autoArchiveAt IS NULL OR autoArchiveAt >
-/// now)`; false: the archived union). Returns `(row, forYou, isRead)`;
-/// `isRead`/`forYou` are only meaningful with a me (the pack omits both for
-/// guests, as upstream's `undefined` does in JSON).
+/// now)`; false: the archived union). Each row carries `(forYou, isRead)`;
+/// both are only meaningful with a me (the pack omits them for guests, as
+/// upstream's `undefined` does in JSON).
 ///
 /// Pagination mirrors QueryService.makePaginationQuery with ids already
 /// normalized (sinceDate/untilDate fold into since/until id boundaries at the
@@ -136,7 +218,7 @@ pub async fn list_public(
     until_id: Option<&str>,
     now_ms: i64,
     limit: i64,
-) -> Result<Vec<(AnnouncementRow, bool, bool)>, sqlx::Error> {
+) -> Result<Vec<PublicListRow>, sqlx::Error> {
     let me = me_id.unwrap_or("");
     // Upstream announcements.ts L60-71: the isActive switch drives two
     // different unions — actives keep the open archive window; "inactive" is
@@ -169,7 +251,7 @@ pub async fn list_public(
         },
         filter = filter,
     );
-    sqlx::query_as::<_, (AnnouncementRow, bool, bool)>(&sql)
+    sqlx::query_as::<_, PublicListRow>(&sql)
         .bind(now_ms)
         .bind(until_id)
         .bind(me)
@@ -194,7 +276,7 @@ pub async fn list_admin(
     until_id: Option<&str>,
     now_ms: i64,
     limit: i64,
-) -> Result<Vec<(AnnouncementRow, i64)>, sqlx::Error> {
+) -> Result<Vec<AdminListRow>, sqlx::Error> {
     let scope = match status {
         "archived" => {
             r#"(NOT a."isActive" OR (a."autoArchiveAt" IS NOT NULL
@@ -233,7 +315,7 @@ pub async fn list_admin(
         scope = scope,
         user_scope = user_scope,
     );
-    sqlx::query_as::<_, (AnnouncementRow, i64)>(&sql)
+    sqlx::query_as::<_, AdminListRow>(&sql)
         .bind(now_ms)
         .bind(user_id)
         .bind(until_id)
