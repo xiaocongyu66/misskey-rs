@@ -42,7 +42,7 @@ async fn push_all(
     cfg: &crate::config::RedisConfig,
     pushes: &[(String, String)],
 ) -> Result<(), std::io::Error> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut conn = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
     let mut cmd = String::new();
@@ -63,7 +63,7 @@ async fn push_all(
     conn.shutdown().await?;
     // ftt2 triage: prove exactly what hit the wire and what came back (an
     // unread `-ERR…` would otherwise vanish with the fire-and-forget drop).
-    let mut rbuf = Vec::new();
+    let mut rbuf: Vec<u8> = Vec::new();
     let mut rchunk = [0u8; 512];
     let _ = tokio::time::timeout(BULK_READ_TIMEOUT, async {
         loop {
