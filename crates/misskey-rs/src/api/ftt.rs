@@ -269,7 +269,7 @@ pub(crate) async fn push_to_tl(
     }
 
     if pushes.is_empty() {
-        tracing::info!(target: "dbg_ftt", note = %note_id, author = %author_id, "fanout: zero pushes");
+        tracing::info!(target: "dbg_ftt", note = %note_id, author = %author_id, author_host = ?author_host, visibility, visible = visible_user_ids.len(), channel_id = ?channel_id, "fanout: zero pushes AFTER legs");
         return;
     }
     match tokio::time::timeout(Duration::from_millis(2000), push_all(redis_cfg, &pushes)).await {
