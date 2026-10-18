@@ -5410,3 +5410,213 @@ async fn timelines_matrix_home_local_hybrid() {
     let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
     assert!(has(&res, &n_carol));
 }
+
+// tl-v3c: timelines.ts arena legs locked per stream type for the trio
+// (pinned upstream test/e2e/timelines.ts): the remote-user split (LTL
+// excludes; home/hybrid pick a followed remote user up), followers-only
+// and specified/visibleUserIds planes per stream, the withReplies DM-reply
+// drop, withRenotes=false pure-renote drop, and withFiles on the local
+// plane. Remote users/notes ride raw schema-default inserts because signup
+// is local-only (user_profile fetch_one'd by the pack pipeline).
+#[tokio::test]
+async fn timelines_tl_v3c_per_stream_legs() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktlv3c").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("v3a")).await;
+    let bob = signup(&app, &uname("v3b")).await;
+    let carol = signup(&app, &uname("v3c")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let c = carol["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    async fn fetch_tl(app: &axum::Router, name: &str, mut params: Value, token: &str) -> Value {
+        params["i"] = json!(token);
+        let (s, v) = post_json(app.clone(), &format!("/api/{name}"), params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    // -- remote fixture: a remote user's public + home notes raw-inserted --
+    // (token is character(16) and LocalUserRow decodes it non-Option — a
+    // tokenless row would break the note pack's find_user_by_id)
+    let rid = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "user" ("id", "username", "usernameLower", "host", "token")
+           VALUES ($1, 'remobo', 'remobo', 'remote.example', 'remotousertoken1')"#,
+    )
+    .bind(&rid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    mk_db::sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ($1)"#)
+        .bind(&rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remote_pub = mk_types::id::gen_aid_now();
+    let remote_home = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note" ("id", "userId", "text", "visibility", "userHost")
+           VALUES ($1, $2, 'remote pub', 'public', 'remote.example'),
+                  ($3, $2, 'remote home', 'home', 'remote.example')"#,
+    )
+    .bind(&remote_pub)
+    .bind(&rid)
+    .bind(&remote_home)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // リモートユーザーのノート: the local plane excludes remote rows even for
+    // a logged-in viewer, and the followee plane keeps unfollowed remotes out
+    let res = fetch_tl(&app, "notes/local-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &remote_pub));
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &remote_pub));
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &remote_pub));
+
+    // フォローしているリモートユーザー: after following the remote user, the
+    // home-visibility note rides the followee arm of home AND hybrid
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": rid, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &remote_pub), "remote pub must ride home");
+    assert!(has(&res, &remote_home), "remote home must ride home");
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &remote_home), "remote home must ride hybrid");
+
+    // -- followers-only per stream: bob's followers note rides home + hybrid
+    //    once followed, never the public-only local plane -----------------
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let n_bob_fol = note_post(
+        &app,
+        json!({ "text": "fol", "visibility": "followers", "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_fol));
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_fol));
+    let res = fetch_tl(&app, "notes/local-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_bob_fol));
+
+    // -- specified/visibleUserIds split: bob's DM to alice rides home +
+    //    hybrid (visibleUserIds arm), never local; unfollowed carol's DM
+    //    stays out of the followee planes --------------------------------
+    let n_bob_dm = note_post(
+        &app,
+        json!({ "text": "dm", "visibility": "specified", "visibleUserIds": [a], "i": bt }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_dm));
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_dm));
+    let res = fetch_tl(&app, "notes/local-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_bob_dm));
+    let n_carol_dm = note_post(
+        &app,
+        json!({ "text": "dmc", "visibility": "specified", "visibleUserIds": [a], "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_carol_dm));
+    let res = fetch_tl(&app, "notes/hybrid-timeline", json!({ "limit": 100 }), &at).await;
+    assert!(lacks(&res, &n_carol_dm));
+
+    // -- withReplies: true still drops a followee's DM REPLY to a third
+    //    party (the reply ride-along never lifts the specified VIS gate) --
+    let n_carol_note = note_post(
+        &app,
+        json!({ "text": "hi", "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    let n_bob_dm_reply = note_post(
+        &app,
+        json!({
+            "text": "dm reply", "replyId": n_carol_note,
+            "visibility": "specified", "visibleUserIds": [c], "i": bt
+        }),
+    )
+    .await;
+    let res = fetch_tl(
+        &app,
+        "notes/timeline",
+        json!({ "withReplies": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_dm_reply));
+    let res = fetch_tl(
+        &app,
+        "notes/hybrid-timeline",
+        json!({ "withReplies": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_dm_reply));
+
+    // -- withRenotes: false drops a followee's pure renote of a home note
+    //    (EXCLUDE_PURE_RENOTES ladder; default withRenotes keeps it) ------
+    let n_carol_home = note_post(
+        &app,
+        json!({ "text": "home", "visibility": "home", "i": carol["token"].as_str().unwrap() }),
+    )
+    .await;
+    let n_bob_renote = note_post(&app, json!({ "renoteId": n_carol_home, "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        "notes/timeline",
+        json!({ "withRenotes": false, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_renote));
+    let res = fetch_tl(&app, "notes/timeline", json!({ "limit": 100 }), &at).await;
+    assert!(has(&res, &n_bob_renote));
+
+    // -- withFiles: true on the local plane keeps file notes only ---------
+    let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
+    let n_bob_text = note_post(&app, json!({ "text": "txt", "i": bt })).await;
+    let n_bob_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let res = fetch_tl(
+        &app,
+        "notes/local-timeline",
+        json!({ "withFiles": true, "limit": 100 }),
+        &at,
+    )
+    .await;
+    assert!(lacks(&res, &n_bob_text));
+    assert!(has(&res, &n_bob_file));
+}
