@@ -15,7 +15,10 @@ use sqlx::PgPool;
 /// is the epoch-millisecond deadline (None → never expires).
 #[derive(Debug, sqlx::FromRow)]
 pub struct PollRow {
-    #[sqlx(rename = "noteId")]
+    // decodes from the `("noteId") AS "note_id"` alias below (NOTE_COLS
+    // convention); a `#[sqlx(rename = "noteId")]` here made every
+    // find_poll_by_note decode fail "no column found for name: noteId" —
+    // the 500 on pack of any poll-attached note.
     pub note_id: String,
     #[sqlx(rename = "expires_at_ms")]
     pub expires_at_ms: Option<i64>,
