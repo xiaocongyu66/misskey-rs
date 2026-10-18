@@ -4102,3 +4102,806 @@ async fn drive_attached_notes_roundtrip() {
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn announcements_auto_archive_cycle() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_ann_archive").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    // first signup = the SignupService rootUserId stroke-in proxy (the e2e
+    // `signup({ username: 'admin' })` gate for admin/announcements)
+    let admin = signup(&app, "admin").await;
+    let token = admin["token"].as_str().unwrap().to_string();
+
+    // create with a future autoArchiveAt (e2e test 1)
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({
+            "title": "Scheduled announcement",
+            "text": "Text",
+            "imageUrl": null,
+            "autoArchiveAt": now_ms() + 60_000,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let id = created["id"].as_str().unwrap().to_string();
+    // the entity pack carries neither autoArchiveAt nor isActive; the admin
+    // list shape does
+    assert!(created.get("autoArchiveAt").is_none());
+    assert!(created.get("isActive").is_none());
+
+    let (s, active) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "status": "active", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {active}");
+    let listed = active
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(id))
+        .unwrap()
+        .clone();
+    assert!(listed["autoArchiveAt"].is_string());
+    assert_eq!(listed["isActive"], json!(true));
+    assert_eq!(listed["reads"], json!(0));
+
+    // clearing autoArchiveAt (204) keeps it active with autoArchiveAt null
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/announcements/update",
+        json!({ "id": id, "autoArchiveAt": null, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, active) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "status": "active", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let cleared = active
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(id))
+        .unwrap()
+        .clone();
+    assert_eq!(cleared["autoArchiveAt"], Value::Null);
+
+    // a past autoArchiveAt archives it (update's INVALID check is < 0 only)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/announcements/update",
+        json!({ "id": id, "autoArchiveAt": now_ms() - 1_000, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, active) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "status": "active", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        !active
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(id))
+    );
+
+    // the archived status surface shows it with the computed isActive=false
+    let (s, archived) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "status": "archived", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let archived = archived
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(id))
+        .unwrap()
+        .clone();
+    assert_eq!(archived["isActive"], json!(false));
+
+    // the public default (active) list drops it for guests — and guests pack
+    // without an isRead key (AnnouncementEntityService.pack)
+    let (s, public) = post_json(app.clone(), "/api/announcements", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {public}");
+    assert!(
+        !public
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(id))
+    );
+    if let Some(first) = public.as_array().unwrap().first() {
+        assert!(first.get("isRead").is_none());
+    }
+}
+
+#[tokio::test]
+async fn announcements_invalid_dates_and_read_flow() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_ann_read").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let admin = signup(&app, "root").await;
+    let token = admin["token"].as_str().unwrap().to_string();
+    let user = signup(&app, &format!("u{}", mk_types::id::gen_aid_now())).await;
+    let user_token = user["token"].as_str().unwrap().to_string();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // e2e test 2: out-of-range autoArchiveAt (a negative JS-Date-epoch ms)
+    // rejected on create (<= now) and update (< 0) with the endpoints'
+    // INVALID_AUTO_ARCHIVE_AT ids
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({
+            "title": "Invalid scheduled announcement",
+            "text": "Text",
+            "imageUrl": null,
+            "autoArchiveAt": -8_640_000_000_000_000i64,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_AUTO_ARCHIVE_AT"));
+    assert_eq!(
+        body["error"]["id"],
+        json!("2a892bd5-487d-46a2-a5fe-3d85ad51defe")
+    );
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({
+            "title": "Expired scheduled announcement",
+            "text": "Text",
+            "imageUrl": null,
+            "autoArchiveAt": now_ms() - 60_000,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("INVALID_AUTO_ARCHIVE_AT"));
+
+    // missing title → INVALID_PARAM (required paramDef property)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({ "text": "Text", "imageUrl": null, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
+
+    // a plain global announcement + a personal one for user
+    let (s, global) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({ "title": "Global", "text": "hi", "imageUrl": null, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {global}");
+    let global_id = global["id"].as_str().unwrap().to_string();
+    let (s, personal) = post_json(
+        app.clone(),
+        "/api/admin/announcements/create",
+        json!({
+            "title": "Personal",
+            "text": "just you",
+            "imageUrl": null,
+            "userId": user_id,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {personal}");
+    let personal_id = personal["id"].as_str().unwrap().to_string();
+    // create's pack is me-less: forYou false, isRead absent
+    assert_eq!(global["forYou"], json!(false));
+    assert!(global.get("isRead").is_none());
+
+    // update with the out-of-range date → the update endpoint's error id
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/update",
+        json!({
+            "id": global_id,
+            "autoArchiveAt": -8_640_000_000_000_000i64,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"]["id"],
+        json!("01b83d7b-2fd5-4d7c-86c4-d03144d16355")
+    );
+
+    // i/read-announcement requires a credential
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/read-announcement",
+        json!({ "announcementId": global_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // a personal announcement of someone else → NO_SUCH_ANNOUNCEMENT (show)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/announcements/show",
+        json!({ "announcementId": personal_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("b57b5e1d-4f49-404a-9edb-46b00268f121")
+    );
+    // global show as guest: the pack carries no isRead key
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/announcements/show",
+        json!({ "announcementId": global_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert!(shown.get("isRead").is_none());
+
+    // the me view: isRead resolves false until the read lands
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/announcements/show",
+        json!({ "announcementId": personal_id, "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(shown["isRead"], json!(false));
+
+    // me-scoped public list: forYou on the personal row
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/announcements",
+        json!({ "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let mine = rows.iter().find(|a| a["id"] == json!(personal_id)).unwrap();
+    assert_eq!(mine["forYou"], json!(true));
+    assert_eq!(mine["isRead"], json!(false));
+
+    // reading the personal announcement → 204 (idempotent like the upstream
+    // catch), then the deactivation pulls it from the default active me-list
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/read-announcement",
+        json!({ "announcementId": personal_id, "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/read-announcement",
+        json!({ "announcementId": personal_id, "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/announcements",
+        json!({ "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1); // only the global stays active-for-me
+    assert_eq!(rows[0]["id"], json!(global_id));
+    assert_eq!(rows[0]["isRead"], json!(false));
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/announcements/show",
+        json!({ "announcementId": personal_id, "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(shown["isRead"], json!(true));
+    // reads counted on the admin list
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "status": "all", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    let reads = rows.iter().find(|a| a["id"] == json!(personal_id)).unwrap()["reads"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(reads, 1);
+
+    // admin/list scopes: absent userId = globals only, present = just that
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list.as_array().unwrap()[0]["id"], json!(global_id));
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "userId": user_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list.as_array().unwrap()[0]["userId"], json!(user_id));
+
+    // non-moderator (no rootUserId/no first-user/no roles) → 403 gate
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/list",
+        json!({ "i": user_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // NO_SUCH_ANNOUNCEMENT on update/delete misses
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/update",
+        json!({ "id": "x".repeat(32), "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"]["id"],
+        json!("d3aae5a7-6372-4cb4-b61c-f511ffc2d7cc")
+    );
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/announcements/delete",
+        json!({ "id": "x".repeat(32), "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"]["id"],
+        json!("ecad8040-a276-4e85-bda9-015a708d291e")
+    );
+
+    // delete lands (fire-and-forget moderation log write)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/announcements/delete",
+        json!({ "id": global_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/announcements/show",
+        json!({ "announcementId": global_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        shown["error"]["id"],
+        json!("b57b5e1d-4f49-404a-9edb-46b00268f121")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// note-agent: notes.ts acceptance slice — unit mirrors of the note.ts e2e
+// ladder (create-with-poll → show poll/votes, vote rules, reply ladder +
+// repliesCount truth, sensitive/prohibited words, mentions dedupe +
+// mentionLimit, translate gate, bare-create visibility in users/notes).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn notes_create_poll_ladder() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_note_poll").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // 投票を添付できる (+ pack poll body)
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "test",
+            "poll": { "choices": ["sakura", "izumi", "ako"] },
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    assert_eq!(created["createdNote"]["hasPoll"], json!(true));
+    let poll = &created["createdNote"]["poll"];
+    assert_eq!(poll["multiple"], json!(false));
+    assert_eq!(poll["choices"][0]["text"], json!("sakura"));
+    assert_eq!(poll["choices"][0]["votes"], json!(0));
+    assert_eq!(poll["choices"][0]["isVoted"], json!(false));
+    assert_eq!(poll["expiresAt"], json!(null));
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // choices validation (投票の選択肢が無くて/1つで怒られる)
+    for bad in [
+        json!({}),
+        json!({"choices": []}),
+        json!({"choices": ["one"]}),
+    ] {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": "x", "poll": bad, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "poll: {bad}");
+    }
+
+    // 投票できる → pack votes bump + isVoted (self-view)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/polls/vote",
+        json!({ "noteId": note_id, "choice": 1, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": note_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["poll"]["choices"][1]["votes"], json!(1));
+    assert_eq!(shown["poll"]["choices"][1]["isVoted"], json!(true));
+    assert_eq!(shown["poll"]["choices"][0]["isVoted"], json!(false));
+
+    // 複数投票できない → ALREADY_VOTED
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/polls/vote",
+        json!({ "noteId": note_id, "choice": 0, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"]["code"], json!("ALREADY_VOTED"), "body: {err}");
+
+    // 許可されている場合は複数投票できる
+    let (s, multi) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "multi",
+            "poll": { "choices": ["a", "b", "c"], "multiple": true },
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {multi}");
+    assert_eq!(multi["createdNote"]["poll"]["multiple"], json!(true));
+    let multi_id = multi["createdNote"]["id"].as_str().unwrap().to_string();
+    for choice in [0, 1, 2] {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/notes/polls/vote",
+            json!({ "noteId": multi_id, "choice": choice, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "choice {choice}");
+    }
+
+    // 締め切られている場合は投票できない
+    let (s, expired) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "exp",
+            "poll": { "choices": ["a", "b"], "expiredAfter": 1 },
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {expired}");
+    let expired_id = expired["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/polls/vote",
+        json!({ "noteId": expired_id, "choice": 0, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err["error"]["code"],
+        json!("ALREADY_EXPIRED"),
+        "body: {err}"
+    );
+
+    // noPoll note → NO_POLL
+    let (s, plain) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "plain", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let plain_id = plain["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/polls/vote",
+        json!({ "noteId": plain_id, "choice": 0, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"]["code"], json!("NO_POLL"), "body: {err}");
+
+    // text:null poll note → pack text null and cw-qualified null
+    assert_eq!(shown["text"], json!("test"));
+    assert_eq!(shown["cw"], json!(null));
+}
+
+#[tokio::test]
+async fn notes_create_reply_ladder_and_delete_truth() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_note_reply").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let b_token = bob["token"].as_str().unwrap().to_string();
+
+    // 返信できる: createdNote.reply gets packed (nested detail)
+    let (s, base) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "foo", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let base_id = base["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, reply) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "bar", "replyId": base_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {reply}");
+    assert_eq!(reply["createdNote"]["replyId"], json!(base_id));
+    assert_eq!(reply["createdNote"]["reply"]["text"], json!("foo"));
+    let reply_id = reply["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // visibility: followers reply target is invisible to a non-follower
+    let (s, followers_note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "direct note to bob", "visibility": "followers", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let fn_id = followers_note["createdNote"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "reply to alice note", "replyId": fn_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err["error"]["code"],
+        json!("CANNOT_REPLY_TO_AN_INVISIBLE_NOTE"),
+        "body: {err}"
+    );
+
+    // 存在しないリプライ先で怒られる
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "text": "test",
+            "replyId": "000000000000000000000000",
+            "i": a_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err["error"]["code"],
+        json!("NO_SUCH_REPLY_TARGET"),
+        "body: {err}"
+    );
+
+    // 引用renoteで空白文字のみ → createdNote.text null (pure renote degrade)
+    let (s, blank) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "   ", "renoteId": base_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {blank}");
+    assert_eq!(blank["createdNote"]["text"], json!(null));
+    assert_eq!(blank["createdNote"]["renote"]["text"], json!("foo"));
+
+    // delete a reply: db repliesCount truth (bump on create, dec on delete)
+    let mut ids = Vec::new();
+    for text in ["reply one", "reply two"] {
+        let (s, r) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": text, "replyId": base_id, "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {r}");
+        ids.push(r["createdNote"]["id"].as_str().unwrap().to_string());
+    }
+    let row = mk_db::note::find_note_by_id(&pool, &base_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.replies_count, 2);
+    // reply created by alice here; delete needs bob's reply? both by alice — fine
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/delete",
+        json!({ "noteId": ids[0], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let row = mk_db::note::find_note_by_id(&pool, &base_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.replies_count, 1);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/delete",
+        json!({ "noteId": ids[1], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let row = mk_db::note::find_note_by_id(&pool, &base_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.replies_count, 0);
+    let (_s, gone) = post_json(app.clone(), "/api/notes/show", json!({ "noteId": ids[0] })).await;
+    assert_eq!(gone["error"]["code"], json!("NO_SUCH_NOTE"), "body: {gone}");
+    let _ = reply_id;
+}
+
+#[tokio::test]
+async fn notes_create_word_ladders() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_note_words").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // (単語指定) force-home
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "sensitiveWords": ["test"], "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "update-meta");
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hogetesthuge", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        note["createdNote"]["visibility"],
+        json!("home"),
+        "body: {note}"
+    );
+
+    // (正規表現)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "sensitiveWords": ["/Test/i"], "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hogetesthuge", "i": a_token }),
+    )
+    .await;
+    assert_eq!(note["createdNote"]["visibility"], json!("home"));
+
+    // (スペースアンド)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "sensitiveWords": ["Test hoge"], "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hogeTesthuge", "i": a_token }),
+    )
+    .await;
+    assert_eq!(note["createdNote"]["visibility"], json!("home"));
+
+    // 禁止ワード (単語/正規表現/スペースアンド → 400 CONTAINS_PROHIBITED_WORDS;
+    // poll choices ride the same check)
+    for words in [json!(["test"]), json!(["/Test/i"]), json!(["Test hoge"])] {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/admin/update-meta",
+            json!({ "prohibitedWords": words, "i": r_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, err) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": "hogeTesthuge", "i": a_token }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "words: {words}");
+        assert_eq!(
+            err["error"]["code"],
+            json!("CONTAINS_PROHIBITED_WORDS"),
+            "body: {err}"
+        );
+    }
+}

@@ -7,6 +7,10 @@ use sqlx::postgres::PgPoolOptions;
 pub use sqlx;
 
 pub mod admin;
+// announcements-agent: announcements domain (announcement/announcement_read
+// live in the 0001 baseline; list/read/admin paths + the unread probe the
+// MeDetailed lane will wire)
+pub mod announcement;
 // channels-agent: channels/* domain (channel/channel_following/channel_favorite
 // tables + the channels/timeline note db path)
 pub mod channel;
