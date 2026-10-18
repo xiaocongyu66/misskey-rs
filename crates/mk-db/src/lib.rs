@@ -7,12 +7,18 @@ use sqlx::PgPool;
 pub use sqlx;
 
 pub mod admin;
+// i/update tail wave: drive files (upload), note pinings, personal memos
+pub mod drive;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
+pub mod memo;
 pub mod note;
 pub mod notification;
+pub mod pin;
 pub mod relation;
 pub mod role;
+// gate-roles: minimal admin/roles/create + assign SQL support
+pub mod roles_lite;
 // social-agent: social-graph writes (follow/mute/block/renote)
 pub mod social;
 pub mod user;

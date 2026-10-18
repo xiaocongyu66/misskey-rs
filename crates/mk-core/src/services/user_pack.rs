@@ -1,17 +1,58 @@
 //! DB-row → packed-user mapping (M1 slice: local users, no relations, no
 //! roles). See `core/entities/UserEntityService.ts` for upstream semantics.
 
+use mk_db::role::AssignedRole;
 use mk_db::user::{LocalUserRow, ProfileRow};
 
 use crate::packers::user::{
-    AvatarDecoration, BackupCodesStock, ChatScope, MeDetailed, OnlineStatus, UserDetailedNotMe,
-    UserField, VisibilityLevel,
+    AvatarDecoration, BackupCodesStock, ChatScope, MeDetailed, OnlineStatus, RoleLiteValue,
+    UserDetailedNotMe, UserField, VisibilityLevel,
 };
 
 #[derive(Clone, Copy)]
 pub struct InstanceCtx<'a> {
     pub url: &'a str,
     pub host: &'a str,
+}
+
+/// Role-engine inputs threaded from the endpoint layer (upstream
+/// `UserEntityService.pack` reads `roleService` per packed user):
+/// public-role list, badge list, the merged-policy flags
+/// (`isSilenced: !canPublicNote`, `canChat`), the me-view
+/// `isAdmin`/`isModerator` and the `(isMe || iAmModerator)`
+/// twoFactorEnabled block gate.
+pub struct RolePack<'a> {
+    /// Target user's assigned roles (`mk_db::role::user_assigned_roles`,
+    /// non-expired, sorted `"displayOrder" DESC`).
+    pub assigned: &'a [AssignedRole],
+    /// `RoleService.isAdministrator(target)`'s root shortcut
+    /// (meta.rootUserId === target.id — mirrored as `usernameLower='root'`).
+    pub target_is_root: bool,
+    /// `RoleService.isModerator(viewer)` — gates badge visibility plus the
+    /// not-me twoFactor/usePasswordLessLogin/securityKeys block.
+    pub viewer_is_moderator: bool,
+}
+
+/// Public assigned roles for the `roles` array (pack L563: filter isPublic,
+/// sort `displayOrder` DESC, project the lite shape).
+fn public_roles_value(rp: &RolePack<'_>) -> Vec<RoleLiteValue> {
+    let mut out: Vec<RoleLiteValue> = rp
+        .assigned
+        .iter()
+        .filter(|r| r.is_public)
+        .map(|r| RoleLiteValue {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            color: r.color.clone(),
+            icon_url: r.icon_url.clone(),
+            description: r.description.clone(),
+            is_moderator: r.is_moderator,
+            is_administrator: r.is_administrator,
+            display_order: r.display_order,
+        })
+        .collect();
+    out.sort_by(|a, b| b.display_order.cmp(&a.display_order));
+    out
 }
 
 fn opt_json_string(v: &serde_json::Value) -> Option<String> {
@@ -119,9 +160,28 @@ fn detailed(
     ctx: InstanceCtx<'_>,
     me_view: bool,
     relation: Option<&mk_db::relation::UserRelation>,
+    roles: Option<&RolePack<'_>>,
 ) -> UserDetailedNotMe {
     let created_at = mk_types::id::parse_aid_date(&row.id).map(crate::services::signup::ms_to_iso);
     let relation_is_following = relation.as_ref().map(|r| r.is_following).unwrap_or(false);
+    // Role engine: badges for the lite block, public roles + merged policy
+    // flags for the detailed block (badge_roles_and_policy = the wiring hook).
+    let (badge_roles, public_roles, policy) = match roles {
+        Some(rp) => {
+            let (badges, policy) =
+                crate::services::role::badge_roles_and_policy(rp.assigned, rp.viewer_is_moderator);
+            (badges, public_roles_value(rp), policy)
+        }
+        None => (
+            Vec::new(),
+            Vec::new(),
+            crate::services::role::UserPolicy::base(),
+        ),
+    };
+    // pack L577: `...(isDetailed && (isMe || iAmModerator) ? { twoFactorEnabled,
+    // usePasswordLessLogin, securityKeys } : {})` — the not-me block appears
+    // only for moderator viewers.
+    let show_two_factor = me_view || roles.map(|rp| rp.viewer_is_moderator).unwrap_or(false);
     UserDetailedNotMe {
         lite_fields: crate::packers::user::UserLite {
             id: row.id.clone(),
@@ -139,7 +199,7 @@ fn detailed(
             instance: None,
             emojis: Default::default(),
             online_status: online_status(row),
-            badge_roles: Some(Vec::new()),
+            badge_roles: Some(badge_roles),
         },
         url: profile.url.clone(),
         uri: None, // local user has no uri
@@ -159,7 +219,7 @@ fn detailed(
             row.banner_blurhash.clone()
         },
         is_locked: row.is_locked,
-        is_silenced: false, // !canPublicNote, default policies
+        is_silenced: policy.is_silenced(), // !canPublicNote (merged policies)
         is_suspended: row.is_suspended,
         description: profile.description.clone(),
         location: profile.location.clone(),
@@ -188,17 +248,29 @@ fn detailed(
         following_visibility: visibility(&profile.following_visibility),
         followers_visibility: visibility(&profile.followers_visibility),
         chat_scope: chat_scope(&row.chat_scope),
-        can_chat: true,
-        roles: Vec::new(),
+        can_chat: policy.can_chat(), // chatAvailability === 'available'
+        roles: public_roles,
         followed_message: relation
             .as_ref()
             .filter(|r| r.is_following)
             .map(|_| profile.followed_message.clone()),
         memo: None,
         moderation_note: None,
-        two_factor_enabled: None,
-        use_password_less_login: None,
-        security_keys: None,
+        two_factor_enabled: if show_two_factor {
+            Some(profile.two_factor_enabled)
+        } else {
+            None
+        },
+        use_password_less_login: if show_two_factor {
+            Some(profile.use_password_less_login)
+        } else {
+            None
+        },
+        security_keys: if show_two_factor {
+            Some(profile.security_keys_available)
+        } else {
+            None
+        },
         // `...(relation ? {...} : {})` in upstream pack: relation fields
         // exist only when a me view targets another user.
         is_following: relation.as_ref().map(|r| r.is_following),
@@ -273,13 +345,28 @@ pub fn pack_inline_opts(
     ctx: InstanceCtx<'_>,
     include_secrets: bool,
 ) -> serde_json::Value {
+    pack_inline_with_roles(row, profile, is_me, relation, ctx, include_secrets, None)
+}
+
+/// Roles-aware variant (endpoints/users paths): `roles` carries the target's
+/// assigned roles + viewer/root flags; `None` degrades to the pack above
+/// (empty role lists, default policies).
+pub fn pack_inline_with_roles(
+    row: &LocalUserRow,
+    profile: &ProfileRow,
+    is_me: bool,
+    relation: Option<&mk_db::relation::UserRelation>,
+    ctx: InstanceCtx<'_>,
+    include_secrets: bool,
+    roles: Option<&RolePack<'_>>,
+) -> serde_json::Value {
     if !is_me {
-        let d = detailed(row, profile, ctx, false, relation);
+        let d = detailed(row, profile, ctx, false, relation, roles);
         return serde_json::to_value(&d).unwrap_or(serde_json::json!({}));
     }
     // me view: no relation block (upstream relation is computed only for
     // other-target views)
-    let me = detailed_as_me(row, profile, ctx, include_secrets);
+    let me = detailed_as_me(row, profile, ctx, include_secrets, roles);
     serde_json::to_value(&me).unwrap_or(serde_json::json!({}))
 }
 
@@ -289,9 +376,20 @@ fn detailed_as_me(
     profile: &ProfileRow,
     ctx: InstanceCtx<'_>,
     include_secrets: bool,
+    roles: Option<&RolePack<'_>>,
 ) -> MeDetailed {
-    let d = detailed(row, profile, ctx, true, None);
+    let d = detailed(row, profile, ctx, true, None, roles);
     let ach = profile.achievements.as_array().cloned().unwrap_or_default();
+    // pack L464: `isModerator/isAdmin = isMe && isDetailed ? roleService.… :
+    // undefined` — RoleService.isModerator = root || assigned moderator/admin
+    // roles; isAdministrator = root || assigned administrator roles.
+    let (is_moderator, is_admin) = match roles {
+        Some(rp) => (
+            rp.target_is_root || crate::services::role::has_moderator_role(rp.assigned),
+            rp.target_is_root || crate::services::role::has_administrator_role(rp.assigned),
+        ),
+        None => (false, false),
+    };
     MeDetailed {
         detailed: crate::packers::user::UserDetailedNotMe {
             two_factor_enabled: Some(profile.two_factor_enabled),
@@ -302,8 +400,8 @@ fn detailed_as_me(
         avatar_id: row.avatar_id.clone(),
         banner_id: row.banner_id.clone(),
         followed_message_always: profile.followed_message.clone(),
-        is_moderator: false,
-        is_admin: false,
+        is_moderator,
+        is_admin,
         inject_featured_note: profile.inject_featured_note,
         receive_announcement_email: profile.receive_announcement_email,
         always_mark_nsfw: profile.always_mark_nsfw,
@@ -372,7 +470,21 @@ pub fn user_lite_value(
     ctx: InstanceCtx<'_>,
 ) -> serde_json::Value {
     let _ = _profile;
+    user_lite_value_with_roles(row, ctx, None)
+}
+
+/// Roles-aware UserLite (`schema: 'UserLite'` results, e2e users/search
+/// `detail: false`): only `badgeRoles` carries the role engine (pack L517).
+pub fn user_lite_value_with_roles(
+    row: &LocalUserRow,
+    ctx: InstanceCtx<'_>,
+    roles: Option<&RolePack<'_>>,
+) -> serde_json::Value {
     use crate::packers::user::UserLite;
+    let badge_roles = match roles {
+        Some(rp) => crate::services::role::badge_roles(rp.assigned, rp.viewer_is_moderator),
+        None => Vec::new(),
+    };
     let lite = UserLite {
         id: row.id.clone(),
         name: row.name.clone(),
@@ -389,7 +501,7 @@ pub fn user_lite_value(
         instance: None,
         emojis: Default::default(),
         online_status: OnlineStatus::Unknown,
-        badge_roles: Some(Vec::new()),
+        badge_roles: Some(badge_roles),
     };
     serde_json::to_value(&lite).unwrap_or(serde_json::json!({}))
 }

@@ -637,6 +637,560 @@ async fn i_update_persists_is_bot_and_is_cat() {
     assert_eq!(persisted(&pool, &my_id).await, (false, false));
 }
 
+// ---------------------------------------------------------------------------
+// i/update census tail (users.ts を書き換えることができる Avatar/Banner/
+// ピン止めノート/メモ/undefined + 作りたてdict): persist + pack parity for the
+// avatarId/bannerId drive swap, i/pin + i/unpin, users/update-memo, the
+// absent-vs-null birthday semantics and the MeDetailed role-compat keys.
+// ---------------------------------------------------------------------------
+
+/// Drive-file insert mirroring the schema defaults (0001_init.sql NOT NULL
+/// cols: md5/name/type/size/"storedInternal"/url) via the upload path.
+async fn seed_drive_file(pool: &mk_db::sqlx::PgPool, user_id: &str, file_type: &str) -> String {
+    let id = mk_types::id::gen_aid_now();
+    let row = mk_db::drive::DriveFileRow {
+        id: id.clone(),
+        user_id: Some(user_id.to_string()),
+        md5: mk_types::id::gen_aid_now(),
+        name: "192.jpg".to_string(),
+        file_type: file_type.to_string(),
+        size: 47_918,
+        blurhash: Some(
+            "U0000000i0f00000000~q00j[00j%NSj[4nWBofj[4nWBofWBj[ofj[%NSj[4nf7j[".to_string(),
+        ),
+        url: "http://127.0.0.1:3000/files/accesskey123/192.jpg".to_string(),
+        webpublic_url: None,
+        properties: json!({}),
+    };
+    mk_db::drive::insert_drive_file(pool, &row, "accesskey123")
+        .await
+        .unwrap();
+    id
+}
+
+/// users.ts `を書き換えることができる(Avatar/Banner)`: i/update with
+/// avatarId/bannerId looks the drive file up and denormalizes
+/// avatarUrl/avatarBlurhash (resp. banner) onto the user row
+/// (i/update.ts L377-411 → UserEntityService.pack L490/L536-537).
+#[tokio::test]
+async fn i_update_avatar_banner_drive_swap() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_avabanner").await;
+    let username = format!("ava{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_id = me["id"].as_str().unwrap().to_string();
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    // foreign-owned file → NO_SUCH_AVATAR (avatar.userId !== user.id gate)
+    let other = signup(&app, &format!("avao{}", mk_types::id::gen_aid_now())).await;
+    let foreign_file = seed_drive_file(&pool, other["id"].as_str().unwrap(), "image/jpeg").await;
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "avatarId": foreign_file }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::BAD_REQUEST, "body: {b1}");
+    assert_eq!(b1["error"]["code"], json!("NO_SUCH_AVATAR"));
+
+    // non-image MIME → AVATAR_NOT_AN_IMAGE / BANNER_NOT_AN_IMAGE
+    let bad_file = seed_drive_file(&pool, &my_id, "text/plain").await;
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "bannerId": bad_file }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::BAD_REQUEST, "body: {b2}");
+    assert_eq!(b2["error"]["code"], json!("BANNER_NOT_AN_IMAGE"));
+
+    // Avatar: image file → id + proxied URL + blurhash denormalized
+    let avatar_file = seed_drive_file(&pool, &my_id, "image/jpeg").await;
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "avatarId": avatar_file }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "body: {b3}");
+    assert_eq!(b3["avatarId"], json!(avatar_file));
+    let blur = b3["avatarBlurhash"].as_str().unwrap_or("");
+    assert!(blur.len() >= 54, "blurhash {blur:?} misses /[ -~]{{54}}/");
+    assert!(blur.bytes().all(|c| (0x20..=0x7e).contains(&c)));
+    let avatar_url = b3["avatarUrl"].as_str().unwrap();
+    assert!(
+        avatar_url.starts_with("http://127.0.0.1:3000/proxy/avatar.webp?url=")
+            && avatar_url.ends_with("&avatar=1"),
+        "avatar url {avatar_url}"
+    );
+    let (row_url, row_blur): (String, String) = mk_db::sqlx::query_as(
+        r#"SELECT "avatarUrl", "avatarBlurhash" FROM "user" WHERE "id" = $1"#,
+    )
+    .bind(&my_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_url, avatar_url);
+    assert_eq!(row_blur, blur);
+
+    // Banner: raw stored url (getPublicUrl w/o mode), blurhash denormalized
+    let banner_file = seed_drive_file(&pool, &my_id, "image/png").await;
+    let (s4, b4) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "bannerId": banner_file }),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::OK, "body: {b4}");
+    assert_eq!(b4["bannerId"], json!(banner_file));
+    assert_eq!(
+        b4["bannerUrl"],
+        json!("http://127.0.0.1:3000/files/accesskey123/192.jpg")
+    );
+    let banner_blur = b4["bannerBlurhash"].as_str().unwrap_or("");
+    assert!(banner_blur.len() >= 54, "banner blurhash {banner_blur:?}");
+
+    // avatarId: null → identicon fallback + blurhash null (pack L490),
+    // bannerId: null → url/blurhash null (pack L536-537)
+    let (s5, b5) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "avatarId": null, "bannerId": null }),
+    )
+    .await;
+    assert_eq!(s5, StatusCode::OK, "body: {b5}");
+    assert_eq!(b5["avatarId"], Value::Null);
+    assert_eq!(b5["avatarBlurhash"], Value::Null);
+    assert!(b5["avatarUrl"].as_str().unwrap().contains("/identicon/"));
+    assert_eq!(b5["bannerId"], Value::Null);
+    assert_eq!(b5["bannerUrl"], Value::Null);
+    assert_eq!(b5["bannerBlurhash"], Value::Null);
+    let (a_url, a_blur, a_id, b_url, b_blur, b_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = mk_db::sqlx::query_as(
+        r#"SELECT "avatarUrl", "avatarBlurhash", "avatarId",
+                  "bannerUrl", "bannerBlurhash", "bannerId"
+           FROM "user" WHERE "id" = $1"#,
+    )
+    .bind(&my_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (a_url, a_blur, a_id, b_url, b_blur, b_id),
+        (None, None, None, None, None, None)
+    );
+
+    // unknown drive id → NO_SUCH_AVATAR (avatar == null is the CLEAR branch)
+    let (s6, b6) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "bannerId": "9zzzzzzzzz" }),
+    )
+    .await;
+    assert_eq!(s6, StatusCode::BAD_REQUEST, "body: {b6}");
+    assert_eq!(b6["error"]["code"], json!("NO_SUCH_BANNER"));
+}
+
+/// users.ts `を書き換えることができる($#)` birthday tail: an OMITTED birthday
+/// must leave the stored value untouched (i/update.ts L296
+/// `if (ps.birthday !== undefined)` guard), explicit null → NULL.
+#[tokio::test]
+async fn i_update_birthday_absent_vs_null() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_bday").await;
+    let username = format!("bday{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    // '9999-99-99' passes the birthdaySchema pattern and persists verbatim
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "birthday": "9999-99-99" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    assert_eq!(b1["birthday"], json!("9999-99-99"));
+
+    // THE census case: a later partial update (lang only) must NOT re-null
+    // the birthday
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "lang": "en-US" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["birthday"], json!("9999-99-99"));
+    assert_eq!(b2["lang"], json!("en-US"));
+    // `i` (the e2e beforeEach refresh) agrees
+    let (_, bi) = post_json(app.clone(), "/api/i", json!({ "i": my_token })).await;
+    assert_eq!(bi["birthday"], json!("9999-99-99"));
+
+    // explicit null → NULL
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "birthday": null }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "body: {b3}");
+    assert_eq!(b3["birthday"], Value::Null);
+    // and omitting it afterwards keeps the NULL (not a resurrection)
+    let (s4, b4) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": my_token, "location": "Kyoto" }),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::OK, "body: {b4}");
+    assert_eq!(b4["birthday"], Value::Null);
+}
+
+/// SignupApiService's response is the full MeDetailed pack, including
+/// `policies` (= DEFAULT_POLICIES when no role/meta overrides exist) and the
+/// backward-compat `mutingNotificationTypes: []` (UserEntityService.pack
+/// L618/L623) — the users.ts 作りたて case deep-equals both.
+#[tokio::test]
+async fn signup_carries_policies_and_compat_keys() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_polkey").await;
+    let username = format!("pol{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let (status, body) = post_json(
+        app,
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["mutingNotificationTypes"], json!([]));
+    let policies = body["policies"].as_object().expect("policies object");
+    assert_eq!(policies["canPublicNote"], json!(true));
+    assert_eq!(policies["pinLimit"], json!(5));
+    assert_eq!(policies["wordMuteLimit"], json!(200));
+    assert_eq!(policies["driveCapacityMb"], json!(100));
+    assert_eq!(policies["chatAvailability"], json!("available"));
+    assert_eq!(
+        policies["uploadableFileTypes"],
+        json!([
+            "text/*",
+            "application/json",
+            "image/*",
+            "video/*",
+            "audio/*"
+        ])
+    );
+    // i emits the same key set (meDetailed() helper symmetry)
+    let my_token = body["token"].as_str().unwrap().to_string();
+    let (_, bi) = post_json(
+        crate::build_router(test_state(pool)),
+        "/api/i",
+        json!({ "i": my_token }),
+    )
+    .await;
+    assert_eq!(bi["mutingNotificationTypes"], json!([]));
+    assert_eq!(bi["policies"]["pinLimit"], json!(5));
+}
+
+/// users.ts `を書き換えることができる(ピン止めノート)`: i/pin adds a
+/// `user_note_pining` row and returns the MeDetailed with pinnedNoteIds +
+/// packed pinnedNotes; i/unpin reverts (NotePiningService.addPinned /
+/// removePinned).
+#[tokio::test]
+async fn i_pin_unpin_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_pin").await;
+    let username = format!("pinu{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    // aliceNote fixture (beforeAll: post → notes/create)
+    let (_, created) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": my_token, "text": "pin me" }),
+    )
+    .await;
+    assert_eq!(created["createdNote"]["text"], json!("pin me"));
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // foreign note → NO_SUCH_NOTE (addPinned ownership lookup)
+    let other = signup(&app, &format!("pino{}", mk_types::id::gen_aid_now())).await;
+    let other_token = other["token"].as_str().unwrap().to_string();
+    let (_, created2) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": other_token, "text": "not mine" }),
+    )
+    .await;
+    let foreign_note = created2["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/i/pin",
+        json!({ "i": my_token, "noteId": foreign_note }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::BAD_REQUEST, "body: {b1}");
+    assert_eq!(b1["error"]["code"], json!("NO_SUCH_NOTE"));
+
+    // pin → response carries the id array + the note pack; row persisted
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/i/pin",
+        json!({ "i": my_token, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["pinnedNoteIds"], json!([note_id]));
+    assert_eq!(b2["pinnedNotes"][0]["id"], json!(note_id));
+    assert_eq!(b2["pinnedNotes"][0]["text"], json!("pin me"));
+    let pins: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_note_pining" WHERE "userId" = $1"#)
+            .bind(me["id"].as_str().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pins, 1);
+
+    // re-pin → ALREADY_PINNED
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/i/pin",
+        json!({ "i": my_token, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::BAD_REQUEST, "body: {b3}");
+    assert_eq!(b3["error"]["code"], json!("ALREADY_PINNED"));
+
+    // secrets stay hidden on i/pin (pack default includeSecrets=false)
+    assert!(!b2.as_object().unwrap().contains_key("email"), "{b2}");
+
+    // unpin → back to the empty baseline
+    let (s4, b4) = post_json(
+        app.clone(),
+        "/api/i/unpin",
+        json!({ "i": my_token, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::OK, "body: {b4}");
+    assert_eq!(b4["pinnedNoteIds"], json!([]));
+    assert_eq!(b4["pinnedNotes"], json!([]));
+    let pins: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_note_pining" WHERE "userId" = $1"#)
+            .bind(me["id"].as_str().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pins, 0);
+}
+
+/// users.ts `を書き換えることができる(メモを$labelに)`: users/update-memo
+/// upserts/deletes the viewer's `user_memo` row and users/show reflects it
+/// (UserEntityService.pack L445-448).
+#[tokio::test]
+async fn users_update_memo_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_memo").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &format!("memoa{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("memob{}", mk_types::id::gen_aid_now())).await;
+    let alice_token = alice["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap();
+
+    // 最大長 (2048 chars persist verbatim)
+    let memo = "x".repeat(2048);
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/users/update-memo",
+        json!({ "i": alice_token, "userId": bob_id, "memo": memo }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::NO_CONTENT, "body: {b1}");
+    let (_, show1) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "i": alice_token, "userId": bob_id }),
+    )
+    .await;
+    assert_eq!(show1["memo"], json!(memo));
+    // self view / anonymous view keep memo null
+    let (_, show2) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "i": alice_token, "userId": alice["id"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(show2["memo"], Value::Null);
+    let (_, show3) = post_json(app.clone(), "/api/users/show", json!({ "userId": bob_id })).await;
+    assert_eq!(show3["memo"], Value::Null);
+
+    // overwrite (update branch)
+    let (s2, _) = post_json(
+        app.clone(),
+        "/api/users/update-memo",
+        json!({ "i": alice_token, "userId": bob_id, "memo": "second" }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::NO_CONTENT);
+    let (_, show4) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "i": alice_token, "userId": bob_id }),
+    )
+    .await;
+    assert_eq!(show4["memo"], json!("second"));
+    let memos: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_memo""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(memos, 1);
+
+    // 空文字 deletes; null deletes too
+    for payload in [json!(""), Value::Null] {
+        let (s3, _) = post_json(
+            app.clone(),
+            "/api/users/update-memo",
+            json!({ "i": alice_token, "userId": bob_id, "memo": payload }),
+        )
+        .await;
+        assert_eq!(s3, StatusCode::NO_CONTENT);
+    }
+    let (_, show5) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "i": alice_token, "userId": bob_id }),
+    )
+    .await;
+    assert_eq!(show5["memo"], Value::Null);
+    let memos: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_memo""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(memos, 0);
+
+    // unknown target → NO_SUCH_USER
+    let (s4, b4) = post_json(
+        app.clone(),
+        "/api/users/update-memo",
+        json!({ "i": alice_token, "userId": "9zzzzzzzzz", "memo": "x" }),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::NOT_FOUND, "body: {b4}");
+    assert_eq!(b4["error"]["code"], json!("NO_SUCH_USER"));
+}
+
+/// The multipart drive/files/create chain (uploadFile shape: file part with
+/// no Content-Type — sniffed to image/jpeg from the magic bytes — plus the
+/// `i` auth field), then the avatarId hand-off into i/update that the
+/// users.ts Avatar census case makes.
+#[tokio::test]
+async fn drive_files_create_and_avatar_handoff() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkiupdate_drive").await;
+    let username = format!("drv{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let me = signup(&app, &username).await;
+    let my_id = me["id"].as_str().unwrap().to_string();
+    let my_token = me["token"].as_str().unwrap().to_string();
+
+    let jpeg = [
+        &[0xFFu8, 0xD8, 0xFF, 0xE0][..],
+        &b"fake-jpeg-content-for-md5-stability"[..],
+    ]
+    .concat();
+    let mut raw: Vec<u8> = Vec::new();
+    raw.extend_from_slice(
+        b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"192.jpg\"\r\n\r\n",
+    );
+    raw.extend_from_slice(&jpeg);
+    raw.extend_from_slice(
+        b"\r\n--B\r\nContent-Disposition: form-data; name=\"force\"\r\n\r\ntrue\r\n",
+    );
+    raw.extend_from_slice(
+        format!("--B\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n{my_token}\r\n--B--\r\n")
+            .as_bytes(),
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/drive/files/create")
+                .header("content-type", "multipart/form-data; boundary=B")
+                .body(Body::from(raw))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s1 = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let b1: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(s1, StatusCode::OK, "body: {b1}");
+    let file_id = b1["id"].as_str().unwrap().to_string();
+    assert_eq!(b1["type"], json!("image/jpeg"));
+    assert_eq!(b1["name"], json!("192.jpg"));
+    assert_eq!(b1["size"], json!(jpeg.len() as i64));
+    assert_eq!(
+        b1["md5"]
+            .as_str()
+            .map(|s| (s.len(), s.chars().all(|c| c.is_ascii_hexdigit()))),
+        Some((32, true))
+    );
+    assert!(b1["blurhash"].as_str().unwrap_or("").len() >= 54);
+    assert!(b1["url"].as_str().unwrap_or("").contains("/files/"));
+    assert_eq!(b1["userId"], json!(my_id));
+
+    // i/update consumes the id exactly like the e2e Avatar test
+    let (s2, b2) = post_json(
+        app,
+        "/api/i/update",
+        json!({ "i": my_token, "avatarId": file_id }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["avatarId"], json!(file_id));
+    assert!(b2["avatarUrl"].as_str().unwrap_or("").starts_with(
+        "http://127.0.0.1:3000/proxy/avatar.webp?url=http%3A%2F%2F127.0.0.1%3A3000%2Ffiles%2F",
+    ));
+}
+
 // Upstream signup truth: SignupApiService.signup reads only
 // username/password(+host/invitationCode/emailAddress/captcha) from the body —
 // isBot/isCat are NOT accepted (there is no paramDef; extra keys are dropped),

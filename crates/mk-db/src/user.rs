@@ -504,6 +504,73 @@ pub async fn update_profile_subset(
     Ok(())
 }
 
+/// `i/update.ts` L377-411 avatar/banner drive-file swap: upstream writes the
+/// denormal `avatarUrl`/`avatarBlurhash` (resp. banner) onto the SAME user
+/// row as `avatarId`/`bannerId` (`updates` dict → `usersRepository.update`).
+/// The pack then reads those columns (UserEntityService.pack L490/L536-537).
+pub enum AvatarBannerOp {
+    /// Param absent → column untouched (upstream `if (ps.avatarId)` guards).
+    Untouched,
+    /// `ps.avatarId === null` → id/url/blurhash all set to NULL.
+    Clear,
+    /// `ps.avatarId` truthy → validated drive file (id + public url + blurhash).
+    Set {
+        id: String,
+        url: String,
+        blurhash: Option<String>,
+    },
+}
+
+pub async fn update_avatar_banner(
+    pool: &PgPool,
+    user_id: &str,
+    avatar: AvatarBannerOp,
+    banner: AvatarBannerOp,
+) -> Result<(), sqlx::Error> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Option<String>> = Vec::new();
+    for (op, id_col, url_col, blur_col) in [
+        (
+            &avatar,
+            "\"avatarId\"",
+            "\"avatarUrl\"",
+            "\"avatarBlurhash\"",
+        ),
+        (
+            &banner,
+            "\"bannerId\"",
+            "\"bannerUrl\"",
+            "\"bannerBlurhash\"",
+        ),
+    ] {
+        let triple: Option<[Option<String>; 3]> = match op {
+            AvatarBannerOp::Untouched => None,
+            AvatarBannerOp::Clear => Some([None, None, None]),
+            AvatarBannerOp::Set { id, url, blurhash } => {
+                Some([Some(id.clone()), Some(url.clone()), blurhash.clone()])
+            }
+        };
+        if let Some([id, url, blur]) = triple {
+            for (col, val) in [(id_col, id), (url_col, url), (blur_col, blur)] {
+                binds.push(val);
+                sets.push(format!("{col} = ${}", binds.len() + 1));
+            }
+        }
+    }
+    if sets.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(r#"UPDATE "user" SET {} WHERE "id" = $1"#, sets.join(", "));
+    let mut q = sqlx::query(&sql).bind(user_id);
+    for v in &binds {
+        // url/blurhash columns are varchar; no empty strings here (drive rows
+        // carry non-empty urls, image files real-or-placeholder blurhashes).
+        q = q.bind(v.as_ref());
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
 pub async fn find_profile(pool: &PgPool, user_id: &str) -> Result<ProfileRow, sqlx::Error> {
     // (column-array decode: Vec<String> is required for varchar[] columns)
     sqlx::query_as::<_, ProfileRow>(&format!(
@@ -532,43 +599,126 @@ pub async fn insert_signin(
     Ok(())
 }
 
-/// `UserSearchService.searchByUsernameAndHost` — no-login variant collapsed to
-/// one query (fresh M2 instances hold no `updatedAt` rows, so the
-/// active/inactive split degenerates to the same ordering; `muting` exclusion
-/// is layered in by the caller when a me is present). Order: usernameLower ASC.
+/// `UserSearchService.searchByUsernameAndHost` — priority-leg search
+/// (upstream `src/core/UserSearchService.ts`): for a logged-in me the legs are
+/// 1. followees with `updatedAt > now-30d`,
+/// 2. followees with `updatedAt IS NULL OR <= now-30d`,
+/// 3. non-followees with `updatedAt > now-30d`,
+/// 4. non-followees with `updatedAt <= now-30d` (NULL excluded! — the
+///    no-activity local-user gate: a user without notes and without a
+///    follow edge to the viewer matches no leg, mirroring the e2e
+///    "ノートなしは検索に載らない" case),
+/// and for anonymous callers two legs: `updatedAt IS NULL OR > now-30d`,
+/// then `<= now-30d`. Each leg is limited to `limit - collected` and ordered
+/// `usernameLower ASC`; ids are deduped across legs preserving leg order.
 pub async fn search_users_by_username_and_host(
     pool: &PgPool,
     username: Option<&str>,
     host: Option<&str>,
     own_host: &str,
+    me_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<LocalUserRow>, sqlx::Error> {
-    let pattern = format!(
-        "{}%",
-        username
-            .unwrap_or("")
-            .to_lowercase()
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    );
-    sqlx::query_as::<_, LocalUserRow>(&format!(
-        r#"SELECT {} FROM "user"
-           WHERE "usernameLower" LIKE $1
-             AND "isSuspended" = FALSE
-             AND (
-                   $2 IS NULL
-                   OR ($2 IN ('.', $3) AND "host" IS NULL)
-                   OR "host" ILIKE $2
-                 )
-           ORDER BY "usernameLower" ASC
-           LIMIT {}"#,
-        LOCAL_USER_COLS, limit
-    ))
-    .bind(pattern)
-    .bind(host)
-    .bind(own_host)
-    .fetch_all(pool)
-    .await
+    // parent site filter: `usernameLower` is interpolated after sql-like
+    // escaping (like upstream sqlLikeEscape); `me` stays a bound parameter.
+    let pattern = username
+        .filter(|u| !u.is_empty())
+        .map(|u| format!("{}%", sql_like_escape(&u.to_lowercase())));
+    // upstream: `if (params.host)` truthy — `null`/absent means no host filter;
+    // `.` or the local host mean local rows.
+    let pattern_host = host.filter(|h| !h.is_empty()).map(|h| {
+        if h == "." || h.eq_ignore_ascii_case(own_host) {
+            None // local
+        } else {
+            Some(format!("{}%", sql_like_escape(&h.to_lowercase())))
+        }
+    });
+
+    // (follow-leg kind per viewer state) — the updated-at gate differs by leg:
+    // upstream buildSearchUserQueries: followee-inactive keeps
+    // `updatedAt IS NULL OR <= threshold`; non-followee legs keep only non-NULL
+    // rows either side of the threshold (a user without notes and without a
+    // follow edge to the viewer matches NO leg — the e2e
+    // "ローカルでノートなしは検索に載らない" gate); the anonymous pair is
+    // (`updatedAt IS NULL OR > threshold`) then `<= threshold`.
+    let legs: Vec<(&str, bool)> = match me_id {
+        Some(_) => vec![
+            ("following", true),
+            ("following", false),
+            ("not-following", true),
+            ("not-following", false),
+        ],
+        None => vec![("anonymous", true), ("anonymous", false)],
+    };
+
+    let mut seen: Vec<LocalUserRow> = Vec::new();
+    for (follow_kind, active) in legs {
+        if seen.len() as i64 >= limit {
+            break;
+        }
+        let remaining = limit - seen.len() as i64;
+        let follow_clause = match (me_id, follow_kind) {
+            (Some(_), "following") => {
+                r#" AND ("id" IN (SELECT "followeeId" FROM "following" WHERE "followerId" = $1))"#
+            }
+            (Some(_), "not-following") => {
+                r#" AND ("id" NOT IN (SELECT "followeeId" FROM "following" WHERE "followerId" = $1))"#
+            }
+            _ => "",
+        };
+        let gate = match (follow_kind, active) {
+            ("anonymous", true) => {
+                r#"("updatedAt" IS NULL OR "updatedAt" > now() - interval '30 days')"#
+            }
+            (_, true) => {
+                r#"("updatedAt" IS NOT NULL AND "updatedAt" > now() - interval '30 days')"#
+            }
+            ("following", false) | ("anonymous", false) => {
+                r#"("updatedAt" IS NULL OR "updatedAt" <= now() - interval '30 days')"#
+            }
+            ("not-following", false) => {
+                r#"("updatedAt" IS NOT NULL AND "updatedAt" <= now() - interval '30 days')"#
+            }
+        };
+        let mut where_ = format!(r#""isSuspended" = FALSE AND ({gate})"#);
+        if let Some(p) = &pattern {
+            where_.push_str(&format!(r#" AND ("usernameLower" LIKE '{p}')"#));
+        }
+        match &pattern_host {
+            Some(None) => where_.push_str(r#" AND ("host" IS NULL)"#),
+            Some(Some(p)) => where_.push_str(&format!(r#" AND "host" ILIKE '{p}'"#)),
+            None => {}
+        }
+
+        let sql = format!(
+            r#"SELECT {LOCAL_USER_COLS} FROM "user"
+               WHERE {where_}{follow_clause}
+               ORDER BY "usernameLower" ASC
+               LIMIT {remaining}"#
+        );
+        let rows = match me_id {
+            Some(me) => {
+                sqlx::query_as::<_, LocalUserRow>(&sql)
+                    .bind(me)
+                    .fetch_all(pool)
+                    .await?
+            }
+            None => {
+                sqlx::query_as::<_, LocalUserRow>(&sql)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        for r in rows {
+            if !seen.iter().any(|x| x.id == r.id) {
+                seen.push(r);
+            }
+            if seen.len() as i64 >= limit {
+                break;
+            }
+        }
+    }
+    Ok(seen)
 }
 
 fn sql_like_escape(q: &str) -> String {
@@ -774,6 +924,10 @@ pub async fn users_explore(
     // $1 = hostname (null ⇒ no filter), $2 = me (null ⇒ no exclusions);
     // both bound, never interpolated — hostname is user input.
     sql.push_str(r#" AND ($1::text IS NULL OR "host" = lower($1))"#);
+    // generateMutedUserQueryForUsers + generateBlockQueryForUsers
+    // (QueryService.ts): mute-exclusions plus BOTH blocking directions —
+    // users the viewer blocks AND users who block the viewer are excluded
+    // (e2e "ブロックしてきているユーザーが含まれる" excludes:true).
     sql.push_str(
         r#" AND ($2::text IS NULL OR "user"."id" NOT IN
               (SELECT "muteeId" FROM "muting" WHERE "muterId" = $2))"#,
@@ -781,6 +935,10 @@ pub async fn users_explore(
     sql.push_str(
         r#" AND ($2::text IS NULL OR "user"."id" NOT IN
               (SELECT "blockeeId" FROM "blocking" WHERE "blockerId" = $2))"#,
+    );
+    sql.push_str(
+        r#" AND ($2::text IS NULL OR "user"."id" NOT IN
+              (SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2))"#,
     );
     sql.push_str(&format!(
         r#" ORDER BY "{}" {} LIMIT {} OFFSET {}"#,

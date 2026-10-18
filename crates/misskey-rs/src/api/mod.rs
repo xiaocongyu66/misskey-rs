@@ -20,6 +20,12 @@ mod social;
 // census slice) — db paths in mk-db/src/freq.rs; the users/notes guest path
 // and the admin/update-meta pinnedUsers slice ride along as requisites.
 mod freq;
+// i/update long-tail wave: drive/files/create (upload) + i/pin + i/unpin +
+// users/update-memo endpoints closing the users.ts を書き換えることができる census
+mod drive;
+// gate-roles: minimal admin/roles/create + admin/roles/assign seeding the
+// users.ts role fixtures (Publicなロール/バッヂロール census)
+mod roles_lite;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -173,6 +179,23 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return users_show(&state, &body, token).await;
     }
 
+    // ==== gate-roles DISPATCH ARM (admin/roles/create + assign) ====
+    // Noses in ahead of the admin/* arm (roles_lite owns only these two
+    // names; everything else keeps falling through to admin::handle).
+    if roles_lite::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return roles_lite::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END gate-roles DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -182,6 +205,34 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return admin::handle(&state, &name, req).await;
     }
     // ==== END ADMIN DISPATCH ARM ====
+
+    // ==== i/update TAIL DISPATCH ARM (drive upload + pin + memo) ====
+    // Self-contained block so co-agent rebases stay trivial (mirrors the
+    // admin-arm pattern). i/pin and i/unpin take a JSON { noteId } body;
+    // drive/files/create is the multipart upload route (upstream fastify
+    // multipart plugin), users/update-memo a JSON { userId, memo } body.
+    if name == "drive/files/create" {
+        return drive::files_create(state, req).await;
+    }
+    if name == "i/pin" || name == "i/unpin" || name == "users/update-memo" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // These routes carry no shared token-extraction quirks: `i` body
+        // field only (the e2e client sends `i`; Bearer handled for parity).
+        let headers = req.headers().clone();
+        let token = extract_token(&body, &headers);
+        return match name.as_str() {
+            "i/pin" => i_pin(&state, &body, token).await,
+            "i/unpin" => i_unpin(&state, &body, token).await,
+            _ => users_update_memo(&state, &body, token).await,
+        };
+    }
+    // ==== END i/update TAIL DISPATCH ARM ====
 
     // social-agent dispatch block: follow/mute/block social actions
     // (following/*, mute/*, blocking/*) — requireCredential, JSON body,
@@ -260,7 +311,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     (StatusCode::OK, Json(result)).into_response()
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -463,6 +514,11 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
         true,
     ))
     .unwrap_or(json!({}));
+    // SignupApiService returns the MeDetailed pack: complete the role-policy
+    // keys the local pack struct does not carry yet (see apply_me_role_compat
+    // — the 作りたて census case deep-equals DEFAULT_POLICIES and the compat
+    // mutingNotificationTypes key, pack L618/L623 upstream).
+    apply_me_role_compat(&mut packed);
     if let Some(obj) = packed.as_object_mut() {
         obj.insert("token".to_string(), json!(outcome.token.clone()));
     }
@@ -613,6 +669,8 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
 
     // userIds array form: missing users are suppressed upstream
     if let Some(ids) = body.get("userIds").and_then(|v| v.as_array()) {
+        // gate-roles: viewer flag once per request, per-target role rows below
+        let viewer_mod = viewer_is_moderator(pool, me_id.as_deref()).await;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids.iter().filter_map(|v| v.as_str()) {
             let row = match mk_db::user::find_user_by_id(pool, id).await {
@@ -635,14 +693,37 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
                 Ok(r) => r,
                 Err(resp) => return *resp,
             };
-            out.push(mk_core::services::user_pack::pack_inline_opts(
-                &row,
-                &profile,
-                is_me,
-                relation.as_ref(),
-                ctx,
-                false, // users/show: secrets stay hidden even for self
-            ));
+            let packed = {
+                let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(target: "dbg_users_show", error = %e, "user_assigned_roles[userIds]");
+                        continue;
+                    }
+                };
+                let role_pack = mk_core::services::user_pack::RolePack {
+                    assigned: &assigned,
+                    target_is_root: row.username_lower == "root",
+                    viewer_is_moderator: viewer_mod,
+                };
+                let mut packed = mk_core::services::user_pack::pack_inline_with_roles(
+                    &row,
+                    &profile,
+                    is_me,
+                    relation.as_ref(),
+                    ctx,
+                    false, // users/show: secrets stay hidden even for self
+                    Some(&role_pack),
+                );
+                set_viewers_memo(pool, me_id.as_deref(), &row.id, &mut packed).await;
+                // upstream users/show self-view packs the MeDetailed schema
+                // (see the single-target arm note)
+                if is_me {
+                    apply_me_role_compat(&mut packed);
+                }
+                packed
+            };
+            out.push(packed);
         }
         return (StatusCode::OK, Json(json!(out))).into_response();
     }
@@ -685,19 +766,41 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-
-    (
-        StatusCode::OK,
-        Json(mk_core::services::user_pack::pack_inline_opts(
+    // gate-roles: badge + public role lists and the merged-policy flags
+    // (UserEntityService.pack reads roleService per user).
+    let viewer_mod = viewer_is_moderator(pool, me_id.as_deref()).await;
+    let packed = {
+        let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(target: "dbg_users_show", error = %e, "user_assigned_roles");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        let role_pack = mk_core::services::user_pack::RolePack {
+            assigned: &assigned,
+            target_is_root: row.username_lower == "root",
+            viewer_is_moderator: viewer_mod,
+        };
+        let mut packed = mk_core::services::user_pack::pack_inline_with_roles(
             &row,
             &profile,
             is_me,
             relation.as_ref(),
             ctx,
             false, // users/show: secrets stay hidden even for self
-        )),
-    )
-        .into_response()
+            Some(&role_pack),
+        );
+        set_viewers_memo(pool, me_id.as_deref(), &row.id, &mut packed).await;
+        // upstream users/show self-view packs the MeDetailed schema (i parity;
+        // secrets stay hidden per includeSecrets: false)
+        if is_me {
+            apply_me_role_compat(&mut packed);
+        }
+        packed
+    };
+
+    (StatusCode::OK, Json(packed)).into_response()
 }
 
 /// Relation lookup for the pack, mirroring upstream `getRelation` scope:
@@ -716,6 +819,37 @@ async fn build_relation(
         Err(e) => {
             tracing::error!(target: "dbg_users_show", error = %e, "get_relation");
             Err(Box::new(api_err(ApiError::internal_error())))
+        }
+    }
+}
+
+/// gate-roles helper: `RoleService.isModerator(me)` for the pack (admin.rs
+/// root shortcut: `meta.rootUserId` || `usernameLower == 'root'`; falls
+/// through to assigned moderator/administrator roles).
+async fn viewer_is_moderator(pool: &mk_db::sqlx::PgPool, me_id: Option<&str>) -> bool {
+    let Some(me_id) = me_id else {
+        return false;
+    };
+    match mk_db::admin::root_user_id(pool).await {
+        Ok(Some(root)) if root == me_id => return true,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "root_user_id");
+        }
+    }
+    match mk_db::user::find_user_by_id(pool, me_id).await {
+        Ok(Some(row)) if row.username_lower == "root" => return true,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "find_user_by_id[viewer]");
+            return false;
+        }
+    }
+    match mk_db::role::user_assigned_roles(pool, me_id).await {
+        Ok(assigned) => mk_core::services::role::has_moderator_role(&assigned),
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "user_assigned_roles[viewer]");
+            false
         }
     }
 }
@@ -863,6 +997,7 @@ async fn i_route(
         Json({
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
+            apply_me_role_compat(&mut v);
             v
         }),
     )
@@ -1002,9 +1137,12 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
     let lang = opt_nullable_str(body, "lang")?;
     let url = opt_nullable_str(body, "url")?;
     // birthday column is character(10): "YYYY-MM-DD" strings persist as-is,
-    // undefined/null persist as NULL.
+    // explicit null → NULL, ABSENT → untouched (upstream i/update.ts L296
+    // `if (ps.birthday !== undefined)` — collapsing undefined into the null
+    // branch re-nulled unchanged birthdays on every partial update)
     let birthday = match body.get("birthday") {
-        None | Some(Value::Null) => Some(None),
+        None => None,
+        Some(Value::Null) => Some(None),
         Some(Value::String(s)) => {
             if !valid_birthday(s) {
                 return Err(invalid_param("birthday", "expected YYYY-MM-DD"));
@@ -1158,8 +1296,25 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         Err(resp) => return resp,
     };
 
+    // --- avatar/banner drive-file swap (i/update.ts L377-411) ---
+    // `if (ps.avatarId)` → drive lookup (owned + image/*) → denormal
+    // avatarUrl/avatarBlurhash written onto the user row; `=== null` → the
+    // triple is nulled (pack falls back to the identicon URL).
+    let avatar_op = match avatar_banner_op(state, pool, &me_id, body.get("avatarId"), true).await {
+        Ok(op) => op,
+        Err(resp) => return resp,
+    };
+    let banner_op = match avatar_banner_op(state, pool, &me_id, body.get("bannerId"), false).await {
+        Ok(op) => op,
+        Err(resp) => return resp,
+    };
+
     if let Err(e) = mk_db::user::update_profile_subset(pool, &me_id, &update).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_profile_subset");
+        return api_err(ApiError::internal_error());
+    }
+    if let Err(e) = mk_db::user::update_avatar_banner(pool, &me_id, avatar_op, banner_op).await {
+        tracing::error!(target: "dbg_i_update", error = %e, "update_avatar_banner");
         return api_err(ApiError::internal_error());
     }
 
@@ -1203,6 +1358,7 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         Json({
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
+            apply_me_role_compat(&mut v);
             v
         }),
     )
@@ -1220,6 +1376,494 @@ async fn apply_me_unread(pool: &mk_db::sqlx::PgPool, packed: &mut Value) {
             }
         }
         Err(e) => tracing::error!(target: "dbg_i", error = %e, "has_unread"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// i/update long-tail wave: Me-detailed role-compat injection + i/pin +
+// i/unpin + users/update-memo (users.ts を書き換えることができる census tail)
+// ---------------------------------------------------------------------------
+
+/// `RoleService.DEFAULT_POLICIES` (RoleService.ts L78). `getUserPolicies` =
+/// DEFAULT merged with meta.policies; no roles infrastructure exists yet, and
+/// the e2e asserts `response.policies` deep-equals DEFAULT_POLICIES verbatim.
+/// TODO(M4): derive from role rows once admin/roles lands.
+pub(crate) fn default_policies_value() -> Value {
+    json!({
+        "gtlAvailable": true,
+        "ltlAvailable": true,
+        "canPublicNote": true,
+        "mentionLimit": 20,
+        "canInvite": false,
+        "inviteLimit": 0,
+        "inviteLimitCycle": 60 * 24 * 7,
+        "inviteExpirationTime": 0,
+        "canManageCustomEmojis": false,
+        "canManageAvatarDecorations": false,
+        "canSearchNotes": false,
+        "canSearchUsers": true,
+        "canUseTranslator": true,
+        "canHideAds": false,
+        "canCreateChannel": true,
+        "driveCapacityMb": 100,
+        "maxFileSizeMb": 30,
+        "alwaysMarkNsfw": false,
+        "canUpdateBioMedia": true,
+        "pinLimit": 5,
+        "antennaLimit": 5,
+        "wordMuteLimit": 200,
+        "webhookLimit": 3,
+        "clipLimit": 10,
+        "noteEachClipsLimit": 200,
+        "userListLimit": 10,
+        "userEachUserListsLimit": 50,
+        "rateLimitFactor": 1,
+        "avatarDecorationLimit": 1,
+        "canImportAntennas": false,
+        "canImportBlocking": false,
+        "canImportFollowing": false,
+        "canImportMuting": false,
+        "canImportUserLists": false,
+        "chatAvailability": "available",
+        "uploadableFileTypes": [
+            "text/*",
+            "application/json",
+            "image/*",
+            "video/*",
+            "audio/*",
+        ],
+        "noteDraftLimit": 10,
+        "scheduledNoteLimit": 1,
+        "watermarkAvailable": true,
+    })
+}
+
+/// MeDetailed key-set completions the pack struct does not carry yet:
+/// `policies: getUserPolicies(...)` (UserEntityService.pack L623) and the
+/// backward-compat `mutingNotificationTypes: []` (pack L618, 後方互換のため).
+/// Applied at every MeDetailed emit point (signup, i, i/update, i/pin,
+/// i/unpin) because the e2e `meDetailed()` helper builds `expected` from the
+/// signup/i responses, so ALL me-shaped dicts must carry the same keys.
+/// PACK-SIDE TODO (mk-core user_pack + me_detailed_fresh): move these into
+/// the pack structs when that surface reopens; upstream truth is pack
+/// L618/L623.
+pub(crate) fn apply_me_role_compat(packed: &mut Value) {
+    if let Some(obj) = packed.as_object_mut() {
+        obj.insert("mutingNotificationTypes".into(), json!([]));
+        obj.insert("policies".into(), default_policies_value());
+    }
+}
+
+/// Shared requireCredential chain for the tail endpoints (same order as
+/// i_update): native 16-char token → local user id → suspended gate.
+pub(crate) async fn require_credential_me_id(
+    pool: &mk_db::sqlx::PgPool,
+    token: Option<&str>,
+    dbg: &'static str,
+) -> Result<String, Response> {
+    let Some(tok) = token.filter(|t| t.len() == 16) else {
+        return Err(authentication_failed());
+    };
+    let me_id = match mk_db::user::find_local_user_id_by_token(pool, tok).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_tail", endpoint = dbg, error = %e, "find_local_user_id_by_token");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    };
+    let Some(me_id) = me_id else {
+        return Err(authentication_failed());
+    };
+    match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(Some(row)) => {
+            if row.is_suspended {
+                return Err(api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_SUSPENDED",
+                    "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                    "Your account has been suspended.",
+                )));
+            }
+        }
+        Ok(None) => return Err(authentication_failed()),
+        Err(e) => {
+            tracing::error!(target: "dbg_tail", endpoint = dbg, error = %e, "find_user_by_id");
+            return Err(api_err(ApiError::internal_error()));
+        }
+    }
+    Ok(me_id)
+}
+
+/// Packed MeDetailed of `me` (no secrets — upstream i/pin/i/unpin pack with
+/// the default opts, includeSecrets default false) with the user's pinned
+/// note ids/notes injected (pack L552-556; pins live in `user_note_pining`,
+/// packed `pinnedNotes` re-packs each note with `{ detail: true }` — the
+/// same shape `notes/show` returns).
+async fn pack_me_with_pins(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+) -> Result<Value, Response> {
+    let row = mk_db::user::find_user_by_id(pool, me_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "dbg_pin", error = %e, "find_user_by_id");
+            api_err(ApiError::internal_error())
+        })?
+        .ok_or_else(authentication_failed)?;
+    let profile = mk_db::user::find_profile(pool, &row.id)
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "dbg_pin", error = %e, "find_profile");
+            api_err(ApiError::internal_error())
+        })?;
+    let ctx = mk_core::services::user_pack::InstanceCtx {
+        url: &state.config.url,
+        host: &state.config.host(),
+    };
+    let mut packed =
+        mk_core::services::user_pack::pack_inline_opts(&row, &profile, true, None, ctx, false);
+    apply_me_unread(pool, &mut packed).await;
+    apply_me_role_compat(&mut packed);
+    match mk_db::pin::pinned_note_ids(pool, me_id).await {
+        Ok(ids) => {
+            let mut notes = Vec::with_capacity(ids.len());
+            for id in &ids {
+                match pack_note(state, pool, id).await {
+                    Ok(n) => notes.push(n),
+                    Err(r) => {
+                        // Deleted note under a pin: upstream innerJoins note so
+                        // the pin simply disappears from the pack.
+                        let _ = r;
+                    }
+                }
+            }
+            if let Some(obj) = packed.as_object_mut() {
+                obj.insert("pinnedNoteIds".into(), json!(ids));
+                obj.insert("pinnedNotes".into(), json!(notes));
+            }
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_pin", error = %e, "pinned_note_ids");
+        }
+    }
+    Ok(packed)
+}
+
+/// `POST /api/i/pin` — `NotePiningService.addPinned` + packed MeDetailed.
+async fn i_pin(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_credential_me_id(pool, token.as_deref(), "dbg_pin").await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(note_id) = body.get("noteId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "noteId",
+            "reason": "required",
+        })));
+    };
+
+    // addPinned: the note must exist and belong to the caller.
+    let note = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(target: "dbg_pin", error = %e, "find_note_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let note = match note {
+        Some(n) if n.user_id == me_id => n,
+        _ => {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "NO_SUCH_NOTE",
+                "56734f8b-3928-431e-bf80-6ff87df40cb3",
+                "No such note.",
+            ));
+        }
+    };
+    match mk_db::pin::pining_exists(pool, &me_id, note_id).await {
+        Ok(true) => {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "ALREADY_PINNED",
+                "8b18c2b7-68fe-4edb-9892-c0cbaeb6c913",
+                "That note has already been pinned.",
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_pin", error = %e, "pining_exists");
+            return api_err(ApiError::internal_error());
+        }
+    }
+    // DEFAULT_POLICIES.pinLimit (no role infra yet)
+    match mk_db::pin::count_pinings(pool, &me_id).await {
+        Ok(n) if n >= 5 => {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "PIN_LIMIT_EXCEEDED",
+                "72dab508-c64d-498f-8740-a8eec1ba385a",
+                "You can not pin notes any more.",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_pin", error = %e, "count_pinings");
+            return api_err(ApiError::internal_error());
+        }
+    }
+    if let Err(e) =
+        mk_db::pin::insert_pining(pool, &mk_types::id::gen_aid_now(), &me_id, &note.id).await
+    {
+        tracing::error!(target: "dbg_pin", error = %e, "insert_pining");
+        return api_err(ApiError::internal_error());
+    }
+
+    match pack_me_with_pins(state, pool, &me_id).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/i/unpin` — `NotePiningService.removePinned` + packed MeDetailed.
+async fn i_unpin(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_credential_me_id(pool, token.as_deref(), "dbg_pin").await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(note_id) = body.get("noteId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "noteId",
+            "reason": "required",
+        })));
+    };
+
+    // removePinned: same ownership gate, error id differs from addPinned.
+    let note = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(target: "dbg_pin", error = %e, "find_note_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    match note {
+        Some(n) if n.user_id == me_id => {
+            if let Err(e) = mk_db::pin::delete_pining(pool, &me_id, &n.id).await {
+                tracing::error!(target: "dbg_pin", error = %e, "delete_pining");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        _ => {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "NO_SUCH_NOTE",
+                "454170ce-9d63-4a43-9da1-ea10afe81e21",
+                "No such note.",
+            ));
+        }
+    }
+
+    match pack_me_with_pins(state, pool, &me_id).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/users/update-memo` — endpoints/users/update-memo.ts: upsert or
+/// delete the viewer's personal memo on a target user; void response
+/// (endpoint-base replies 204 for the undefined return).
+async fn users_update_memo(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_credential_me_id(pool, token.as_deref(), "dbg_memo").await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(user_id) = body.get("userId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "userId",
+            "reason": "required",
+        })));
+    };
+    // paramDef requires `memo` (string, nullable); absence is INVALID_PARAM.
+    let memo = match body.get("memo") {
+        Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "memo",
+                "reason": "expected a string or null",
+            })));
+        }
+        None => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "memo",
+                "reason": "required",
+            })));
+        }
+    };
+
+    // GetterService.getUser → NO_SUCH_USER on unknown target
+    let target = match mk_db::user::find_user_by_id(pool, user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_memo", error = %e, "find_user_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    match target {
+        Some(_) => {}
+        None => {
+            return api_err(ApiError::new(
+                404,
+                mk_types::api_error::ApiErrorKind::Client,
+                "NO_SUCH_USER",
+                "6fef56f3-e765-4957-88e5-c6f65329b8a5",
+                "No such user.",
+            ));
+        }
+    }
+
+    // 引数がnullか空文字であれば、パーソナルメモを削除する
+    // (written as `!is_empty` so the guard never reads a binding the `None`
+    // alternative of an or-pattern would not produce)
+    let result = match memo {
+        Some(ref m) if !m.is_empty() => {
+            mk_db::memo::set_user_memo(pool, &mk_types::id::gen_aid_now(), &me_id, user_id, m).await
+        }
+        _ => mk_db::memo::delete_user_memo(pool, &me_id, user_id).await,
+    };
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_memo", error = %e, "update_memo");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// users/show memo completion: upstream pack reads the viewer's `user_memo`
+/// row for an other-person view (UserEntityService.pack L445-448) and keeps
+/// null on self/anonymous views. Post-pack injection until the pack struct
+/// grows a viewer-aware memo input (PACK-SIDE TODO, mk-core user_pack).
+async fn set_viewers_memo(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: Option<&str>,
+    target_id: &str,
+    packed: &mut Value,
+) {
+    let Some(me_id) = me_id else {
+        return; // anonymous viewer → pack's memo: null stands
+    };
+    if me_id == target_id {
+        return; // self view → null stands
+    }
+    match mk_db::memo::find_user_memo(pool, me_id, target_id).await {
+        Ok(memo) => {
+            if let Some(obj) = packed.as_object_mut() {
+                obj.insert("memo".into(), json!(memo));
+            }
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_users_show", error = %e, "find_user_memo");
+        }
+    }
+}
+
+/// `i/update.ts` L377-411: parse the avatarId/bannerId param into the
+/// drive-file swap op, validating existence/ownership (`NO_SUCH_AVATAR`) and
+/// MIME (`AVATAR_NOT_AN_IMAGE`), and resolving the public URL like
+/// `DriveFileEntityService.getPublicUrl` (avatar mode goes through the media
+/// proxy, `{url}/proxy/avatar.webp?url=…&avatar=1`).
+async fn avatar_banner_op(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+    param: Option<&Value>,
+    is_avatar: bool,
+) -> Result<mk_db::user::AvatarBannerOp, Response> {
+    let Some(param) = param else {
+        return Ok(mk_db::user::AvatarBannerOp::Untouched);
+    };
+    match param {
+        Value::Null => Ok(mk_db::user::AvatarBannerOp::Clear),
+        Value::String(id) => {
+            let file = match mk_db::drive::find_drive_file(pool, id).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(target: "dbg_i_update", error = %e, "find_drive_file");
+                    return Err(api_err(ApiError::internal_error()));
+                }
+            };
+            let file = match file {
+                Some(f) if f.user_id.as_deref() == Some(me_id) => f,
+                _ => {
+                    return Err(api_err(ApiError::new(
+                        400,
+                        mk_types::api_error::ApiErrorKind::Client,
+                        if is_avatar {
+                            "NO_SUCH_AVATAR"
+                        } else {
+                            "NO_SUCH_BANNER"
+                        },
+                        if is_avatar {
+                            "539f3a45-f215-4f81-a9a8-31293640207f"
+                        } else {
+                            "0d8f5629-f210-41c2-9433-735831a58595"
+                        },
+                        if is_avatar {
+                            "No such avatar file."
+                        } else {
+                            "No such banner file."
+                        },
+                    )));
+                }
+            };
+            if !file.file_type.starts_with("image/") {
+                return Err(api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    if is_avatar {
+                        "AVATAR_NOT_AN_IMAGE"
+                    } else {
+                        "BANNER_NOT_AN_IMAGE"
+                    },
+                    if is_avatar {
+                        "f419f9f8-2f4d-46b1-9fb4-49d3a2fd7191"
+                    } else {
+                        "75aedb19-2afd-4e6d-87fc-67941256fa60"
+                    },
+                    if is_avatar {
+                        "The file specified as an avatar is not an image."
+                    } else {
+                        "The file specified as a banner is not an image."
+                    },
+                )));
+            }
+            let url = drive::get_public_url(&state.config.url, &file, is_avatar);
+            Ok(mk_db::user::AvatarBannerOp::Set {
+                id: file.id.clone(),
+                url,
+                blurhash: file.blurhash.clone(),
+            })
+        }
+        Some(_) => Err(api_err(ApiError::invalid_param(json!({
+            "param": if is_avatar { "avatarId" } else { "bannerId" },
+            "reason": "expected a string or null",
+        })))),
     }
 }
 
@@ -1269,7 +1913,7 @@ async fn users_list(state: &AppState, body: &Value, token: Option<String>) -> Re
         }
     };
 
-    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref(), true).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -1314,7 +1958,7 @@ async fn hashtags_users(state: &AppState, body: &Value, token: Option<String>) -
             }
         };
 
-    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref(), true).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -1322,17 +1966,21 @@ async fn hashtags_users(state: &AppState, body: &Value, token: Option<String>) -
 }
 
 /// Shared result packing for user-search endpoints (upstream packs with the
-/// requesting me; schema 'UserDetailed' by default).
+/// requesting me; schema 'UserDetailed' by default, 'UserLite' when
+/// `detail: false`). gate-roles: thread each target's assigned roles and the
+/// viewer-moderator flag into the pack.
 async fn pack_search_rows(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     rows: Vec<mk_db::user::LocalUserRow>,
     me_id: Option<&str>,
+    detail: bool,
 ) -> Result<Vec<Value>, Box<Response>> {
     let ctx = mk_core::services::user_pack::InstanceCtx {
         url: &state.config.url,
         host: &state.config.host(),
     };
+    let viewer_mod = viewer_is_moderator(pool, me_id).await;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let is_me = me_id == Some(row.id.as_str());
@@ -1343,17 +1991,51 @@ async fn pack_search_rows(
                 return Err(Box::new(api_err(ApiError::internal_error())));
             }
         };
+        if !detail {
+            // schema 'UserLite': badge roles only, no relations
+            let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(target: "dbg_search", error = %e, "user_assigned_roles");
+                    return Err(Box::new(api_err(ApiError::internal_error())));
+                }
+            };
+            let role_pack = mk_core::services::user_pack::RolePack {
+                assigned: &assigned,
+                target_is_root: row.username_lower == "root",
+                viewer_is_moderator: viewer_mod,
+            };
+            out.push(mk_core::services::user_pack::user_lite_value_with_roles(
+                row,
+                ctx,
+                Some(&role_pack),
+            ));
+            continue;
+        }
         let relation = match build_relation(pool, me_id, &row.id, is_me).await {
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
-        out.push(mk_core::services::user_pack::pack_inline_opts(
+        let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(target: "dbg_search", error = %e, "user_assigned_roles");
+                return Err(Box::new(api_err(ApiError::internal_error())));
+            }
+        };
+        let role_pack = mk_core::services::user_pack::RolePack {
+            assigned: &assigned,
+            target_is_root: row.username_lower == "root",
+            viewer_is_moderator: viewer_mod,
+        };
+        out.push(mk_core::services::user_pack::pack_inline_with_roles(
             row,
             &profile,
             is_me,
             relation.as_ref(),
             ctx,
             false,
+            Some(&role_pack),
         ));
     }
     Ok(out)
@@ -1375,6 +2057,7 @@ async fn users_search_by_username_and_host(
         .get("host")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let detail = body.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
     let limit = body
         .get("limit")
         .and_then(|v| v.as_i64())
@@ -1387,6 +2070,7 @@ async fn users_search_by_username_and_host(
         username,
         host.as_deref(),
         &own_host,
+        me_id.as_deref(),
         limit,
     )
     .await
@@ -1398,7 +2082,7 @@ async fn users_search_by_username_and_host(
         }
     };
 
-    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref(), detail).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -1435,6 +2119,9 @@ async fn users_search(state: &AppState, body: &Value, token: Option<String>) -> 
         .unwrap_or(0)
         .max(0);
     let origin = body.get("origin").and_then(|v| v.as_str());
+    // paramDef default `detail: true` — false flips the pack to 'UserLite'
+    // (e2e "を検索することができる(UserLite)").
+    let detail = body.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let rows = match mk_db::user::search_users(pool, query, me_id.as_deref(), origin, limit, offset)
         .await
@@ -1446,7 +2133,7 @@ async fn users_search(state: &AppState, body: &Value, token: Option<String>) -> 
         }
     };
 
-    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref()).await {
+    let packed = match pack_search_rows(state, pool, rows, me_id.as_deref(), detail).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
