@@ -3114,7 +3114,12 @@ async fn admin_meta_server_info_stats() {
     assert_eq!(b["mascotImageUrl"], json!("/assets/ai.png"));
     assert_eq!(b["pinnedUsers"], json!([]));
     assert_eq!(b["enableEmail"], json!(false));
-    assert_eq!(b["notesPerOneAd"], json!(20));
+    // the first signup stamps meta.rootUserId (SignupService L160-162) and
+    // MetaService.update creates the bootstrap row via save({...data, id:'x'},
+    // L117-120) — the row carries the MiMeta COLUMN default for notesPerOneAd
+    // (models/Meta.ts L632-635 default: 0), so the row-present read is 0;
+    // the code-fallback 20 only applies when no meta row exists at all
+    assert_eq!(b["notesPerOneAd"], json!(0));
     assert_eq!(b["policies"]["canPublicNote"], json!(true));
     // admin-only secret fields are present (the requireAdmin gate is the seal)
     assert_eq!(b["hcaptchaSecretKey"], Value::Null);
