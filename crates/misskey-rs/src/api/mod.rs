@@ -2627,25 +2627,12 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
                     "You cannot reply to a specified visibility note with extended visibility.",
                 ));
             }
-            // blocking (blocker = reply target author)
-            if reply_row.user_id != me_id {
-                match mk_db::social::blocking_exists(pool, &reply_row.user_id, &me_id).await {
-                    Ok(true) => {
-                        return api_err(ApiError::new(
-                            400,
-                            mk_types::api_error::ApiErrorKind::Client,
-                            "YOU_HAVE_BEEN_BLOCKED",
-                            "b0df6025-f2e8-44b4-a26a-17ad99104612",
-                            "You have been blocked by this user.",
-                        ));
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::error!(target: "dbg_notes", error = %e, "blocking_exists[reply]");
-                        return api_err(ApiError::internal_error());
-                    }
-                }
-            }
+            // NO blocking check here: upstream CheckActionResolver/gates block
+            // pure RENOTE only (NoteCreateService L530-541 isRenote && !isQuote
+            // — the reply switch below carries no checkBlock). Replying to a
+            // user who blocked you is accepted at creation; the exclusion is
+            // emergent at query time (get-frequently-replied-users
+            // TARGET_BLOCKER_GATE).
             Some(reply_row)
         }
         None => None,
