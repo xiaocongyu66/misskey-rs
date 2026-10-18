@@ -808,9 +808,11 @@ async fn i_route(
 
     (
         StatusCode::OK,
-        Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, None, ctx,
-        )),
+        ({
+            let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
+            apply_me_unread(pool, &mut v).await;
+            v
+        }),
     )
         .into_response()
 }
@@ -1146,11 +1148,27 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
 
     (
         StatusCode::OK,
-        Json(mk_core::services::user_pack::pack_inline(
-            &row, &profile, true, None, ctx,
-        )),
+        ({
+            let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
+            apply_me_unread(pool, &mut v).await;
+            v
+        }),
     )
         .into_response()
+}
+
+/// Me-view unread flag injection: `hasUnreadNotification` reflects the
+/// notification table at request time (pack is pure; upstream computes it
+/// in UserEntityService.pack per call).
+async fn apply_me_unread(pool: &mk_db::sqlx::PgPool, packed: &mut Value) {
+    match mk_db::notification::has_unread(pool, packed["id"].as_str().unwrap_or("")).await {
+        Ok(v) => {
+            if let Some(obj) = packed.as_object_mut() {
+                obj.insert("hasUnreadNotification".into(), Value::Bool(v));
+            }
+        }
+        Err(e) => tracing::error!(target: "dbg_i", error = %e, "has_unread"),
+    }
 }
 
 /// `POST /api/users` — explorable-user list with the sort/state/origin matrix.
