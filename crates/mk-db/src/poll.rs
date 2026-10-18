@@ -33,7 +33,7 @@ pub async fn insert_poll(
     note_id: &str,
     choices: &[String],
     multiple: bool,
-    /// Epoch-ms deadline; None → never expires.
+    // Epoch-ms deadline; None → never expires.
     expires_at_ms: Option<i64>,
     note_visibility: &str,
     user_id: &str,
