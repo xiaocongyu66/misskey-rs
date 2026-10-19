@@ -10354,21 +10354,21 @@ async fn note_notify_following_list_notification_filter() {
     // test 5: the flag is per-edge — bob's own notify:'normal' list carries
     // only his followee (carol), never alice's settings
     let (s, b) = post_json(
-        &app,
+        app.clone(),
         "/api/following/create",
         json!({ "i": bob["token"], "userId": carol_id }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {b}");
     let (s, b) = post_json(
-        &app,
+        app.clone(),
         "/api/following/update",
         json!({ "i": bob["token"], "userId": carol_id, "notify": "normal" }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {b}");
     let (s, b) = post_json(
-        &app,
+        app.clone(),
         "/api/following/list",
         json!({ "i": bob["token"], "notification": true }),
     )
@@ -10377,7 +10377,7 @@ async fn note_notify_following_list_notification_filter() {
     assert_eq!(b.as_array().unwrap().len(), 1);
     assert_eq!(b[0]["followeeId"], carol_id);
     let (s, b) = post_json(
-        &app,
+        app.clone(),
         "/api/following/delete",
         json!({ "i": bob["token"], "userId": carol_id }),
     )
