@@ -682,6 +682,34 @@ mod tests {
         assert_eq!(orders, vec![8, 2]);
     }
 
+    #[test]
+    fn unit_services_with_role_beats_instance_default() {
+        // unit-services — upstream RoleService.ts 'getUserPolicies with role':
+        // instance meta.policies forces the key false, an assigned role
+        // overrides true (useDefault: false, priority 0) → true. Mirrored on
+        // canPublicNote (the boolean key our policy slice carries; upstream
+        // uses canManageCustomEmojis, not mirrored here).
+        let base = UserPolicy::base_with_meta(&json!({ "canPublicNote": false }));
+        let roles = vec![
+            role("r1", 0, json!({ "canPublicNote": pe(json!(true), 0, false) })),
+        ];
+        assert!(UserPolicy::from_base_and_roles(&roles, &base).can_public_note);
+    }
+
+    #[test]
+    fn unit_services_role_with_no_policy_set() {
+        // unit-services — upstream RoleService.ts 'getUserPolicies role with
+        // no policy set': an empty-policies role rides the base value; the
+        // pinLimit override (10) beats the meta default (5) under max
+        // aggregation.
+        let base = UserPolicy::base_with_meta(&json!({ "pinLimit": 5 }));
+        let roles = vec![
+            role("with", 0, json!({ "pinLimit": pe(json!(10), 0, false) })),
+            role("without", 1, json!({})),
+        ];
+        assert_eq!(UserPolicy::from_base_and_roles(&roles, &base).pin_limit, 10);
+    }
+
     #[tokio::test]
     async fn db_backed_no_roles_yields_base_and_role_override_merges() {
         if std::env::var("DATABASE_URL").is_err() {

@@ -363,4 +363,360 @@ mod tests {
             ]))
         );
     }
+
+    // ------------------------------------------------------------------------
+    // unit-services: 1:1 port of upstream test/unit/RoleService.ts
+    // (describe('RoleService') — engine slice this file owns).
+    //
+    // Upstream test → parity site map:
+    // - getUserAssigns (expiry matrix)        → mk-db/src/role.rs tests
+    //   (`expired_excluded...` pins no-expiry / future / past assignments).
+    // - getUserPolicies                        → mk-core/src/services/role.rs
+    //   tests (instance-default / with-role / priority / no-policy-set legs).
+    // - assign + roleAssigned notification     → SKIPPED here: the
+    //   notification leg is not modeled (mk-core notification_pack.rs marks
+    //   roleAssigned deferred) and the e2e census (e2e-harness/roles.ts)
+    //   never demands it — upstream `assign describe`'s assignment-exists
+    //   half is the dedup row in mk-db/src/roles.rs (`assign_role_expiring`).
+    // - getModeratorIds / getAdministratorIds  → SKIPPED here: no equivalent
+    //   moderator-id query anywhere in the tree and no e2e demand (harness
+    //   roles.ts pins pack flags, not id listings) — nothing to wire without
+    //   dead code.
+    // ------------------------------------------------------------------------
+
+    /// CondFacts shaped after an upstream `createUser(...)` args combo.
+    fn facts(
+        created_s_ago: i64,
+        bot: bool,
+        cat: bool,
+        suspended: bool,
+        now_ms: i64,
+    ) -> CondFacts {
+        let mut f = CondFacts::fixture(now_ms - created_s_ago * 1000, now_ms, 0, 0, 0);
+        f.is_bot = bot;
+        f.is_cat = cat;
+        f.is_suspended = suspended;
+        f
+    }
+
+    /// `createConditionalRole({ type })` / `createConditionalRole(formula)`.
+    fn formula(t: &str) -> serde_json::Value {
+        serde_json::json!({ "type": t })
+    }
+
+    fn a_cond_role(id: &str, cond_formula: serde_json::Value) -> mk_db::roles::CondRole {
+        mk_db::roles::CondRole {
+            id: id.to_string(),
+            name: format!("[conditional] {id}"),
+            is_public: true,
+            is_moderator: false,
+            is_administrator: false,
+            as_badge: false,
+            color: None,
+            icon_url: None,
+            description: String::new(),
+            display_order: 0,
+            policies: serde_json::json!({}),
+            target: "conditional".to_string(),
+            cond_formula,
+        }
+    }
+
+    /// `createRole` (manual row) — only the fields `effective_roles` reads.
+    fn a_manual_role(id: &str) -> AssignedRole {
+        AssignedRole {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_public: true,
+            is_moderator: false,
+            is_administrator: false,
+            as_badge: false,
+            color: None,
+            icon_url: None,
+            description: String::new(),
+            display_order: 0,
+            policies: serde_json::json!({}),
+        }
+    }
+
+    fn holds(roles: &[AssignedRole], id: &str) -> bool {
+        roles.iter().any(|r| r.id == id)
+    }
+
+    /// `getUserRoles` against the pure fixture tables.
+    fn roles_for(
+        all: &[mk_db::roles::CondRole],
+        assigns: &[AssignedRole],
+        f: &CondFacts,
+    ) -> Vec<AssignedRole> {
+        effective_roles(all, assigns, f)
+    }
+
+    /// Counter-only variant (followers/following/notes bound tests).
+    fn counts(followers: i64, following: i64, notes: i64) -> CondFacts {
+        let mut f = facts(60, false, false, false, NOW);
+        f.followers_count = followers;
+        f.following_count = following;
+        f.notes_count = notes;
+        f
+    }
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn conditional_role_and() {
+        // upstream '～かつ～': u1 bot-only / u2 cat-only / u3 bot+cat /
+        // u4 neither (suspended) vs role4 = isBot AND isCat.
+        let role1 = formula("isBot");
+        let role2 = formula("isCat");
+        let role4 = serde_json::json!({ "type": "and", "values": [role1, role2] });
+        let u1 = facts(60, true, false, false, NOW);
+        let u2 = facts(60, false, true, false, NOW);
+        let u3 = facts(60, true, true, false, NOW);
+        let u4 = facts(60, false, false, true, NOW);
+        assert!(!eval_cond(&u1, &[], &role4));
+        assert!(!eval_cond(&u2, &[], &role4));
+        assert!(eval_cond(&u3, &[], &role4));
+        assert!(!eval_cond(&u4, &[], &role4));
+    }
+
+    #[test]
+    fn conditional_role_or() {
+        // upstream '～または～' — same users vs isBot OR isCat.
+        let v1 = formula("isBot");
+        let v2 = formula("isCat");
+        let role4 = serde_json::json!({ "type": "or", "values": [v1, v2] });
+        let u1 = facts(60, true, false, false, NOW);
+        let u2 = facts(60, false, true, false, NOW);
+        let u3 = facts(60, true, true, false, NOW);
+        let u4 = facts(60, false, false, true, NOW);
+        assert!(eval_cond(&u1, &[], &role4));
+        assert!(eval_cond(&u2, &[], &role4));
+        assert!(eval_cond(&u3, &[], &role4));
+        assert!(!eval_cond(&u4, &[], &role4));
+    }
+
+    #[test]
+    fn conditional_role_not() {
+        // upstream '～ではない' — u1 bot / u2 cat / u3 bot+cat vs NOT isBot.
+        let role4 = serde_json::json!({ "type": "not", "value": formula("isBot") });
+        assert!(!eval_cond(&facts(60, true, false, false, NOW), &[], &role4));
+        assert!(eval_cond(&facts(60, false, true, false, NOW), &[], &role4));
+        assert!(!eval_cond(&facts(60, true, true, false, NOW), &[], &role4));
+    }
+
+    #[test]
+    fn conditional_role_assigned_to_manual() {
+        // upstream 'マニュアルロールにアサイン済み' — the conditional
+        // roleAssignedTo(manual) fires only for a user holding the manual
+        // role, and getUserRoles keeps BOTH rows (manual + conditional).
+        let manual = a_manual_role("rmanual");
+        let cond = a_cond_role(
+            "rcond",
+            serde_json::json!({ "type": "roleAssignedTo", "roleId": "rmanual" }),
+        );
+        let all = [cond];
+        let f = facts(60, false, false, false, NOW);
+        // user1: no assignments
+        let u1roles = roles_for(&all, &[], &f);
+        assert!(!holds(&u1roles, "rcond"));
+        // user2: assigned the manual role
+        let u2roles = roles_for(&all, &[manual.clone()], &f);
+        assert!(holds(&u2roles, "rmanual"));
+        assert!(holds(&u2roles, "rcond"));
+    }
+
+    #[test]
+    fn conditional_role_is_local_is_remote() {
+        // upstream 'ローカルユーザのみ' / 'リモートユーザのみ'
+        let local = formula("isLocal");
+        let remote = formula("isRemote");
+        let mut u1 = facts(60, false, false, false, NOW);
+        assert!(eval_cond(&u1, &[], &local));
+        assert!(!eval_cond(&u1, &[], &remote));
+        u1.is_local = false; // host = 'example.com'
+        assert!(!eval_cond(&u1, &[], &local));
+        assert!(eval_cond(&u1, &[], &remote));
+    }
+
+    #[test]
+    fn conditional_role_flag_types() {
+        // upstream 'サスペンド済みユーザである' / '鍵アカウントユーザである' /
+        // 'botユーザである' / '猫である' / '「ユーザを見つけやすくする」が
+        // 有効なアカウント' — one off/on pair per single-flag formula.
+        for t in ["isSuspended", "isLocked", "isBot", "isCat", "isExplorable"] {
+            let f = formula(t);
+            let mut off = facts(60, false, false, false, NOW);
+            assert!(!eval_cond(&off, &[], &f), "{t} off must not match");
+            match t {
+                "isSuspended" => off.is_suspended = true,
+                "isLocked" => off.is_locked = true,
+                "isBot" => off.is_bot = true,
+                "isCat" => off.is_cat = true,
+                _ => off.is_explorable = true,
+            }
+            assert!(eval_cond(&off, &[], &f), "{t} on must match");
+        }
+    }
+
+    #[test]
+    fn conditional_role_created_less_than() {
+        // upstream 'ユーザが作成されてから指定期間経過した'
+        // (createdLessThan sec:300) — createdAt after (now - sec*1000):
+        // created 5:01 ago → false, 5:00 → false (strict), 4:59 → true.
+        let role = serde_json::json!({ "type": "createdLessThan", "sec": 300 });
+        assert!(!eval_cond(&facts(301, false, false, false, NOW), &[], &role));
+        assert!(!eval_cond(&facts(300, false, false, false, NOW), &[], &role));
+        assert!(eval_cond(&facts(299, false, false, false, NOW), &[], &role));
+    }
+
+    #[test]
+    fn conditional_role_created_more_than() {
+        // upstream 'ユーザが作成されてから指定期間経っていない'
+        // (createdMoreThan sec:300).
+        let role = serde_json::json!({ "type": "createdMoreThan", "sec": 300 });
+        assert!(eval_cond(&facts(301, false, false, false, NOW), &[], &role));
+        assert!(!eval_cond(&facts(300, false, false, false, NOW), &[], &role));
+        assert!(!eval_cond(&facts(299, false, false, false, NOW), &[], &role));
+    }
+
+    #[test]
+    fn conditional_role_count_bounds() {
+        // upstream 'フォロワー数が指定値以下/以上', 'フォロー数が…',
+        // 'ノート数が…' — 99/100/101 against value 100 (also 10 for notes).
+        let f_le = serde_json::json!({ "type": "followersLessThanOrEq", "value": 100 });
+        let f_ge = serde_json::json!({ "type": "followersMoreThanOrEq", "value": 100 });
+        let g_le = serde_json::json!({ "type": "followingLessThanOrEq", "value": 100 });
+        let g_ge = serde_json::json!({ "type": "followingMoreThanOrEq", "value": 100 });
+        let n_le = serde_json::json!({ "type": "notesLessThanOrEq", "value": 10 });
+        let n_ge = serde_json::json!({ "type": "notesMoreThanOrEq", "value": 10 });
+        let lo = counts(99, 99, 9);
+        let eq = counts(100, 100, 10);
+        let hi = counts(101, 101, 11);
+        let ev = |f: &CondFacts, c: &serde_json::Value| eval_cond(f, &[], c);
+        assert!(ev(&lo, &f_le) && ev(&eq, &f_le) && !ev(&hi, &f_le));
+        assert!(!ev(&lo, &f_ge) && ev(&eq, &f_ge) && ev(&hi, &f_ge));
+        assert!(ev(&lo, &g_le) && ev(&eq, &g_le) && !ev(&hi, &g_le));
+        assert!(!ev(&lo, &g_ge) && ev(&eq, &g_ge) && ev(&hi, &g_ge));
+        assert!(ev(&lo, &n_le) && ev(&eq, &n_le) && !ev(&hi, &n_le));
+        assert!(!ev(&lo, &n_ge) && ev(&eq, &n_ge) && ev(&hi, &n_ge));
+    }
+
+    #[test]
+    fn get_user_roles_merges_manual_and_conditional() {
+        // upstream 'getUserRoles アサインされたロールとコンディショナル
+        // ロールの両方が取得できる' — manual assignment + matching conditional
+        // formula both land in the list.
+        let cond = a_cond_role("rcond", formula("isBot"));
+        let all = [cond];
+        let f = facts(60, true, false, false, NOW);
+        let roles = roles_for(&all, &[a_manual_role("rmanual")], &f);
+        assert!(holds(&roles, "rmanual"));
+        assert!(holds(&roles, "rcond"));
+    }
+
+    #[test]
+    fn get_user_badge_roles_conditional() {
+        // upstream 'getUserBadgeRoles コンディショナルなバッジロールが条件
+        // 一致で返る' + 'roleAssignedTo 条件のバッジロール: アサイン有無で
+        // 変化する' — only asBadge conditional roles surface, gated on the
+        // formula. (Expiry of manual badge assignments is the assignment
+        // fetch, pinned at mk-db/src/role.rs `expired_excluded...`.)
+        let mk = |id: &str, badge: bool, cf: serde_json::Value| {
+            let mut r = a_cond_role(id, cf);
+            r.as_badge = badge;
+            r
+        };
+        let cond_badge = mk("condbadge", true, formula("isBot"));
+        let cond_plain = mk("condplain", false, formula("isBot"));
+        let manual = a_manual_role("rmanual");
+        let assigned_badge = mk(
+            "assignedbadge",
+            true,
+            serde_json::json!({ "type": "roleAssignedTo", "roleId": "rmanual" }),
+        );
+        let all = [cond_badge, cond_plain, assigned_badge];
+        // isBot user with no assignments: bot-conditional badge only.
+        let roles = roles_for(&all, &[], &facts(60, true, false, false, NOW));
+        assert_eq!(badge_ids(&roles), vec!["condbadge".to_string()]);
+        // user2 assigned the manual role: the roleAssignedTo badge fires too.
+        let roles = roles_for(&all, &[manual], &facts(60, false, false, false, NOW));
+        assert_eq!(badge_ids(&roles), vec!["assignedbadge".to_string()]);
+    }
+
+    /// The getUserBadgeRoles asBadge projection (ids for assertion purposes).
+    fn badge_ids(roles: &[AssignedRole]) -> Vec<String> {
+        roles.iter().filter(|r| r.as_badge).map(|r| r.id.clone()).collect()
+    }
+
+    /// upstream 'getUserRoles' against real tables: manual + conditional rows
+    /// merge, and an EXPIRED assignment never reaches the engine (the
+    /// getUserAssigns expiry filter lives in `mk_db::role::user_assigned_roles`).
+    #[tokio::test]
+    async fn db_user_effective_roles_merges_and_expires() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pool = mk_db::test_support::fresh_db("mkcore_roles_v2").await;
+        mk_db::run_migrations(&pool).await.expect("migrations");
+
+        mk_db::sqlx::query(
+            r#"INSERT INTO "user" ("id", "username", "usernameLower", "isBot")
+               VALUES ('u1', 'botuser', 'botuser', TRUE)"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user");
+
+        mk_db::sqlx::query(
+            r#"INSERT INTO "role" ("id", "updatedAt", "name", "description", "lastUsedAt")
+               VALUES ('rManual', now(), 'manual role', '', now())"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert manual role");
+        mk_db::sqlx::query(
+            r#"INSERT INTO "role" ("id", "updatedAt", "name", "description", "lastUsedAt",
+                                   "target", "condFormula")
+               VALUES ('rCondBot', now(), '[conditional] isBot', '', now(), 'conditional', $1::jsonb)"#,
+        )
+        .bind(r#"{"type":"isBot"}"#)
+        .execute(&pool)
+        .await
+        .expect("insert conditional role");
+        mk_db::sqlx::query(
+            r#"INSERT INTO "role" ("id", "updatedAt", "name", "description", "lastUsedAt")
+               VALUES ('rExpiredAssign', now(), 'expired', '', now())"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert expired-assignment role");
+
+        // live manual + live conditional + EXPIRED assignment
+        mk_db::sqlx::query(
+            r#"INSERT INTO "role_assignment" ("id", "userId", "roleId")
+               VALUES ('a1', 'u1', 'rManual'), ('a2', 'u1', 'rExpiredAssign')"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert assignments");
+        mk_db::sqlx::query(
+            r#"UPDATE "role_assignment" SET "expiresAt" = now() - interval '1 second'
+               WHERE "id" = 'a2'"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("expire a2");
+
+        let row = mk_db::user::find_user_by_id(&pool, "u1")
+            .await
+            .expect("find user")
+            .expect("user row");
+        let roles = user_effective_roles(&pool, &row).await.expect("effective");
+
+        // upstream 'getUserRoles 両方が取得できる' + 'getUserAssigns 期限切れ'
+        assert!(holds(&roles, "rManual"), "live manual assignment kept");
+        assert!(holds(&roles, "rCondBot"), "matching conditional granted");
+        assert!(!holds(&roles, "rExpiredAssign"), "expired assignment dropped");
+    }
 }
