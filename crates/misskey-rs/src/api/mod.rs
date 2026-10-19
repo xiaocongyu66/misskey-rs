@@ -256,7 +256,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return social::following_update(&state, &body, token.as_deref()).await;
         }
         if name == "notes/reactions" {
-            return social::notes_reactions(&state, &body).await;
+            return social::notes_reactions(&state, &body, token.as_deref()).await;
         }
         if name == "notes/reactions/create" || name == "notes/delete" {
             return social::note_credential_dispatch(
@@ -3319,6 +3319,77 @@ pub(crate) async fn note_is_visible_for_me(
     }
 }
 
+// arena-apivis: NoteEntityService.shouldHideNote + hideNote (the pack lane).
+// show.ts itself never errors — getNoteWithRelations 404s only on a missing
+// row; the gate rides pack(): every packed note (skipHide=false) runs
+// shouldHideNote against the viewer and, when hidden, hideNote strips the
+// content (text/cw → null, files/fileIds → [], poll/visibleUserIds removed,
+// isHidden: true). The user-flag legs (requireSigninToViewContents /
+// makeNotesHiddenBefore / makeNotesFollowersOnlyBefore) and the
+// ugcVisibilityForVisitor leg are no-ops under the default config the e2e
+// runs ('all', flags unset). NOTE: the specified leg keys off visibleUserIds
+// ONLY — a text mention does NOT unhide a specified note (speM: target2 sees
+// isHidden even though the text mentions them); the followers leg shows the
+// reply-target / mentioned user / follower and hides everyone else.
+
+/// `NoteEntityService.shouldHideNote(packedNote, meId)` — pack-time hide
+/// decision mirroring the upstream ladder (author / guest / specified-listed
+/// / reply-target / mentioned / follower).
+pub(crate) async fn note_should_hide_for_pack(
+    pool: &mk_db::sqlx::PgPool,
+    note: &mk_db::note::NoteRow,
+    me_id: Option<&str>,
+) -> Result<bool, Response> {
+    let Some(me) = me_id else {
+        // guest: only the visibility legs apply (visibility が
+        // specified/followers かつ自分が…でなかったら非表示).
+        return Ok(matches!(
+            note.visibility.as_str(),
+            "specified" | "followers"
+        ));
+    };
+    if note.user_id == me {
+        return Ok(false);
+    }
+    match note.visibility.as_str() {
+        "specified" => Ok(!note.visible_user_ids.iter().any(|v| v == me)),
+        "followers" => {
+            if note.reply_user_id.as_deref() == Some(me) {
+                // 自分の投稿に対するリプライ
+                return Ok(false);
+            }
+            if note.mentions.iter().any(|m| m == me) {
+                // 自分へのメンション
+                return Ok(false);
+            }
+            // フォロワーかどうか
+            let followees = match mk_db::social::followee_ids(pool, me).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "followee_ids[apivis]");
+                    return Err(api_err(ApiError::internal_error()));
+                }
+            };
+            Ok(!followees.iter().any(|f| f == &note.user_id))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `NoteEntityService.hideNote(packedNote)` — the strip applied after a true
+/// shouldHideNote (visibleUserIds/poll → removed, files emptied, isHidden).
+fn note_hide_pack(packed: &mut Value) {
+    if let Some(obj) = packed.as_object_mut() {
+        obj.remove("visibleUserIds");
+        obj.insert("fileIds".into(), json!([]));
+        obj.insert("files".into(), json!([]));
+        obj.insert("text".into(), Value::Null);
+        obj.remove("poll");
+        obj.insert("cw".into(), Value::Null);
+        obj.insert("isHidden".into(), json!(true));
+    }
+}
+
 /// ajv `misskey:id` format (`/^[a-zA-Z0-9]+$/` — endpoint-base.ts L20).
 pub(crate) fn is_alnum_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -3335,6 +3406,10 @@ pub(crate) fn is_alnum_id(s: &str) -> bool {
 /// `load_pack_note` wrapper (E0733), body lives in `load_pack_note_inner`.
 /// Named pinned lifetime (multi-ref args defeat `'_` elision, E0106) and
 /// `+ Send` (endpoint handlers are tokio-spawned by axum).
+/// `hide` runs the arena-apivis shouldHideNote/hideNote tail (the me-aware
+/// pack_note_for family — upstream packs these with the viewer); the
+/// viewer-less pack_note consumers (pins/renote-response/user_notes/
+/// attached-notes) keep their pre-apivis shapes.
 fn load_pack_note<'a>(
     state: &'a AppState,
     pool: &'a mk_db::sqlx::PgPool,
@@ -3342,6 +3417,7 @@ fn load_pack_note<'a>(
     me_id: Option<&'a str>,
     detail: bool,
     depth: u32,
+    hide: bool,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<Option<Value>, Box<Response>>>
@@ -3350,7 +3426,7 @@ fn load_pack_note<'a>(
     >,
 > {
     Box::pin(load_pack_note_inner(
-        state, pool, note_id, me_id, detail, depth,
+        state, pool, note_id, me_id, detail, depth, hide,
     ))
 }
 
@@ -3361,6 +3437,7 @@ async fn load_pack_note_inner(
     me_id: Option<&str>,
     detail: bool,
     depth: u32,
+    hide: bool,
 ) -> Result<Option<Value>, Box<Response>> {
     const MAX_PACK_DEPTH: u32 = 8;
     let row = match mk_db::note::find_note_by_id(pool, note_id).await {
@@ -3427,7 +3504,17 @@ async fn load_pack_note_inner(
     let (reply, renote) = if detail && depth < MAX_PACK_DEPTH {
         // async fn 自再帰は Box 化が必要 (E0733) — nested packs box the future.
         let reply = if let Some(rid) = &row.reply_id {
-            match Box::pin(load_pack_note(state, pool, rid, me_id, false, depth + 1)).await? {
+            match Box::pin(load_pack_note(
+                state,
+                pool,
+                rid,
+                me_id,
+                false,
+                depth + 1,
+                hide,
+            ))
+            .await?
+            {
                 Some(v) => Some(v),
                 None => Some(Value::Null),
             }
@@ -3435,7 +3522,17 @@ async fn load_pack_note_inner(
             None
         };
         let renote = if let Some(rid) = &row.renote_id {
-            match Box::pin(load_pack_note(state, pool, rid, me_id, true, depth + 1)).await? {
+            match Box::pin(load_pack_note(
+                state,
+                pool,
+                rid,
+                me_id,
+                true,
+                depth + 1,
+                hide,
+            ))
+            .await?
+            {
                 Some(v) => Some(v),
                 None => Some(Value::Null),
             }
@@ -3485,7 +3582,30 @@ async fn load_pack_note_inner(
         _ => None,
     };
 
-    Ok(Some(mk_core::packers::note::note_pack_full(
+    // arena-apivis: NoteEntityService.pack tail — shouldHideNote against the
+    // viewer, then the hideNote strip (nested reply/renote recursion rides
+    // this same funnel with the viewer, matching pack's skipHide=false
+    // default). The viewer-less funnel (hide=false) keeps its pre-apivis
+    // shape — its internal consumers (pins/renote/user_notes/attached-notes)
+    // pass None where upstream passes the real viewer, and packing a
+    // guest-hide there would regress clears that upstream never sees.
+    if !hide {
+        return Ok(Some(mk_core::packers::note::note_pack_full(
+            &row,
+            &mk_core::packers::note::NotePackParts {
+                detail,
+                user_lite,
+                created_at_iso: created_at,
+                emojis,
+                files,
+                poll,
+                reply,
+                renote,
+                my_reaction,
+            },
+        )));
+    }
+    let mut packed = mk_core::packers::note::note_pack_full(
         &row,
         &mk_core::packers::note::NotePackParts {
             detail,
@@ -3498,7 +3618,13 @@ async fn load_pack_note_inner(
             renote,
             my_reaction,
         },
-    )))
+    );
+    match note_should_hide_for_pack(pool, &row, me_id).await {
+        Ok(true) => note_hide_pack(&mut packed),
+        Ok(false) => {}
+        Err(r) => return Err(Box::new(r)),
+    }
+    Ok(Some(packed))
 }
 
 /// Viewer-less pack (notes/show + the social/freq slices that round-trip it).
@@ -3507,7 +3633,9 @@ async fn pack_note(
     pool: &mk_db::sqlx::PgPool,
     note_id: &str,
 ) -> Result<Value, Box<Response>> {
-    match load_pack_note(state, pool, note_id, None, true, 0).await? {
+    // hide=false: the consumers of this lane hand their own me where upstream
+    // packs with the viewer — apivis strip stays off (see load_pack_note).
+    match load_pack_note(state, pool, note_id, None, true, 0, false).await? {
         Some(v) => Ok(v),
         None => Err(Box::new(api_err(ApiError::new(
             404,
@@ -3526,7 +3654,8 @@ async fn pack_note_for(
     note_id: &str,
     me_id: Option<&str>,
 ) -> Result<Value, Box<Response>> {
-    match load_pack_note(state, pool, note_id, me_id, true, 0).await? {
+    // hide=true (arena-apivis): viewer packs run the pack-tail shouldHideNote.
+    match load_pack_note(state, pool, note_id, me_id, true, 0, true).await? {
         Some(v) => Ok(v),
         None => Err(Box::new(api_err(ApiError::new(
             // show.ts noSuchNote has NO httpStatusCode → ApiError default 400

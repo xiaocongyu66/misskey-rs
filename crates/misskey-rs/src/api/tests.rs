@@ -8567,19 +8567,13 @@ async fn approval_arena_unlock_readjudicates_pending_requests() {
 
     let receiver = signup(&app, &uname("aur")).await;
     let bob = signup(&app, &uname("aub")).await;
-    let carol = signup(&app, &uname("auc")).await;
     let dan = signup(&app, &uname("aud")).await;
     let (r_id, r_token) = (
         receiver["id"].as_str().unwrap(),
         receiver["token"].as_str().unwrap(),
     );
-    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
-    let (c_id, c_token) = (
-        carol["id"].as_str().unwrap(),
-        carol["token"].as_str().unwrap(),
-    );
+    let (_b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
     let d_token = dan["token"].as_str().unwrap();
-    let d_id = dan["id"].as_str().unwrap();
 
     // leg 1 (指定期間を経過した相手は鍵の解除時に承認される): bob pends under
     // a 1s window, the window expires, the unlock accepts him.
@@ -8597,8 +8591,18 @@ async fn approval_arena_unlock_readjudicates_pending_requests() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
-    // leg 2 (鍵を解除しても指定期間に達していない相手は保留される): carol pends
-    // under a 30d window — the SAME unlock must leave her pending.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // leg 2 (鍵を解除しても指定期間に達していない相手は保留される): carol is
+    // born NOW — her account age is well under 1s when the unlock
+    // re-adjudicates, so the SAME 1s window that expired for bob still
+    // binds her (requires_age_approval reads the follower's AID createdAt,
+    // upstream アカウント作成後の期間によるフォロー承認).
+    let carol = signup(&app, &uname("auc")).await;
+    let (_c_id, c_token) = (
+        carol["id"].as_str().unwrap(),
+        carol["token"].as_str().unwrap(),
+    );
     let (s, v) = post_json(
         app.clone(),
         "/api/following/create",
@@ -8606,7 +8610,6 @@ async fn approval_arena_unlock_readjudicates_pending_requests() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
-    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let (s, v) = post_json(
         app.clone(),
@@ -8651,8 +8654,17 @@ async fn approval_arena_unlock_readjudicates_pending_requests() {
         "body: {v}"
     );
 
-    // leg 3 (鍵の解除と同時に期間を null に変更すると承認される): dan's request
-    // rides an unlock that also clears the window in the SAME i/update.
+    // leg 3 (鍵の解除と同時に期間を null に変更すると承認される): re-lock so
+    // the null flip rides a genuine isLocked true→false transition — dan
+    // (old account) pends under the lock, and the SAME i/update's window
+    // reset makes acceptAllFollowRequests accept him.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": true, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
     let (s, v) = post_json(
         app.clone(),
         "/api/following/create",
@@ -9137,4 +9149,225 @@ async fn arena_nodeinfo_20_document_shape() {
     );
 
     let _ = pool;
+}
+
+// ===== arena-apivis: api-visibility.ts show/reactions gates (upstream
+// test/e2e/api-visibility.ts @ ea2c3aed) =====================================
+//
+// notes/show never errors on an invisible note — the gate rides the pack
+// (NoteEntityService.shouldHideNote + hideNote): text/cw → null, files
+// emptied, isHidden: true. Specified keys off visibleUserIds ONLY (a text
+// mention does not unhide); followers shows the reply-target / mentioned
+// user / follower. notes/reactions gates through getNote + isVisibleForMe →
+// NO_SUCH_NOTE(263fff3d) for invisible notes.
+#[tokio::test]
+async fn apivis_show_pack_hide_lanes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapivis1").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+
+    let alice = signup(&app, &uname("apa")).await;
+    let a_token = alice["token"].as_str().unwrap();
+    let follower = signup(&app, &uname("fpa")).await;
+    let f_token = follower["token"].as_str().unwrap();
+    let target = signup(&app, &uname("tpa")).await;
+    let t_token = target["token"].as_str().unwrap();
+    let t_uname = target["username"].as_str().unwrap();
+    let other = signup(&app, &uname("opa")).await;
+    let o_token = other["token"].as_str().unwrap();
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": alice["id"], "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower follows alice: {s}");
+
+    // [show] followers-post: guest/other → isHidden, follower → full text
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "x", "visibility": "followers", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "fol create: {v}");
+    let fol = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(app.clone(), "/api/notes/show", json!({ "noteId": fol })).await;
+    assert_eq!(s, StatusCode::OK, "guest show fol: {v}");
+    assert_eq!(v["isHidden"], json!(true), "guest [show] followers: {v}");
+    assert_eq!(v["text"], Value::Null, "hideNote strips text: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": fol, "i": o_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "other show fol: {v}");
+    assert_eq!(v["isHidden"], json!(true), "other [show] followers: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": fol, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower show fol: {v}");
+    assert_eq!(v["text"], json!("x"), "follower [show] followers: {v}");
+
+    // [show] specified-post: listed target sees it, everyone else hides — a
+    // text mention does NOT unhide (the leg keys off visibleUserIds only)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "x", "visibility": "specified", "visibleUserIds": [target["id"]], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "spe create: {v}");
+    let spe = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": spe, "i": t_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "listed show spe: {v}");
+    assert_eq!(v["text"], json!("x"), "指定ユーザー [show]: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": spe, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower show spe: {v}");
+    assert_eq!(v["isHidden"], json!(true), "follower [show] specified: {v}");
+    let (s, v) = post_json(app.clone(), "/api/notes/show", json!({ "noteId": spe })).await;
+    assert_eq!(s, StatusCode::OK, "guest show spe: {v}");
+    assert_eq!(v["isHidden"], json!(true), "guest [show] specified: {v}");
+
+    // [show] specified-reply with NO visibleUserIds — the reply target rides
+    // the create-time visibleUsers pull, so された人 sees it without a listing
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "y", "visibility": "public", "i": t_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "tgt create: {v}");
+    let tgt = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "x", "visibility": "specified", "replyId": tgt, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "speR create: {v}");
+    let sper = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": sper, "i": t_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "reply-target show speR: {v}");
+    assert_eq!(
+        v["text"],
+        json!("x"),
+        "された人 [show] specified-reply: {v}"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": sper, "i": o_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "other show speR: {v}");
+    assert_eq!(
+        v["isHidden"],
+        json!(true),
+        "other [show] specified-reply: {v}"
+    );
+
+    // [show] followers-mention — the mentioned non-follower reads it
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": format!("@{t_uname} x"), "visibility": "followers", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "folM create: {v}");
+    let folm = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/show",
+        json!({ "noteId": folm, "i": t_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "mentioned show folM: {v}");
+    assert_eq!(
+        v["text"],
+        json!(format!("@{t_uname} x")),
+        "メンションされた人 [show] followers-mention: {v}"
+    );
+
+    // [reactions] invisible note → NO_SUCH_NOTE(263fff3d) (guest + non-follow)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": fol, "reaction": "👍", "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower reacts: {s}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": fol }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "guest [reactions] followers: {v}"
+    );
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_NOTE"), "{v}");
+    assert_eq!(
+        v["error"]["id"],
+        json!("263fff3d-d0e1-4af4-bea7-8408059b451a"),
+        "{v}"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": fol, "i": o_token }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "other [reactions] followers: {v}"
+    );
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_NOTE"), "{v}");
+    // visible note → 200 with the reaction listed
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": fol, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower [reactions] followers: {v}");
+    assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    // 存在しないノート (misskey:id tolerates 'foo') → NO_SUCH_NOTE
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": "foo", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "nonexistent [reactions]: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_NOTE"), "{v}");
+
+    let _ = (o_token, folm);
 }

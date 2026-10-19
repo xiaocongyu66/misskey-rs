@@ -1256,16 +1256,68 @@ fn opt_i(body: &Value, key: &str, dflt: i64) -> i64 {
     body.get(key).and_then(|v| v.as_i64()).unwrap_or(dflt)
 }
 
-/// `POST /api/notes/reactions` — reaction list for one note.
-pub(crate) async fn notes_reactions(state: &crate::api::AppState, body: &Value) -> Response {
+/// notes/reactions.ts meta.errors.noSuchNote (id differs from show.ts's
+/// 24fcbfc6 — L37 in the upstream file).
+fn reaction_no_such_note() -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        "NO_SUCH_NOTE",
+        "263fff3d-d0e1-4af4-bea7-8408059b451a",
+        "No such note.",
+    ))
+}
+
+/// `POST /api/notes/reactions` — reaction list for one note. Guest-ok, but a
+/// riding credential still authenticates (ApiCallServerService).
+pub(crate) async fn notes_reactions(
+    state: &crate::api::AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
     let Some(pool) = &state.pool else {
         return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    // Optional-credential: present-but-unresolvable token → AUTHENTICATION_FAILED.
+    let me_id: Option<String> = match token {
+        None => None,
+        Some(t) => {
+            if t.len() != 16 {
+                return crate::api::authentication_failed();
+            }
+            match super::resolve_me(pool, Some(t)).await {
+                Some(id) => Some(id),
+                None => return crate::api::authentication_failed(),
+            }
+        }
     };
     let Some(note_id) = opt_id(body, "noteId") else {
         return crate::api::api_err(crate::api::ApiError::invalid_param(
             json!({ "param": "noteId", "reason": "required" }),
         ));
     };
+    // arena-apivis: notes/reactions.ts gate (L68-75) — getNote (missing row →
+    // 9725d0ce remap) → NO_SUCH_NOTE(263fff3d), then
+    // NoteEntityService.isVisibleForMe (invisible → NO_SUCH_NOTE). Guest lanes
+    // only reach public/home (isVisibleForMe returns false for
+    // followers/specified on meId == null).
+    let note = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return reaction_no_such_note(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "reactions find_note_by_id");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    };
+    let visible = match &me_id {
+        Some(me) => crate::api::note_is_visible_for_me(pool, &note, me).await,
+        None => Ok(matches!(note.visibility.as_str(), "public" | "home")),
+    };
+    match visible {
+        Ok(true) => {}
+        Ok(false) => return reaction_no_such_note(),
+        Err(r) => return r,
+    }
     let rows = mk_db::note::list_note_reactions(
         pool,
         note_id,
