@@ -2104,3 +2104,129 @@ pub(crate) async fn following_list(
     }
     ok_json(Value::Array(out))
 }
+
+// unit-misc: upstream test/unit/misc/should-require-follow-approval.ts on the
+// local arm. The upstream shape (profile, isRemote, createdAt, now) maps onto
+// requires_age_approval(profile, follower_id), which derives created/now from
+// the follower's AID and the wall clock, so the exact-'+1ms' boundary probes
+// become 5-second margins (drift between the two clock reads is milliseconds).
+// The remote arm (isRemote=true → followApprovalRemoteSeconds) is
+// upstream-only: the M2 social lane is local-only and remote followers never
+// reach this gate (documented at the call sites).
+#[cfg(test)]
+mod unit_misc_should_require_follow_approval {
+    use super::*;
+
+    const DAY_MS: i64 = 86_400_000;
+    const HOUR_MS: i64 = 3_600_000;
+
+    fn profile_with(local_seconds: Option<i32>) -> Profile {
+        Profile {
+            user_id: String::new(),
+            location: None,
+            birthday: None,
+            description: None,
+            lang: None,
+            fields: serde_json::Value::Null,
+            url: None,
+            email: None,
+            email_verified: false,
+            two_factor_enabled: false,
+            password: None,
+            auto_accept_followed: false,
+            always_mark_nsfw: false,
+            careful_bot: false,
+            security_keys_available: false,
+            use_password_less_login: false,
+            inject_featured_note: false,
+            receive_announcement_email: false,
+            email_notification_types: serde_json::Value::Null,
+            public_reactions: false,
+            auto_sensitive: false,
+            achievements: serde_json::Value::Null,
+            logged_in_dates: Vec::new(),
+            prevent_ai_learning: false,
+            no_crawle: false,
+            verified_links: Vec::new(),
+            notification_recieve_config: serde_json::Value::Null,
+            hard_muted_words: serde_json::Value::Null,
+            muted_words: serde_json::Value::Null,
+            muted_instances: serde_json::Value::Null,
+            following_visibility: String::new(),
+            followers_visibility: String::new(),
+            followed_message: None,
+            follow_approval_local_seconds: local_seconds,
+            follow_approval_remote_seconds: None,
+            two_factor_backup_secret: None,
+        }
+    }
+
+    fn follower_created_at(age_ms: i64) -> String {
+        mk_types::id::gen_aid(super::super::now_ms() as i64 - age_ms)
+    }
+
+    #[test]
+    fn local_window_binds_then_ages_out() {
+        // upstream case 1, local half: a 10-day-old account against a 7-day
+        // window no longer requires approval.
+        let settings = profile_with(Some(7 * 86_400));
+        assert!(!requires_age_approval(
+            &settings,
+            &follower_created_at(10 * DAY_MS)
+        ));
+    }
+
+    #[test]
+    fn window_boundary_ages_out_at_full_span() {
+        // upstream test.each (local: 7 days): just within the span still
+        // requires; just past it does not. Upstream's `now - days*day`
+        // equality maps to the past side because `<` is strict.
+        let settings = profile_with(Some(7 * 86_400));
+        assert!(requires_age_approval(
+            &settings,
+            &follower_created_at(7 * DAY_MS - 5_000)
+        ));
+        assert!(!requires_age_approval(
+            &settings,
+            &follower_created_at(7 * DAY_MS + 5_000)
+        ));
+    }
+
+    #[test]
+    fn half_day_window() {
+        // upstream: second-granular settings (43200 = half a day) bind too.
+        let half_day = profile_with(Some(43_200));
+        assert!(requires_age_approval(
+            &half_day,
+            &follower_created_at(12 * HOUR_MS - 5_000)
+        ));
+        assert!(!requires_age_approval(
+            &half_day,
+            &follower_created_at(12 * HOUR_MS + 5_000)
+        ));
+    }
+
+    #[test]
+    fn disabled_settings_never_require() {
+        // upstream: null and 0 disable the gate entirely (a just-created
+        // account needs no approval).
+        assert!(!requires_age_approval(
+            &profile_with(None),
+            &follower_created_at(0)
+        ));
+        assert!(!requires_age_approval(
+            &profile_with(Some(0)),
+            &follower_created_at(0)
+        ));
+    }
+
+    #[test]
+    fn unparseable_follower_id_never_requires() {
+        // port detail (upstream-only): with no AID timestamp the gate cannot
+        // bind, so the request stays on the manual path.
+        assert!(!requires_age_approval(
+            &profile_with(Some(86_400)),
+            "notanaid"
+        ));
+    }
+}
