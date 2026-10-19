@@ -3904,13 +3904,10 @@ async fn notes_replies(state: &AppState, body: &Value, token: Option<String>) ->
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
-        match note_is_visible_for_me(pool, row, Some(&me_id)).await {
+        match note_is_visible_for_me(pool, row, &me_id).await {
             Ok(true) => {}
             Ok(false) => continue,
-            Err(e) => {
-                tracing::error!(target: "dbg_replies", error = %e, "visible");
-                return api_err(ApiError::internal_error());
-            }
+            Err(r) => return r,
         }
         match pack_note_for(state, pool, &row.id, Some(&me_id)).await {
             Ok(v) => out.push(v),
