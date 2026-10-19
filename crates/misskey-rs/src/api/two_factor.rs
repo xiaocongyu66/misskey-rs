@@ -390,8 +390,7 @@ pub(crate) fn rp_id(state: &AppState) -> String {
 
 pub(crate) fn rp_origin(state: &AppState) -> String {
     let url = &state.config.url;
-    url.trim_end_matches('/')
-        .to_string()
+    url.trim_end_matches('/').to_string()
 }
 
 /// register-key.ts / key-done.ts / remove-key.ts shared gate (L77-96 shape):
@@ -573,7 +572,15 @@ async fn i_key_done(state: &AppState, body: &Value, token: Option<&str>) -> Resp
     };
     // key-done.ts L77-96 gate (profile load → 2FA token gate → bcrypt →
     // twoFactorNotEnabled)
-    if let Err(resp) = key_family_gate(state, body, token, &me, "0d7ec6d2-e652-443e-a7bf-9ee9a0cd77b0").await {
+    if let Err(resp) = key_family_gate(
+        state,
+        body,
+        token,
+        &me,
+        "0d7ec6d2-e652-443e-a7bf-9ee9a0cd77b0",
+    )
+    .await
+    {
         return resp;
     }
 
@@ -643,7 +650,8 @@ async fn i_password_less(state: &AppState, body: &Value, token: Option<&str>) ->
             }
         };
         if count == 0 {
-            if let Err(e) = mk_db::webauthn::set_use_password_less_login(pool, &_me.id, false).await {
+            if let Err(e) = mk_db::webauthn::set_use_password_less_login(pool, &_me.id, false).await
+            {
                 tracing::error!(target: "dbg_two_factor", error = %e, "password_less_false");
                 return internal();
             }
@@ -728,10 +736,7 @@ async fn i_remove_key(state: &AppState, body: &Value, token: Option<&str>) -> Re
     let Ok(password) = str_param(body, "password") else {
         return super::invalid_param("password", "required");
     };
-    if !body
-        .get("credentialId")
-        .is_some_and(|v| v.is_string())
-    {
+    if !body.get("credentialId").is_some_and(|v| v.is_string()) {
         return super::invalid_param("credentialId", "required");
     }
     match body.get("token") {

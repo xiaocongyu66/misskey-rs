@@ -44,8 +44,12 @@ pub fn put_challenge_kind(kind: &'static str, key: &str, challenge: &str) {
     let mut guard = CHALLENGES.lock().unwrap();
     let now = Instant::now();
     guard.retain(|(_, _, deadline)| *deadline > now);
-    guard.retain(|((k_kind, k_key), _, _)| !(k_kind == kind && k_key == key));
-    guard.push(((kind, key.to_string()), challenge.to_string(), now + CHALLENGE_TTL));
+    guard.retain(|((k_kind, k_key), _, _)| !(*k_kind == kind && k_key.as_str() == key));
+    guard.push((
+        (kind, key.to_string()),
+        challenge.to_string(),
+        now + CHALLENGE_TTL,
+    ));
 }
 
 /// Get-and-delete (`getdel`) — upstream reads then deletes unconditionally
@@ -56,7 +60,7 @@ pub fn take_challenge_kind(kind: &str, key: &str) -> Option<String> {
     guard.retain(|(_, _, deadline)| *deadline > now);
     let pos = guard
         .iter()
-        .position(|((k_kind, k_val), _, _)| k_kind == kind && k_val == key)?;
+        .position(|((k_kind, k_val), _, _)| *k_kind == kind && k_val.as_str() == key)?;
     let ((_, _), challenge, _) = guard.remove(pos);
     Some(challenge)
 }
@@ -81,7 +85,9 @@ pub fn take_authentication_challenge(user_id: &str) -> Option<String> {
 /// over the WebCrypto random, upstream default challenge).
 pub fn new_challenge_b64url() -> String {
     let mut buf = [0u8; 32];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)) {
+    match std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+    {
         Ok(()) => {}
         Err(_) => {
             // same total-fn fallback the TOTP secret generator rides
@@ -467,11 +473,7 @@ fn add_mod(a: &U256, b: &U256, m: &U256) -> U256 {
 
 fn sub_mod(a: &U256, b: &U256, m: &U256) -> U256 {
     let (d, borrow) = sub256(a, b);
-    if borrow == 1 {
-        add256(&d, m).0
-    } else {
-        d
-    }
+    if borrow == 1 { add256(&d, m).0 } else { d }
 }
 
 fn mul_wide(a: &U256, b: &U256) -> [u64; 8] {
@@ -586,7 +588,11 @@ fn pt_double(p: &Point) -> Point {
     // Z' = 2*Y*Z
     let yz = mul_mod(&p.y, &p.z, &P);
     let z3 = add_mod(&yz, &yz, &P);
-    Point { x: x3, y: y3, z: z3 }
+    Point {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// General Jacobian addition; degenerate equal points double, opposites fall
@@ -620,10 +626,18 @@ fn pt_add(p1: &Point, p2: &Point) -> Point {
     let two_v = add_mod(&v, &v, &P);
     let x3 = sub_mod(&sub_mod(&r2, &hhh, &P), &two_v, &P);
     // Y3 = R*(V - X3) - S1*H^3
-    let y3 = sub_mod(&mul_mod(&r, &sub_mod(&v, &x3, &P), &P), &mul_mod(&s1, &hhh, &P), &P);
+    let y3 = sub_mod(
+        &mul_mod(&r, &sub_mod(&v, &x3, &P), &P),
+        &mul_mod(&s1, &hhh, &P),
+        &P,
+    );
     // Z3 = Z1*Z2*H
     let z3 = mul_mod(&mul_mod(&p1.z, &p2.z, &P), &h, &P);
-    Point { x: x3, y: y3, z: z3 }
+    Point {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 fn scalar_mult(k: &U256, pt: &Point) -> Point {
@@ -709,7 +723,12 @@ fn der_parse_ecdsa_sig(der: &[u8]) -> Option<(U256, U256)> {
 /// WebCrypto `subtle.verify({ name: 'ECDSA', hash: 'SHA-256' })` over
 /// secp256r1 — `der_sig` is the WebAuthn ASN.1-wrapped (r, s), `msg` is the
 /// raw signature base (authenticatorData || sha256(clientDataJSON)).
-pub fn ecdsa_p256_sha256_verify(msg: &[u8], pub_x: &[u8; 32], pub_y: &[u8; 32], der_sig: &[u8]) -> bool {
+pub fn ecdsa_p256_sha256_verify(
+    msg: &[u8],
+    pub_x: &[u8; 32],
+    pub_y: &[u8; 32],
+    der_sig: &[u8],
+) -> bool {
     let Some((r, s)) = der_parse_ecdsa_sig(der_sig) else {
         return false;
     };
@@ -821,7 +840,10 @@ pub async fn count_by_user(pool: &PgPool, user_id: &str) -> Result<i64, sqlx::Er
         .await
 }
 
-pub async fn list_briefs(pool: &PgPool, user_id: &str) -> Result<Vec<SecurityKeyBrief>, sqlx::Error> {
+pub async fn list_briefs(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<SecurityKeyBrief>, sqlx::Error> {
     sqlx::query_as::<_, SecurityKeyBrief>(
         r#"SELECT "id", "name",
                   to_char("lastUsed" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "lastUsed"
@@ -921,7 +943,7 @@ pub struct VerifiedRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum VerifyFail {
+pub enum VerifyFail {
     /// IdentifiableError upstream → INTERNAL_ERROR 500 on the handler.
     Error,
 }
@@ -956,10 +978,7 @@ fn parse_client_data_json(raw_b64url: &str) -> Result<ClientData, VerifyFail> {
 
 /// parseAuthenticatorData + matchExpectedRPID — returns None when the
 /// authenticator bytes are malformed or the rpIdHash does not match.
-fn parse_auth_data(
-    auth_data: &[u8],
-    rp_id: &str,
-) -> Option<AuthData> {
+fn parse_auth_data(auth_data: &[u8], rp_id: &str) -> Option<AuthData> {
     if auth_data.len() < 37 {
         return None;
     }
@@ -1087,7 +1106,7 @@ pub fn verify_registration(
     let (cose_decoded, _) = cbor_scan(&cose, 0).ok_or(VerifyFail::Error)?;
     let alg = cbor_map_int(&cose_decoded, 3)
         .and_then(|v| match v {
-            Cbor::NInt(n) => Some(*n as i64),
+            Cbor::Neg(n) => Some(*n as i64),
             Cbor::UInt(u) => Some(*u as i64),
             _ => None,
         })
@@ -1156,10 +1175,7 @@ pub async fn verify_authentication(
         return Err(VerifyFail::Error);
     }
     // findOneBy({ id, userId }) — a key owned by someone else is unknown
-    let Some(key) = find_by_id(pool, &id)
-        .await
-        .map_err(|_| VerifyFail::Error)?
-    else {
+    let Some(key) = find_by_id(pool, &id).await.map_err(|_| VerifyFail::Error)? else {
         return Err(VerifyFail::Error);
     };
     if key.user_id != user_id {
@@ -1273,9 +1289,7 @@ pub async fn registration_options(
     let existing = list_briefs(pool, user_id).await?;
     let exclude_credentials: Vec<serde_json::Value> = existing
         .iter()
-        .map(|k| {
-            serde_json::json!({ "id": k.id, "type": "public-key" })
-        })
+        .map(|k| serde_json::json!({ "id": k.id, "type": "public-key" }))
         .collect();
     Ok(serde_json::json!({
         "rp": { "id": rp_id, "name": rp_name },
