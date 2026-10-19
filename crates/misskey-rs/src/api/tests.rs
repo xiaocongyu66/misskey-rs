@@ -11137,12 +11137,17 @@ async fn oauth_oneshot(
     (status, v, acao, www)
 }
 
-// arena-oauth: PKCE S256 — the deterministic pair the pinned spec's
-// 'Verify PKCE' describe block hardcodes.
+// arena-oauth: PKCE S256 — the deterministic verifier the pinned spec's
+// 'Verify PKCE' describe block hardcodes. Its pair ("4w2GDuvaxXlw2l46…" —
+// 94 chars with '.' separators) is a REJECT DECOY, never an S256 output:
+// base64url over 32 digest bytes is always 43 chars from a 64-symbol
+// alphabet. oauth.ts only ever asserts invalid_grant against it, so the
+// rust pin asserts the true RFC7636 transform (BASE64URL(SHA256(verifier)),
+// computed independently) plus the four tamper shapes mismatching it.
 #[test]
 fn oauth_pkce_s256_verify_bytes() {
     let code_verifier = "Ew8VSBiH59JirLlg7ocFpLQ6NXuFC1W_rn8gmRzBKc8";
-    let code_challenge = "4w2GDuvaxXlw2l46k5PFIoIcTGHdzw2i3hrn-C_Q6f7u0-nTYKd-beVEYy9XinYsGtAix.Nnvr.GByD3lAii2ibPRsSDrZgIN0YQb.kfevcfR9aDKoTLyOUm4hW4ABhs";
+    let code_challenge = "iT8CFYv5In71phRqghCxDCOn0icAMP51XC8wrMBLIRg";
     assert_eq!(
         crate::api::oauth::s256_challenge(code_verifier),
         code_challenge,
@@ -11434,11 +11439,8 @@ fn oauth_html_client_scan_parity() {
     let (uris, name, logo) = crate::api::oauth::parse_client_html(multi, &base, &id);
     assert_eq!(
         uris,
-        vec![
-            "http://127.0.0.1:3001/redirect2".to_string(),
-            "http://127.0.0.1:3001/redirect".to_string(),
-        ],
-        "link[rel=redirect_uri][href] pairs resolve against the document URL"
+        vec!["/redirect2".to_string(), "/redirect".to_string()],
+        "link[rel=redirect_uri][href] collected RAW — discovery resolves the list against the final URL (redirectUris.map(uri => new URL(uri, res.url)))"
     );
     assert_eq!(name.as_deref(), Some("Misklient"), "h-app p-name text");
     assert_eq!(logo, None);
