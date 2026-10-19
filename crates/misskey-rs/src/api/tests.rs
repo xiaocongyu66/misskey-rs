@@ -10502,3 +10502,88 @@ async fn note_notify_push_leg_note_reason() {
 
     let _ = pool;
 }
+// api-final: the api.ts close-out pins (upstream test/e2e/api.ts) — the four
+// legs the 2703917 tail left unasserted locally: the non-nullable
+// `default:null` reject (General validation), the Bearer-only
+// Authentication-header SUCCESS leg, the exact invalid_token challenge bytes
+// (#sendAuthenticationError L141) and the native-bob ROLE gate id
+// (管理者専用のAPIのアクセス制限 failedApiCall rows).
+// ============================================================================
+
+#[tokio::test]
+async fn arena_api_final_closeout_pins() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapifinal").await;
+    let app = crate::build_router(test_state(pool));
+
+    // (1) General validation: non-nullable `default` given a visible null →
+    // 400 (ajv type string, nullable:false — the explicit-null passthrough
+    // only applies to nullableDefault).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/test",
+        json!({ "required": true, "default": null }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INVALID_PARAM"), "body: {v}");
+
+    // alice signs up FIRST → stamped meta."rootUserId" (root bypass).
+    let alice = signup(&app, "alice").await;
+    let a_token = alice["token"].as_str().unwrap();
+
+    // (2) Authentication header > 一般リクエスト: Bearer-only native token on
+    // admin/get-index-stats → 200 array (no `i` in the body at all).
+    let (s, _h, v) = arena_api_post(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({}),
+        Some(a_token),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert!(v.is_array(), "pg_indexes rows: {v}");
+
+    // (3) invalid_token challenge — exact upstream bytes (ApiCallService
+    // #sendAuthenticationError L141).
+    let (s, h, v) = arena_api_post(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({}),
+        Some("syuilo"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert_eq!(
+        hdr(&h, "www-authenticate").as_deref(),
+        Some(
+            "Bearer realm=\"Misskey\", error=\"invalid_token\", \
+             error_description=\"Authentication failed. Please ensure your \
+             token is correct.\""
+        ),
+        "challenge: {:?}",
+        hdr(&h, "www-authenticate")
+    );
+
+    // (4) 管理者専用のAPIのアクセス制限 > bobは一般ユーザー: native token, no
+    // roles → 403 ROLE_PERMISSION_DENIED c3d38592 (role gate ahead of the
+    // app-token kind gate).
+    let alice_bob = signup(&app, "bob").await;
+    let b_token = alice_bob["token"].as_str().unwrap();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({ "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        v["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61"),
+        "body: {v}"
+    );
+}
