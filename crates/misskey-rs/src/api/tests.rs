@@ -9925,11 +9925,23 @@ async fn arena_streaming_main_events_and_app_token() {
     assert_eq!(s, StatusCode::OK, "{v}");
     let mention_note = v["createdNote"]["id"].as_str().unwrap().to_string();
 
-    // 'renote' event (Events/renote test): ayano renotes kyoko's note.
+    // 'renote' event (Events/renote test): ayano renotes kyoko's note. The
+    // target must be KYOKO's own note — upstream NoteCreateService (L872-885,
+    // `note.userId !== renote.userId`) and the port's renote leg suppress the
+    // main 'renote' event when the target is the renoter's own note, so the
+    // earlier leg that renoted ayano's mention note never streamed anything.
     let (s, v) = post_json(
         app.clone(),
         "/api/notes/create",
-        json!({ "renoteId": mention_note, "i": ay_t }),
+        json!({ "text": "ky seed", "i": ky_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let ky_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": ky_note, "i": ay_t }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{v}");
