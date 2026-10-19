@@ -1872,7 +1872,7 @@ pub(crate) async fn following_list(
             | (_, _, _, _, Err(r)) => return r,
         };
     // makePaginationQuery (same converter ff-arena lists run)
-    let (from_id, until_bound, desc) = ff_vis::paginate_bounds(
+    let (from_id, until_bound, desc) = super::ff_vis::paginate_bounds(
         since_id.as_deref(),
         until_id.as_deref(),
         since_date,
@@ -1907,7 +1907,12 @@ pub(crate) async fn following_list(
         });
         match mk_db::user::find_user_by_id(pool, &edge.followee_id).await {
             Ok(Some(row)) => {
-                item["followee"] = ff_vis::pack_edge_user(state, pool, row, Some(&me_id)).await?;
+                item["followee"] =
+                    match super::ff_vis::pack_edge_user(state, pool, row, Some(&me_id)).await {
+                        Ok(v) => v,
+                        // pack errors surface as their own api response
+                        Err(resp) => return resp,
+                    };
             }
             Ok(None) => {}
             Err(e) => {
