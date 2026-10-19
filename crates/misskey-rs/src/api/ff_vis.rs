@@ -66,7 +66,9 @@ fn endpoint_ids(name: &str) -> (&'static str, &'static str) {
 /// order (sinceId+untilId → DESC range; sinceId → ASC; untilId → DESC; then
 /// the date-only branches) mirrors QueryService.ts L54-76. Returns
 /// (exclusive since bound, exclusive until bound, order DESC).
-fn paginate_bounds(
+/// (`pub(crate)` — the note-notify arena's following/list runs the same
+/// converter on its own param line.)
+pub(crate) fn paginate_bounds(
     since_id: Option<&str>,
     until_id: Option<&str>,
     since_date: Option<i64>,
@@ -93,7 +95,9 @@ fn paginate_bounds(
 /// One packed edge user the way `userEntityService.pack(id, me, {
 /// schema: 'UserDetailedNotMe' })` lands in the Following items: the same
 /// roles/memo pipeline users/show runs (badge/public roles + relation block).
-async fn pack_edge_user(
+/// (`pub(crate)` — the note-notify arena's following/list packs its
+/// followee through the identical pipeline.)
+pub(crate) async fn pack_edge_user(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     target: mk_db::user::LocalUserRow,

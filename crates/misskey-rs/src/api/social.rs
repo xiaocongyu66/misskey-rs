@@ -199,6 +199,41 @@ pub(crate) async fn notify_note_event(
     }
 }
 
+/// note-notify (upstream NoteCreateService.create L790-813): the
+/// `data.reply == null` branch — every following row of the author carrying
+/// `notify: 'normal'` gets a notification type 'note' with the fresh note id
+/// (L806 createNotification('note', { noteId })). The caller owns the
+/// `visibility !== 'specified'` guard (L796); `pure_renote` re-adds the
+/// per-follower renote-mute drop (L800-804 — `renoteMutingsCache.fetch(
+/// followerId).has(author)`); text/quote lanes fall through with false.
+/// Muting/self drops ride the shared insert gate as usual.
+pub(crate) async fn notify_note_to_followers(
+    pool: &mk_db::sqlx::PgPool,
+    author_id: &str,
+    note_id: &str,
+    pure_renote: bool,
+) {
+    let follower_ids = match mk_db::social::notify_follower_ids(pool, author_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "notify_follower_ids");
+            return;
+        }
+    };
+    for follower_id in follower_ids {
+        if pure_renote {
+            match mk_db::social::renote_muting_exists(pool, &follower_id, author_id).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(target: "dbg_social", error = %e, "renote_muting_exists");
+                }
+            }
+        }
+        notify_note_event(pool, &follower_id, author_id, "note", note_id).await;
+    }
+}
+
 /// createNotification legs WITHOUT a bound note (packed shape keeps
 /// id/createdAt/type/userId/user — the follow family):
 /// - 'follow' (UserFollowingService.insertFollowingDoc L357),
@@ -1077,6 +1112,13 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
             &id,
         )
         .await;
+        // note-notify: the L790 leg covers renotes too (data.reply == null);
+        // a PURE renote (textless → not a quote) drops renote-muted
+        // followers (L800-804 renoteMutingsCache). visibility 'specified'
+        // renotes sit outside the branch like any other note.
+        if visibility != "specified" {
+            notify_note_to_followers(pool, me_id, &id, text.is_none()).await;
+        }
     }
 
     // TODO(M2+): replyId+renoteId quote-combo reply-target validation
@@ -1763,4 +1805,117 @@ pub(crate) async fn note_credential_dispatch(
     } else {
         notes_delete(state, body, &me_id).await
     }
+}
+
+/// `POST /api/following/list` (endpoints/following/list.ts, requireCredential
+/// read:following — the note-notify arena's read side of the
+/// follow-edge notify flag). `followerId = me` (L54), the `notification:
+/// true` flag adds `following.notify IS NOT NULL` (L56-58), then
+/// QueryService pagination (exclusive aid bounds / sinceId-ASC, limit
+/// 1..100 default 10) and FollowingEntityService.packMany(,
+/// { populateFollowee: true }) — { id, createdAt, followeeId, followerId,
+/// followee }.
+pub(crate) async fn following_list(
+    state: &AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match require_checked_user(pool, token, true).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // paramDef: notification boolean default false; sinceId/untilId/sinceDate/
+    // untilDate cursors; limit 1..100 default 10.
+    let notification = match body.get("notification") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return super::invalid_param("notification", "expected a boolean"),
+    };
+    let id_param = |key: &str| -> Result<Option<String>, Response> {
+        match body.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if super::is_alnum_id(s) => Ok(Some(s.clone())),
+            Some(_) => Err(super::invalid_param(key, "expected an alphanumeric id")),
+        }
+    };
+    let since_id = id_param("sinceId");
+    let until_id = id_param("untilId");
+    let date_param = |key: &str| -> Result<Option<i64>, Response> {
+        match body.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => match v.as_i64() {
+                Some(ms) => Ok(Some(ms)),
+                None => Err(super::invalid_param(key, "expected an integer (ms)")),
+            },
+        }
+    };
+    let since_date = date_param("sinceDate");
+    let until_date = date_param("untilDate");
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => Ok(10u32),
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=100).contains(&n) => Ok(n as u32),
+            Some(_) => Err(super::invalid_param("limit", "must be >= 1 and <= 100")),
+            None => Err(super::invalid_param("limit", "expected an integer")),
+        },
+    };
+    let (since_id, until_id, since_date, until_date, limit) =
+        match (since_id, until_id, since_date, until_date, limit) {
+            (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e)) => (a, b, c, d, e),
+            (Err(r), _, _, _, _)
+            | (_, Err(r), _, _, _)
+            | (_, _, Err(r), _, _)
+            | (_, _, _, Err(r), _)
+            | (_, _, _, _, Err(r)) => return r,
+        };
+    // makePaginationQuery (same converter ff-arena lists run)
+    let (from_id, until_bound, desc) = ff_vis::paginate_bounds(
+        since_id.as_deref(),
+        until_id.as_deref(),
+        since_date,
+        until_date,
+    );
+    let edges = match mk_db::social::list_following_edges(
+        pool,
+        &me_id,
+        notification,
+        from_id.as_deref(),
+        until_bound.as_deref(),
+        desc,
+        limit,
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "list_following_edges");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let mut out = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let mut item = json!({
+            "id": edge.id,
+            "createdAt": mk_core::services::signup::ms_to_iso(
+                mk_types::id::parse_aid_date(&edge.id).unwrap_or_default(),
+            ),
+            "followeeId": edge.followee_id,
+            "followerId": edge.follower_id,
+        });
+        match mk_db::user::find_user_by_id(pool, &edge.followee_id).await {
+            Ok(Some(row)) => {
+                item["followee"] = ff_vis::pack_edge_user(state, pool, row, Some(&me_id)).await?;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_social", error = %e, "following_list followee row");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        out.push(item);
+    }
+    ok_json(Value::Array(out))
 }

@@ -253,7 +253,12 @@ pub async fn ensure_table(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         DO $do$ BEGIN
-            CREATE TYPE public.notification_type_enum AS ENUM ('follow', 'mention', 'reply', 'renote', 'quote', 'reaction', 'pollVote', 'pollEnded', 'receiveFollowRequest', 'followRequestAccepted', 'groupInvited', 'achievementEarned', 'app');
+            CREATE TYPE public.notification_type_enum AS ENUM ('follow', 'mention', 'reply', 'renote', 'quote', 'note', 'reaction', 'pollVote', 'pollEnded', 'receiveFollowRequest', 'followRequestAccepted', 'groupInvited', 'achievementEarned', 'app');
+        -- note-notify: migration 0005 ALTERs 'note' between 'quote' and
+        -- 'reaction' (the NoteCreateService L806 'note' fanout). This
+        -- self-heal path (42P01 → replay, normally after the e2e fixture's
+        -- dropSchema swept the table out) must mint the FINAL enum shape in
+        -- one go — here the CREATE TYPE runs without 0005.
         EXCEPTION WHEN duplicate_object THEN NULL; END $do$;
         "#,
     )
