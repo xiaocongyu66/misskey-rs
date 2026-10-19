@@ -10807,3 +10807,247 @@ async fn arena_streaming_final_poll_quote_and_hashtag() {
     crate::api::streaming::remove_user(&a_id);
     let _ = (kt, at, k_id, pool);
 }
+
+// arena-2fa ==================================================================
+// upstream test/e2e/2fa.ts (pinned ea2c3aed) TOTP lane: the register → done →
+// signin-flow(next: totp) → unregister chain plus the vendored TOTP core in
+// mk-db/src/two_factor.rs. The crypto primitives are the RFC-vector level of
+// the census: SHA-1 (RFC 3174), HMAC-SHA1 (RFC 2202) and 6-digit TOTP-SHA1
+// (RFC 6238 / the otpauth defaults the upstream test drives).
+
+#[test]
+fn two_factor_sha1_and_hmac_rfc_vectors() {
+    // RFC 3174 test suite: "abc" and the 56-char padding-edge message
+    assert_eq!(
+        mk_db::two_factor::sha1(b"abc"),
+        hex20("a9993e364706816aba3e25717850c26c9cd0d89d")
+    );
+    assert_eq!(
+        mk_db::two_factor::sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        hex20("84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    );
+    // RFC 2202 case 1..3-ish shapes: key "key" over the fox, and the
+    // larger-than-block-size key case 6 (80 bytes of 0xaa).
+    assert_eq!(
+        mk_db::two_factor::hmac_sha1(b"key", b"The quick brown fox jumps over the lazy dog"),
+        hex20("de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")
+    );
+    let long_key = [0xaau8; 80];
+    assert_eq!(
+        mk_db::two_factor::hmac_sha1(
+            &long_key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        ),
+        hex20("aa4ae5e15272d00e95705637ce8a3b55ed402112")
+    );
+}
+
+#[test]
+fn two_factor_totp_rfc6238_vectors() {
+    // RFC 6238 appendix B (SHA-1) with the 6-digit truncation the upstream
+    // OTPAuth config uses — secret "12345678901234567890" (ASCII), last six
+    // digits of the published 8-digit values.
+    let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // base32("12345678901234567890")
+    assert_eq!(
+        mk_db::two_factor::totp_code_at(secret, 59).as_deref(),
+        Some("287082")
+    );
+    assert_eq!(
+        mk_db::two_factor::totp_code_at(secret, 1111111109).as_deref(),
+        Some("081804")
+    );
+    assert_eq!(
+        mk_db::two_factor::totp_code_at(secret, 1111111111).as_deref(),
+        Some("050597")
+    );
+    assert_eq!(
+        mk_db::two_factor::totp_code_at(secret, 1234567896).as_deref(),
+        Some("359130")
+    );
+    // ±1 window acceptance mirrors OTPAuth validate({ window: 1 }): a code
+    // one step behind the wall clock still verifies (delta -1).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let now_code = mk_db::two_factor::totp_code_at(secret, now).unwrap();
+    assert_eq!(
+        mk_db::two_factor::verify_totp(secret, &now_code, now + 30),
+        Some(-1)
+    );
+    assert_eq!(mk_db::two_factor::verify_totp(secret, "00000x", now), None);
+    // the ±2 window stays closed (delta of a 60s-old code rejects)
+    let old = mk_db::two_factor::totp_code_at(secret, now - 60).unwrap();
+    assert_eq!(mk_db::two_factor::verify_totp(secret, &old, now), None);
+}
+
+#[test]
+fn two_factor_base32_and_secret_generation() {
+    // RFC 4648 examples, no-padding form
+    assert_eq!(mk_db::two_factor::base32_encode(b"f"), "MY");
+    assert_eq!(mk_db::two_factor::base32_encode(b"fo"), "MZXQ");
+    assert_eq!(mk_db::two_factor::base32_encode(b"foo"), "MZXW6");
+    assert_eq!(
+        mk_db::two_factor::base32_decode("MZXW6===").as_deref(),
+        Some(b"foo".as_slice())
+    );
+    assert_eq!(
+        mk_db::two_factor::base32_decode("mzxw6"),
+        Some(b"foo".to_vec())
+    );
+    assert!(mk_db::two_factor::base32_decode("MZ1W6").is_none());
+    // generate → decode round-trip: 20 bytes → 32 unpadded chars
+    let secret = mk_db::two_factor::generate_secret_base32();
+    assert_eq!(secret.len(), 32, "{secret}");
+    assert!(
+        secret
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+    );
+    assert_eq!(
+        mk_db::two_factor::base32_encode(&mk_db::two_factor::base32_decode(&secret).unwrap()),
+        secret
+    );
+}
+
+#[tokio::test]
+async fn two_factor_register_done_unregister_flow() {
+    // upstream 2fa.ts tests 1+6 (TOTP 設定/解除): register fields, done's
+    // backupCodes, the i twoFactorEnabled flip, the signin-flow totp prompt
+    // (assert.deepStrictEqual shape), the token login and the unregister
+    // back-to-password login. The duplicated-token burn (test 7) rides the
+    // same primitives — covered at the validate level above.
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mk2fa1").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let a = alice["token"].as_str().unwrap().to_string();
+
+    // register: qr/url/secret present, label = username, issuer = host
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/i/2fa/register",
+        json!({ "i": a, "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b["qr"].as_str().is_some());
+    assert!(b["url"].as_str().is_some());
+    assert!(b["secret"].as_str().is_some());
+    assert_eq!(b["label"], json!("alice"));
+    assert_eq!(b["issuer"], json!("127.0.0.1:3000"));
+    let secret = b["secret"].as_str().unwrap().to_string();
+
+    // done: a live TOTP code escalates the temp secret + 5 backup codes
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = mk_db::two_factor::totp_code_at(&secret, now).unwrap();
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/i/2fa/done",
+        json!({ "i": a, "token": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["backupCodes"].as_array().unwrap().len(), 5);
+
+    // i: twoFactorEnabled flipped
+    let (s, b) = post_json(app.clone(), "/api/i", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["twoFactorEnabled"], json!(true));
+
+    // signin-flow without token → EXACTLY { finished: false, next: 'totp' }
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/signin-flow",
+        json!({ "username": "alice", "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!({ "finished": false, "next": "totp" }));
+
+    // signin-flow with the token → finished + i
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/signin-flow",
+        json!({ "username": "alice", "password": "test", "token": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["finished"], json!(true));
+    assert!(b["i"].as_str().is_some());
+
+    // unregister → 204, i flips back, password-only signin works again
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token2 = mk_db::two_factor::totp_code_at(&secret, now).unwrap();
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/i/2fa/unregister",
+        json!({ "i": a, "password": "test", "token": token2 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (s, b) = post_json(app.clone(), "/api/i", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["twoFactorEnabled"], json!(false));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/signin-flow",
+        json!({ "username": "alice", "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["finished"], json!(true));
+}
+
+#[test]
+fn two_factor_duplicated_totp_burn() {
+    // upstream 2fa.ts test 7 core: once a step is claimed (validateOtp's
+    // redis SET NX parity), the same (user, secret, step) never verifies
+    // again inside the 90s ttl.
+    let secret = mk_db::two_factor::generate_secret_base32();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = mk_db::two_factor::totp_code_at(&secret, now).unwrap();
+    let env = mk_db::two_factor::OtpEnv {
+        test_mode: false,
+        check_dup: true,
+    };
+    assert!(mk_db::two_factor::validate_otp(
+        "u-burn", &secret, &token, env
+    ));
+    assert!(!mk_db::two_factor::validate_otp(
+        "u-burn", &secret, &token, env
+    ));
+    // a different user burns independently
+    assert!(mk_db::two_factor::validate_otp(
+        "u-other", &secret, &token, env
+    ));
+    // test-mode without the flag short-circuits (UserAuthService L46-48)
+    let plain = mk_db::two_factor::OtpEnv {
+        test_mode: true,
+        check_dup: false,
+    };
+    assert!(mk_db::two_factor::validate_otp(
+        "u-burn", &secret, "999999", plain
+    ));
+}
+
+fn hex20(s: &str) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    for (i, c) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap();
+    }
+    out
+}

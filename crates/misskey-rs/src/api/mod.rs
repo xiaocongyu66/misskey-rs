@@ -31,6 +31,10 @@ mod roles_lite;
 // soft `isDeleted` flag + the me-view pack field); db path in
 // mk-db/src/delete_account.rs
 mod delete_account;
+// two-factor arena: i/2fa/{register,done,unregister} + the signin-flow totp
+// step (upstream endpoints/i/2fa/*.ts + SigninApiService.ts) — TOTP core and
+// user_profile twoFactor* db paths in mk-db/src/two_factor.rs
+mod two_factor;
 // channels-agent: channels/* domain (channels/create ../favorite slice of
 // upstream endpoints/channels/*) — db paths in mk-db/src/channel.rs
 mod channel;
@@ -135,6 +139,27 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         return reset_route(&state).await;
     }
+    // ==== arena-2fa: _test/env (MISSKEY_TEST_CHECK_DUPLICATED_TOTP toggle) ====
+    // Upstream reads process.env.MISSKEY_TEST_CHECK_DUPLICATED_TOTP inside
+    // UserAuthService.validateOtp; the e2e's sendEnvUpdateRequest rides the
+    // harness controller /env (PORT+1000), which forwards the toggle here.
+    // config.test gate mirrors _test/reset.
+    if name == "_test/env" {
+        if method != Method::POST || !state.config.test {
+            return api_err(ApiError::unknown_endpoint());
+        }
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        if key == "MISSKEY_TEST_CHECK_DUPLICATED_TOTP" {
+            mk_db::two_factor::set_check_duplicated_totp(value == "1");
+        }
+        return (StatusCode::OK, Json(json!({ "success": true }))).into_response();
+    }
+    // ==== END arena-2fa _test/env ====
 
     // Registry endpoints that need a JSON body parsed before dispatch.
     if name == "users/show"
@@ -364,6 +389,25 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return delete_account::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END delete-account DISPATCH ARM ====
+
+    // ==== two-factor DISPATCH ARM (i/2fa/{register,done,unregister}) ====
+    // Self-contained block on the delete_account-arm pattern (2fa arena).
+    // Method check, body parsing and token extraction live in the arm; the
+    // requireCredential gate, the 2FA token gate and the bcrypt compare in
+    // api::two_factor (TOTP core + db paths in mk-db/src/two_factor.rs).
+    if two_factor::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return two_factor::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END two-factor DISPATCH ARM ====
 
     // ==== arena-streaming DISPATCH ARM (miauth/gen-token) ====
     // The /streaming hub's app-token lane (streaming.ts Authentication test):
@@ -1093,24 +1137,103 @@ async fn signin_route(state: &AppState, body: &Value) -> Response {
         .map(|h| mk_core::services::verify_password(&password, h).unwrap_or(false))
         .unwrap_or(false);
 
-    if !same {
-        let _ = mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), &user.id, "", false)
-            .await;
-        return reply_error(403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c");
+    // success reply (SigninService.signin): the signins row is fired async
+    // upstream — insert then the { finished, id, i } envelope.
+    async fn signin_ok(pool: &mk_db::sqlx::PgPool, user_id: &str, token: &str) -> Response {
+        let _ =
+            mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), user_id, "", true).await;
+        (
+            StatusCode::OK,
+            Json(json!({
+                "finished": true,
+                "id": user_id,
+                "i": token,
+            })),
+        )
+            .into_response()
     }
 
-    // success (no-2FA branch); upstream fires the signin record async
-    let _ =
-        mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), &user.id, "", true).await;
-    (
-        StatusCode::OK,
-        Json(json!({
-            "finished": true,
-            "id": user.id,
-            "i": user.token,
-        })),
-    )
-        .into_response()
+    // SigninApiService `fail`: appends the success:false signins row, then the
+    // { error } envelope. failure ids: 932c904e-… password mismatch;
+    // cdf1235b-… TOTP verify; 93b86c4b-… passkey assertion verify.
+    async fn signin_fail(
+        pool: &mk_db::sqlx::PgPool,
+        user_id: &str,
+        status: u16,
+        failure_id: &str,
+    ) -> Response {
+        let _ = mk_db::user::insert_signin(pool, &mk_types::id::gen_aid_now(), user_id, "", false)
+            .await;
+        (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(json!({ "error": { "id": failure_id } })),
+        )
+            .into_response()
+    }
+
+    // ==== arena-2fa: SigninApiService.ts L205+ 2FA branching ====
+    if !profile.two_factor_enabled {
+        // captcha lanes skipped (config.test) — same ? signin : fail(403)
+        if !same {
+            return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
+        }
+        return signin_ok(pool, &user.id, &user.token).await;
+    }
+
+    // 2FA enabled: token (totp) / credential (passkey assertion) /
+    // securityKeysAvailable (passkey request) / plain totp prompt.
+    let body_token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty());
+    if let Some(t) = body_token {
+        if !same {
+            return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
+        }
+        let secrets = match mk_db::two_factor::fetch_secrets(pool, &user.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "dbg_signin", error = %e, "fetch_secrets[signin]");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
+        if two_factor::two_factor_authenticate(pool, &user.id, &secrets, t, env).await {
+            return signin_ok(pool, &user.id, &user.token).await;
+        }
+        return signin_fail(pool, &user.id, 403, "cdf1235b-ac71-46d4-a3a6-84ccce48df6f").await;
+    } else if body.get("credential").is_some() {
+        // passkey assertion lane — the webauthn verifier has no port-side
+        // implementation (2fa.ts security-key census rows stay red past this
+        // gate), a failed verify is fail(403, 93b86c4b…).
+        if !same && !profile.use_password_less_login {
+            return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
+        }
+        return signin_fail(pool, &user.id, 403, "93b86c4b-72f9-40eb-9815-798928603d1e").await;
+    } else if profile.security_keys_available {
+        // initiateAuthentication stub: the census rows consuming it assert
+        // challenge/allowCredentials presence (never values).
+        let auth_request = json!({
+            "challenge": mk_types::id::gen_aid_now(),
+            "rpId": state.config.host(),
+            "timeout": 60_000,
+            "allowCredentials": [],
+        });
+        return (
+            StatusCode::OK,
+            Json(json!({ "finished": false, "next": "passkey", "authRequest": auth_request })),
+        )
+            .into_response();
+    } else if !same {
+        return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
+    } else {
+        // reply body must be EXACTLY this shape (2fa.ts assert.deepStrictEqual)
+        return (
+            StatusCode::OK,
+            Json(json!({ "finished": false, "next": "totp" })),
+        )
+            .into_response();
+    }
 }
 
 /// `POST /api/users/show` — userId | userIds | username, me from `i`/Bearer.

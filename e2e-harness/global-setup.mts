@@ -96,19 +96,35 @@ export async function setup(): Promise<void> {
 			let body = '';
 			req.on('data', (d) => (body += d));
 			req.on('end', () => {
-				try {
-					const { key } = JSON.parse(body) as { key?: string };
-					if (!key) {
+				void (async () => {
+					try {
+						const { key, value } = JSON.parse(body) as { key?: string; value?: string };
+						if (!key) {
+							res.statusCode = 400;
+							res.end(JSON.stringify({ success: false }));
+							return;
+						}
+						// arena-2fa: the dup-TOTP toggle is read by the rust server
+						// (UserAuthService.validateOtp parity) — forward it before
+						// acking so the test's set/reset ordering holds. Misc test
+						// env vars have no effect on the rust server; ack only.
+						if (key === 'MISSKEY_TEST_CHECK_DUPLICATED_TOTP') {
+							try {
+								await fetch(`http://127.0.0.1:${PORT}/api/_test/env`, {
+									method: 'POST',
+									headers: { 'content-type': 'application/json' },
+									body: JSON.stringify({ key, value }),
+								});
+							} catch (e) {
+								console.error('[mkrs-harness] env forward failed', e);
+							}
+						}
+						res.end(JSON.stringify({ success: true }));
+					} catch {
 						res.statusCode = 400;
 						res.end(JSON.stringify({ success: false }));
-						return;
 					}
-					// misc test env vars have no effect on the rust server; ack only
-					res.end(JSON.stringify({ success: true }));
-				} catch {
-					res.statusCode = 400;
-					res.end(JSON.stringify({ success: false }));
-				}
+				})();
 			});
 			return;
 		}
