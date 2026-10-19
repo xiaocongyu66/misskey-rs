@@ -23,7 +23,7 @@
 //! (harness /env forward), mirroring the upstream process.env read.
 
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -518,10 +518,36 @@ fn validate_client_id(raw: &str, test: bool) -> Result<Url, OAuthError> {
 fn ip_range_allowed(host_or_ip: &str) -> bool {
     match (host_or_ip, 0u16).to_socket_addrs() {
         Ok(mut addrs) => match addrs.next() {
-            Some(addr) => addr.ip().is_global(),
+            Some(addr) => ipaddr_is_global(addr.ip()),
             None => false,
         },
         Err(_) => false,
+    }
+}
+
+/// Stable stand-in for the unstable `IpAddr::is_global` (issue #27709):
+/// rejects the ipaddr.js `range() !== 'unicast'` set — private, loopback,
+/// link-local (incl. fe80::/10 without the std `ip` feature), multicast,
+/// broadcast, documentation and unspecified addresses. Not exhaustive over
+/// RFC reserves the nightly gate covers; the pinned e2e spec only drives
+/// 127.0.0.1 (loopback → reject) and public hostnames here.
+fn ipaddr_is_global(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || v4.is_unspecified())
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
     }
 }
 
@@ -779,8 +805,14 @@ async fn discover_client_information(id: &Url) -> Result<ClientInformation, OAut
         // JSON client metadata (11 July 2024 spec). The json()/prefix
         // mismatch failures throw OAuthProviderError inside upstream's
         // discovery and are rethrown (NOT wrapped) — direct 400s below.
-        let json: Value = res.json().await.map_err(|_| OAuthError::parse_failed())?;
-        let s = |k: &str| json.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        // reqwest is built without the `json` feature — read the body and
+        // parse explicitly (mirrors the other raw-response readers here).
+        let body_text = res.text().await.map_err(|_| OAuthError::parse_failed())?;
+        let json: Value =
+            serde_json::from_str(&body_text).map_err(|_| OAuthError::parse_failed())?;
+        let s = |k: &str| -> Option<String> {
+            json.get(k).and_then(|v| v.as_str()).map(|v| v.to_owned())
+        };
 
         if s("client_id").as_deref() != Some(id_str.as_str()) {
             return Err(OAuthError::invalid_request(

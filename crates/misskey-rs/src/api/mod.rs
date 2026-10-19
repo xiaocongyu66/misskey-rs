@@ -2846,60 +2846,63 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
-    let Some(me_id) = resolve_me(pool, token.as_deref()).await else {
-        // ==== arena-oauth: AuthenticateService non-native branch ====
-        // Non-16-length tokens resolve through the access_token table
-        // (hash/token OR lookup) into (user, permission list); the
-        // notes/create ep.meta.kind='write:notes' gate then rides the
-        // ApiCallService.call L465 permission check. A token that resolves
-        // to nothing keeps the AUTHENTICATION_FAILED 401.
-        let oauth_row = match token.as_deref().filter(|t| t.len() != 16) {
-            Some(t) => match crate::api::oauth::resolve_access_token(pool, t).await {
-                Ok(row) => row,
+    let me_id = match resolve_me(pool, token.as_deref()).await {
+        Some(id) => id,
+        None => {
+            // ==== arena-oauth: AuthenticateService non-native branch ====
+            // Non-16-length tokens resolve through the access_token table
+            // (hash/token OR lookup) into (user, permission list); the
+            // notes/create ep.meta.kind='write:notes' gate then rides the
+            // ApiCallService.call L465 permission check. A token that resolves
+            // to nothing keeps the AUTHENTICATION_FAILED 401.
+            let oauth_row = match token.as_deref().filter(|t| t.len() != 16) {
+                Some(t) => match crate::api::oauth::resolve_access_token(pool, t).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::error!(target: "dbg_oauth", error = %e, "resolve_access_token");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let Some(row) = oauth_row else {
+                return api_err(ApiError::new(
+                    401,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "AUTHENTICATION_FAILED",
+                    "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
+                    "Authentication failed. Please ensure your token is correct.",
+                ));
+            };
+            // requireCredential gates ride the resolved owner (suspension first,
+            // then the kind permission gate — ApiCallService.call L411/L465).
+            let owner = match mk_db::user::find_user_by_id(pool, &row.user_id).await {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(target: "dbg_oauth", error = %e, "resolve_access_token");
-                    None
+                    tracing::error!(target: "dbg_oauth", error = %e, "find_user_by_id");
+                    return api_err(ApiError::internal_error());
                 }
-            },
-            None => None,
-        };
-        let Some(row) = oauth_row else {
-            return api_err(ApiError::new(
-                401,
-                mk_types::api_error::ApiErrorKind::Client,
-                "AUTHENTICATION_FAILED",
-                "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
-                "Authentication failed. Please ensure your token is correct.",
-            ));
-        };
-        // requireCredential gates ride the resolved owner (suspension first,
-        // then the kind permission gate — ApiCallService.call L411/L465).
-        let owner = match mk_db::user::find_user_by_id(pool, &row.user_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(target: "dbg_oauth", error = %e, "find_user_by_id");
-                return api_err(ApiError::internal_error());
+            };
+            if owner.map(|o| o.is_suspended).unwrap_or(true) {
+                return api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_SUSPENDED",
+                    "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                    "Your account has been suspended.",
+                ));
             }
-        };
-        if owner.map(|o| o.is_suspended).unwrap_or(true) {
-            return api_err(ApiError::new(
-                403,
-                mk_types::api_error::ApiErrorKind::Permission,
-                "YOUR_ACCOUNT_SUSPENDED",
-                "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
-                "Your account has been suspended.",
-            ));
+            if !row.permission.iter().any(|p| p == "write:notes") {
+                return api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "PERMISSION_DENIED",
+                    "1370e5b7-d4eb-4566-bb1d-7748ee6a1838",
+                    "Your app does not have the necessary permissions to use this endpoint.",
+                ));
+            }
+            row.user_id
         }
-        if !row.permission.iter().any(|p| p == "write:notes") {
-            return api_err(ApiError::new(
-                403,
-                mk_types::api_error::ApiErrorKind::Permission,
-                "PERMISSION_DENIED",
-                "1370e5b7-d4eb-4566-bb1d-7748ee6a1838",
-                "Your app does not have the necessary permissions to use this endpoint.",
-            ));
-        }
-        row.user_id
     };
 
     // social-agent: renote path — upstream notes/create renoteId param with
