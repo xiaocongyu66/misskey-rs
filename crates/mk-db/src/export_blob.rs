@@ -24,7 +24,22 @@ use crate::drive::DriveFileRow;
 
 /// Store the export bytes (upstream: the temp file DriveService.addFile
 /// uploads). Same accessKey the drive_file row + pack url carry.
+///
+/// arena-exports: the table is (re)ensured first — the e2e harness's TypeORM
+/// `initTestDb` (dropSchema: true, setup.e2e.ts beforeAll) rebuilds the
+/// schema after this server's migrations and wipes non-entity tables.
+/// `IF NOT EXISTS` keeps it idempotent (0006 remains the canonical DDL).
 pub async fn put_blob(pool: &PgPool, access_key: &str, content: &[u8]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS "mk_export_blobs" (
+               "access_key" character varying(256) NOT NULL,
+               "content" bytea NOT NULL,
+               "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+               CONSTRAINT mk_export_blobs_pkey PRIMARY KEY (access_key)
+           )"#,
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(r#"INSERT INTO "mk_export_blobs" ("access_key", "content") VALUES ($1, $2)"#)
         .bind(access_key)
         .bind(content)

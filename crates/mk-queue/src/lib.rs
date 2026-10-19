@@ -66,7 +66,33 @@ impl QueueHandle {
     }
 
     /// Inserts a job of `kind` with a jsonb `payload` and returns its id.
+    ///
+    /// arena-exports: the table is (re)ensured first — the upstream e2e
+    /// harness runs TypeORM `initTestDb` with `dropSchema: true` AFTER this
+    /// server's own migrations (setup.e2e.ts beforeAll), and the rebuild
+    /// wipes non-entity tables like `mk_queue_jobs`. `IF NOT EXISTS` is an
+    /// idempotent catalog probe, and the durable-queue invariant (an
+    /// accepted enqueue must survive) holds regardless of who wiped the
+    /// table underneath.
     pub async fn enqueue(&self, kind: &str, payload: &Value) -> Result<i64, sqlx::Error> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS "mk_queue_jobs" (
+                   "id" bigserial NOT NULL,
+                   "kind" text NOT NULL,
+                   "payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
+                   "attempts" integer DEFAULT 0 NOT NULL,
+                   "run_after" timestamp with time zone DEFAULT now() NOT NULL,
+                   "created_at" timestamp with time zone DEFAULT now() NOT NULL
+               )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS mk_queue_jobs_kind_run_after_idx
+               ON "mk_queue_jobs" USING btree (kind, run_after)"#,
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query_scalar(
             r#"INSERT INTO "mk_queue_jobs" ("kind", "payload")
                VALUES ($1, $2)

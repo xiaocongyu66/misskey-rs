@@ -74,6 +74,9 @@ jobs:
       - name: Compile upstream config
         run: pnpm --filter backend compile-config
         working-directory: upstream
+      - name: Build misskey-js (exports.ts boots the Nest queue app)
+        run: pnpm --filter misskey-js build
+        working-directory: upstream
       - name: Install harness
         run: |
           cp e2e-harness/global-setup.mts upstream/packages/backend/global-setup.mts
