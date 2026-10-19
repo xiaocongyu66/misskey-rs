@@ -7,6 +7,10 @@ use sqlx::postgres::PgPoolOptions;
 pub use sqlx;
 
 pub mod admin;
+// antennas-v2: antennas/* domain (antenna CRUD plane from the 0001 baseline +
+// the 0004 antenna_note fanout projection; checkHitAntenna ladder + the
+// antennas/notes feed page over the shared lists.rs fragment set)
+pub mod antennas;
 // announcements-agent: announcements domain (announcement/announcement_read
 // live in the 0001 baseline; list/read/admin paths + the unread probe the
 // MeDetailed lane will wire)

@@ -195,7 +195,7 @@ const REPLY_GATE: &str = r#" AND (
 /// generateVisibilityQuery(me) — public/home, self, specified-to-me,
 /// mentioned-me, followers-of-author (author among my followees) or a
 /// followers reply addressed to me (QueryService.ts L270-315).
-const VIS_ME: &str = r#" AND (
+pub(crate) const VIS_ME: &str = r#" AND (
           (n."visibility" IN ('public','home'))
           OR n."userId" = $2
           OR ($3::varchar[] <@ n."visibleUserIds")
@@ -206,17 +206,17 @@ const VIS_ME: &str = r#" AND (
           )
         )"#;
 
-const MUTE_SEL: &str = r#"(SELECT "muteeId" FROM "muting" WHERE "muterId" = $2
+pub(crate) const MUTE_SEL: &str = r#"(SELECT "muteeId" FROM "muting" WHERE "muterId" = $2
               AND ("expiresAt" IS NULL OR "expiresAt" > now()))"#;
 
-const BLOCK_SEL: &str = r#"(SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2)"#;
+pub(crate) const BLOCK_SEL: &str = r#"(SELECT "blockerId" FROM "blocking" WHERE "blockeeId" = $2)"#;
 
 /// generateBaseNoteFilteringQuery(me) + generateMutedUserRenotesQueryForNotes
 /// (muting/blocking over author / reply target / renote target, renote_muting
 /// for pure renotes, suspended authors + suspended reply/renote parent
 /// authors; the blocked-host slice is out of scope for the whole mk-db
 /// timeline family, matching timelines.rs).
-const BASE_ME: &str = r#" AND u."isSuspended" = FALSE
+pub(crate) const BASE_ME: &str = r#" AND u."isSuspended" = FALSE
         AND (n."userId" IS NULL OR n."userId" NOT IN (MUTE_SEL))
         AND (n."replyUserId" IS NULL OR n."replyUserId" NOT IN (MUTE_SEL))
         AND (n."renoteUserId" IS NULL OR n."renoteUserId" NOT IN (MUTE_SEL))
