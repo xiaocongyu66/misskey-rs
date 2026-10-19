@@ -11686,8 +11686,11 @@ async fn arena_exports_export_clips_queue_plane() {
         json!(bob["username"].as_str().unwrap())
     );
 
-    // beforeEach plane: drive/files/delete 204 (bytes dropped with the row),
-    // show on the gone file 400s NO_SUCH_FILE
+    // beforeEach plane: the drive/files/delete lane (arena-files agent's
+    // api::drive slice) drops the metadata rows; the mk_export_blobs bytes
+    // are owned by the /files byte route and outlive them in this slice
+    // (upstream drops the storage object via DriveService.deleteFile —
+    // documented divergence). show on the gone file 400s NO_SUCH_FILE.
     for f in &files {
         let (s, b) = post_json(
             app.clone(),
@@ -11701,7 +11704,10 @@ async fn arena_exports_export_clips_queue_plane() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(blobs, 0, "blobs die with their drive rows");
+    assert_eq!(
+        blobs, 2,
+        "2 exports → 2 blob payloads (storage untouched by delete)"
+    );
     let (s, b) = post_json(
         app.clone(),
         "/api/drive/files/show",
