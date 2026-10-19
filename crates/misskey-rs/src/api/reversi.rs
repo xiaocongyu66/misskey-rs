@@ -486,6 +486,14 @@ async fn match_specific(
     target_id: &str,
     multiple: bool,
 ) -> Response {
+    // drop-schema shim: setup.e2e.ts's initTestDb drops the whole public
+    // schema AFTER the server migrations (TypeORM dropSchema: !justBorrow) —
+    // reversi_matching has no pinned entity, so the invite store must
+    // re-ensure on first use (mk_queue_jobs/mk_export_blobs precedent).
+    if let Err(e) = mk_db::reversi::ensure_matching_table(pool).await {
+        tracing::error!(target: "dbg_reversi", error = %e, "ensure_matching_table");
+        return internal();
+    }
     if !multiple {
         // `id > gen(Date.now() - 3min)` recent unstarted game between the two
         let restart_min = mk_types::id::gen_aid(
@@ -547,6 +555,10 @@ async fn match_any(
     no_irregular: bool,
     multiple: bool,
 ) -> Response {
+    if let Err(e) = mk_db::reversi::ensure_matching_table(pool).await {
+        tracing::error!(target: "dbg_reversi", error = %e, "ensure_matching_table");
+        return internal();
+    }
     if !multiple {
         let restart_min = mk_types::id::gen_aid(
             crate::api::now_ms() as i64 - mk_db::reversi::MATCH_RESTART_WINDOW_MS,
@@ -606,6 +618,10 @@ async fn cancel_match(state: &AppState, body: &Value, token: Option<String>) -> 
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    if let Err(e) = mk_db::reversi::ensure_matching_table(&pool).await {
+        tracing::error!(target: "dbg_reversi", error = %e, "ensure_matching_table");
+        return internal();
+    }
     if let Some(uid) = body.get("userId").and_then(Value::as_str) {
         if let Err(e) = mk_db::reversi::cancel_invite_to(&pool, uid, &me_id).await {
             tracing::error!(target: "dbg_reversi", error = %e, "cancel_invite_to");
@@ -624,6 +640,10 @@ async fn invitations(state: &AppState, token: Option<String>) -> Response {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    if let Err(e) = mk_db::reversi::ensure_matching_table(&pool).await {
+        tracing::error!(target: "dbg_reversi", error = %e, "ensure_matching_table");
+        return internal();
+    }
     let invite_min = mk_types::id::gen_aid(
         crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS,
     );
