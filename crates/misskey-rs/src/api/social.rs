@@ -1376,12 +1376,17 @@ pub(crate) async fn notes_reactions_create(
         }
     }
     match mk_db::note::find_note_reaction(pool, note_id, me_id).await {
-        Ok(Some(_mine)) => {
+        Ok(Some(mine)) => {
             if let Err(e) = mk_db::note::delete_note_reaction(pool, note_id, me_id).await {
                 tracing::error!(target: "dbg_notes", error = %e, "delete_note_reaction");
                 return crate::api::api_err(crate::api::ApiError::internal_error());
             }
-            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, &reaction, -1).await {
+            // 二重リアクション上書き: the jsonb map must lose the STORED
+            // reaction (ReactionService.delete → the old emoji's count),
+            // never the replacing one's (endpoints.ts deepStrictEqual
+            // {'🚀': 1} after 🥰 → 🚀 overwrite).
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, &mine.reaction, -1).await
+            {
                 tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
             }
         }
