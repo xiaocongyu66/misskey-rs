@@ -360,8 +360,11 @@ pub async fn mentions_notes(
     let sql = inner
         .replace("MUTE_SEL", &expand(MUTE_SEL, 2, 3, 1, 4, 5, 6, ""))
         .replace("BLOCK_SEL", &expand(BLOCK_SEL, 2, 3, 1, 4, 5, 6, ""));
+    // local binding: the QueryAs borrows the SQL string, so the temporary
+    // from wrap_outer must outlive the builder (E0716).
+    let outer = wrap_outer(&sql, asc);
 
-    let mut q = sqlx::query_as::<_, NoteRow>(&wrap_outer(&sql, asc))
+    let mut q = sqlx::query_as::<_, NoteRow>(&outer)
         .bind(&no_followees)
         .bind(me_id)
         .bind(&me_list)
