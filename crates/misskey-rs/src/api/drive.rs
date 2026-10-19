@@ -1858,10 +1858,7 @@ mod tests {
         assert_eq!(packed["name"], json!("file-file0001ab"));
         assert_eq!(packed["type"], json!("text/plain"));
         assert_eq!(packed["size"], json!(1));
-        assert_eq!(
-            packed["md5"],
-            json!("d41d8cd98f00b204e9800998ecf8427e")
-        );
+        assert_eq!(packed["md5"], json!("d41d8cd98f00b204e9800998ecf8427e"));
         // self mode keeps the stored url and the untouched property set
         assert_eq!(packed["url"], json!("https://example.com/file0001ab"));
         assert_eq!(packed["properties"], json!({}));
@@ -1877,14 +1874,8 @@ mod tests {
         row.webpublic_url = Some("https://cdn.example.com/w/file0001ab".to_string());
         row.properties = json!({ "width": 640, "height": 480, "angle": 90 });
         let packed = pack_drive_file(&row, false);
-        assert_eq!(
-            packed["url"],
-            json!("https://cdn.example.com/w/file0001ab")
-        );
-        assert_eq!(
-            packed["properties"],
-            json!({ "width": 640, "height": 480 })
-        );
+        assert_eq!(packed["url"], json!("https://cdn.example.com/w/file0001ab"));
+        assert_eq!(packed["properties"], json!({ "width": 640, "height": 480 }));
 
         // no dimensions → public properties degenerate to {}
         row.properties = json!({ "angle": 90 });

@@ -385,13 +385,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     /// CondFacts shaped after an upstream `createUser(...)` args combo.
-    fn facts(
-        created_s_ago: i64,
-        bot: bool,
-        cat: bool,
-        suspended: bool,
-        now_ms: i64,
-    ) -> CondFacts {
+    fn facts(created_s_ago: i64, bot: bool, cat: bool, suspended: bool, now_ms: i64) -> CondFacts {
         let mut f = CondFacts::fixture(now_ms - created_s_ago * 1000, now_ms, 0, 0, 0);
         f.is_bot = bot;
         f.is_cat = cat;
@@ -565,8 +559,16 @@ mod tests {
         // (createdLessThan sec:300) — createdAt after (now - sec*1000):
         // created 5:01 ago → false, 5:00 → false (strict), 4:59 → true.
         let role = serde_json::json!({ "type": "createdLessThan", "sec": 300 });
-        assert!(!eval_cond(&facts(301, false, false, false, NOW), &[], &role));
-        assert!(!eval_cond(&facts(300, false, false, false, NOW), &[], &role));
+        assert!(!eval_cond(
+            &facts(301, false, false, false, NOW),
+            &[],
+            &role
+        ));
+        assert!(!eval_cond(
+            &facts(300, false, false, false, NOW),
+            &[],
+            &role
+        ));
         assert!(eval_cond(&facts(299, false, false, false, NOW), &[], &role));
     }
 
@@ -576,8 +578,16 @@ mod tests {
         // (createdMoreThan sec:300).
         let role = serde_json::json!({ "type": "createdMoreThan", "sec": 300 });
         assert!(eval_cond(&facts(301, false, false, false, NOW), &[], &role));
-        assert!(!eval_cond(&facts(300, false, false, false, NOW), &[], &role));
-        assert!(!eval_cond(&facts(299, false, false, false, NOW), &[], &role));
+        assert!(!eval_cond(
+            &facts(300, false, false, false, NOW),
+            &[],
+            &role
+        ));
+        assert!(!eval_cond(
+            &facts(299, false, false, false, NOW),
+            &[],
+            &role
+        ));
     }
 
     #[test]
@@ -646,7 +656,11 @@ mod tests {
 
     /// The getUserBadgeRoles asBadge projection (ids for assertion purposes).
     fn badge_ids(roles: &[AssignedRole]) -> Vec<String> {
-        roles.iter().filter(|r| r.as_badge).map(|r| r.id.clone()).collect()
+        roles
+            .iter()
+            .filter(|r| r.as_badge)
+            .map(|r| r.id.clone())
+            .collect()
     }
 
     /// upstream 'getUserRoles' against real tables: manual + conditional rows
@@ -717,6 +731,9 @@ mod tests {
         // upstream 'getUserRoles 両方が取得できる' + 'getUserAssigns 期限切れ'
         assert!(holds(&roles, "rManual"), "live manual assignment kept");
         assert!(holds(&roles, "rCondBot"), "matching conditional granted");
-        assert!(!holds(&roles, "rExpiredAssign"), "expired assignment dropped");
+        assert!(
+            !holds(&roles, "rExpiredAssign"),
+            "expired assignment dropped"
+        );
     }
 }

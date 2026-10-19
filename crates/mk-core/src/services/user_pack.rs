@@ -806,55 +806,79 @@ mod tests {
             .await
             .expect("follow tr1");
         let out = rel_pack(&pool, "meU", "tr1").await;
-        expect_flags(&out, [true, false, false, false, false, false, false, false]);
+        expect_flags(
+            &out,
+            [true, false, false, false, false, false, false, false],
+        );
 
         // me をフォローしてる人たち
         mk_db::social::insert_following(&pool, "a-tr2", "tr2", "meU", false)
             .await
             .expect("follow from tr2");
         let out = rel_pack(&pool, "meU", "tr2").await;
-        expect_flags(&out, [false, true, false, false, false, false, false, false]);
+        expect_flags(
+            &out,
+            [false, true, false, false, false, false, false, false],
+        );
 
         // me がフォローリクエストを送った人たち
         mk_db::social::insert_follow_request(&pool, "a-tr3", "meU", "tr3", false)
             .await
             .expect("request tr3");
         let out = rel_pack(&pool, "meU", "tr3").await;
-        expect_flags(&out, [false, false, true, false, false, false, false, false]);
+        expect_flags(
+            &out,
+            [false, false, true, false, false, false, false, false],
+        );
 
         // me にフォローリクエストを送った人たち
         mk_db::social::insert_follow_request(&pool, "a-tr4", "tr4", "meU", false)
             .await
             .expect("request from tr4");
         let out = rel_pack(&pool, "meU", "tr4").await;
-        expect_flags(&out, [false, false, false, true, false, false, false, false]);
+        expect_flags(
+            &out,
+            [false, false, false, true, false, false, false, false],
+        );
 
         // me がブロックしてる人たち
         mk_db::social::block(&pool, "a-tr5", "meU", "tr5")
             .await
             .expect("block tr5");
         let out = rel_pack(&pool, "meU", "tr5").await;
-        expect_flags(&out, [false, false, false, false, true, false, false, false]);
+        expect_flags(
+            &out,
+            [false, false, false, false, true, false, false, false],
+        );
 
         // me をブロックしてる人たち
         mk_db::social::block(&pool, "a-tr6", "tr6", "meU")
             .await
             .expect("block from tr6");
         let out = rel_pack(&pool, "meU", "tr6").await;
-        expect_flags(&out, [false, false, false, false, false, true, false, false]);
+        expect_flags(
+            &out,
+            [false, false, false, false, false, true, false, false],
+        );
 
         // me がミュートしてる人たち
         mk_db::social::insert_muting(&pool, "a-tr7", "meU", "tr7", None)
             .await
             .expect("mute tr7");
         let out = rel_pack(&pool, "meU", "tr7").await;
-        expect_flags(&out, [false, false, false, false, false, false, true, false]);
+        expect_flags(
+            &out,
+            [false, false, false, false, false, false, true, false],
+        );
 
         // me がリノートミュートしてる人たち
         mk_db::social::insert_renote_muting(&pool, "a-tr8", "meU", "tr8")
             .await
             .expect("renote-mute tr8");
         let out = rel_pack(&pool, "meU", "tr8").await;
-        expect_flags(&out, [false, false, false, false, false, false, false, true]);
+        expect_flags(
+            &out,
+            [false, false, false, false, false, false, false, true],
+        );
     }
 }

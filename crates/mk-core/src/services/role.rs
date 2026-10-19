@@ -690,9 +690,11 @@ mod tests {
         // canPublicNote (the boolean key our policy slice carries; upstream
         // uses canManageCustomEmojis, not mirrored here).
         let base = UserPolicy::base_with_meta(&json!({ "canPublicNote": false }));
-        let roles = vec![
-            role("r1", 0, json!({ "canPublicNote": pe(json!(true), 0, false) })),
-        ];
+        let roles = vec![role(
+            "r1",
+            0,
+            json!({ "canPublicNote": pe(json!(true), 0, false) }),
+        )];
         assert!(UserPolicy::from_base_and_roles(&roles, &base).can_public_note);
     }
 
