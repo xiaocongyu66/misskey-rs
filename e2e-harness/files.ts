@@ -46,7 +46,10 @@ describe('Drive files', () => {
 		status: number;
 		body: misskey.entities.DriveFile | any;
 	}> => {
-		const absPath = new URL('192.jpg', new URL('resources/', import.meta.url));
+		// upstream ships fixtures at test/resources/; test/utils.ts:316 resolves
+		// 'resources/' relative to test/utils.ts (one level up from test/e2e/),
+		// so mirror that from this spec's test/e2e/ location
+		const absPath = new URL('192.jpg', new URL('../resources/', import.meta.url));
 		const formData = new FormData();
 		formData.append('file', new Blob([new Uint8Array(await readFile(absPath))]), basename(absPath.toString()));
 		formData.append('force', 'true');
