@@ -572,18 +572,16 @@ fn pt_double(p: &Point) -> Point {
     // M = 3*X^2 + a*Z^4
     let z4 = mul_mod(&zz, &zz, &P);
     let az4 = mul_mod(&A_P256, &z4, &P);
-    let m3 = add_mod(&add_mod(&xx, &xx, &P), &add_mod(&xx, &xx, &P), &P);
+    let m3 = add_mod(&add_mod(&xx, &xx, &P), &xx, &P);
     let mm = add_mod(&m3, &az4, &P);
     // X' = M^2 - 2S
     let mm2 = mul_mod(&mm, &mm, &P);
     let x3 = sub_mod(&mm2, &add_mod(&s, &s, &P), &P);
     // Y' = M*(S - X') - 8*Y^4
     let y4 = mul_mod(&yy, &yy, &P);
-    let y8 = add_mod(
-        &add_mod(&y4, &y4, &P),
-        &add_mod(&add_mod(&y4, &y4, &P), &add_mod(&y4, &y4, &P), &P),
-        &P,
-    );
+    let y4x2 = add_mod(&y4, &y4, &P);
+    let y4x4 = add_mod(&y4x2, &y4x2, &P);
+    let y8 = add_mod(&y4x4, &y4x4, &P);
     let y3 = sub_mod(&mul_mod(&mm, &sub_mod(&s, &x3, &P), &P), &y8, &P);
     // Z' = 2*Y*Z
     let yz = mul_mod(&p.y, &p.z, &P);
