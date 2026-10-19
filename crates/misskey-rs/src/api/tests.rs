@@ -3357,7 +3357,10 @@ async fn frequently_replied_orders_and_gates() {
     );
     assert_eq!(
         body["error"]["id"],
-        json!("b0df6025-f2e8-44b4-a26a-17ad99104612")
+        // notes/create's catch-arm (create.ts L280-282) remaps the
+        // NoteCreateService IdentifiableError b0df6025 to
+        // meta.errors.youHaveBeenBlocked (b390d7e1) — the client-facing id
+        json!("b390d7e1-8a5e-46ed-b625-06271cafd3d3")
     );
     let (s, body) = post_json(
         app.clone(),
