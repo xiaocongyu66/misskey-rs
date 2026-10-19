@@ -216,3 +216,64 @@ mod keyword_tests {
         assert!(is_keyword_included("hogeTesthuge", &and));
     }
 }
+
+// unit-ap: upstream `test/unit/extract-mentions.ts` pinned beside the
+// equivalent impl (`extract_mentions` above; upstream
+// `src/misc/extract-mentions.ts`). Upstream walks the parsed mfm tree
+// (`mfm.extract(node => node.type === 'mention')`) and returns every
+// mention node's props `{username, acct, host}` with NO dedupe (removal is
+// an explicit upstream TODO); the interim text-level scanner dedupes as the
+// notes_create contract (pinned by `mentions_basic_forms` above) — the two
+// upstream cases carry no repeated mention, so the pins hold either way.
+// Parity ledger for the rest of the upstream test/unit AP/MFM set — all
+// SKIPs until their surfaces exist:
+//   ap-request.ts   -> pins ApRequestCreator.createSignedPost/Get (rsa-sha256
+//                      signing string: `(request-target)`, digest, host) +
+//                      check-against-url.ts assertActivityMatchesUrl; there
+//                      is no HTTP-Signature generator anywhere in-tree (mk-ap
+//                      is an empty stub) and signing is federation-active
+//                      surface — skipped per lane policy.
+//   ApMfmService.ts -> pins getNoteHtml (hashtag/mention/emoji-in-tree →
+//                      ap-tag html + `_misskey_content` flag); mfm-rs is an
+//                      empty stub, no AST to walk — skipped.
+//   MfmService.ts   -> pins toHtml (br/escape/no-span) + fromHtml (p/pre/
+//                      code/blockquote/link/ruby/mention/hashtag); no html
+//                      renderer exists (fetch_resource's `mfm_lite_html` is
+//                      an escape-only feed helper, not the contract) —
+//                      skipped.
+//   activitypub.ts  -> pins ApPerson/ApNote/ApImage/ApRenderer/JsonLd
+//                      services through a MockResolver + DB (minimum object
+//                      parse, name truncate, alsoKnownAs, collection
+//                      visibility, featured fetch trials, renderDocument
+//                      dimensions, JSON-LD compaction); none of those
+//                      services exist (mk-ap stub) — skipped.
+mod unit_ap {
+    use super::extract_mentions;
+
+    #[test]
+    fn upstream_simple() {
+        // 'simple': extractMentions(parse('@foo @bar @baz'))
+        assert_eq!(
+            extract_mentions("@foo @bar @baz"),
+            vec![
+                ("foo".to_string(), None),
+                ("bar".to_string(), None),
+                ("baz".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn upstream_nested() {
+        // 'nested': extractMentions(parse('@foo **@bar** @baz')) — the bold
+        // child node's mention must survive the walk
+        assert_eq!(
+            extract_mentions("@foo **@bar** @baz"),
+            vec![
+                ("foo".to_string(), None),
+                ("bar".to_string(), None),
+                ("baz".to_string(), None),
+            ]
+        );
+    }
+}
