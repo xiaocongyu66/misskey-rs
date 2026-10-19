@@ -2230,3 +2230,78 @@ mod unit_misc_should_require_follow_approval {
         ));
     }
 }
+
+#[cfg(test)]
+mod unit_services_reaction_normalize {
+    use super::normalize_reaction as normalize;
+
+    // unit-services — 1:1 port of upstream test/unit/ReactionService.ts
+    // describe('normalize'). The end-to-end create-side asserts (block gate,
+    // renote gate, toggle semantics) live in api/tests.rs + the reactions
+    // e2e; upstream's `create` spec that needs an emoji REGISTRY (the
+    // local-only-emoji fallback) degenerates here: this server wires no emoji
+    // table, so every custom ':name[:@host:]' token already folds to the
+    // FALLBACK heart — pinned by custom_emoji_token_falls_back below.
+
+    #[test]
+    fn emoji_reaction_kept_as_is() {
+        // upstream '絵文字リアクションはそのまま'
+        assert_eq!(normalize("👍"), "👍");
+        assert_eq!(normalize("🍅"), "🍅");
+    }
+
+    #[test]
+    fn legacy_short_forms_emoji_fied() {
+        // upstream '既存のリアクションは絵文字化する' pudding / like / love /
+        // laugh / hmm / surprise / congrats / angry / confused / rip / star
+        assert_eq!(normalize("pudding"), "🍮");
+        assert_eq!(normalize("like"), "👍");
+        // upstream keeps U+2764 WITHOUT the variation selector
+        assert_eq!(normalize("love"), "\u{2764}");
+        assert_eq!(normalize("laugh"), "😆");
+        assert_eq!(normalize("hmm"), "🤔");
+        assert_eq!(normalize("surprise"), "😮");
+        assert_eq!(normalize("congrats"), "🎉");
+        assert_eq!(normalize("angry"), "💢");
+        assert_eq!(normalize("confused"), "😥");
+        assert_eq!(normalize("rip"), "😇");
+        assert_eq!(normalize("star"), "⭐");
+    }
+
+    #[test]
+    fn variation_selector_stripped() {
+        // upstream '異体字セレクタ除去'
+        assert_eq!(normalize("㊗️"), "㊗");
+        // upstream '異体字セレクタ除去 必要なし'
+        assert_eq!(normalize("㊗"), "㊗");
+    }
+
+    #[test]
+    fn fallback_heart_for_unknown() {
+        // upstream 'fallback - empty' (upstream `fallback - null` is
+        // unreachable in the Rust signature: the endpoint's reaction param is
+        // required, and the omitted-_-reaction create() default rides the
+        // same FALLBACK constant)
+        assert_eq!(normalize(""), "\u{2764}");
+        // upstream 'fallback - unknown'
+        assert_eq!(normalize("unknown"), "\u{2764}");
+    }
+
+    #[test]
+    fn custom_emoji_token_falls_back() {
+        // upstream 'create ローカル限定カスタム絵文字はリモートノートへの
+        // リアクションではハートにフォールバックする' (degenerate slice — see
+        // the module note; upstream gates this inside create() when the
+        // fetched emoji is localOnly and the note author is remote)
+        assert_eq!(normalize(":localonly:"), "\u{2764}");
+        assert_eq!(normalize(":pudding@remote.example.tld:"), "\u{2764}");
+    }
+
+    #[test]
+    fn zwj_sequences_keep_visibility_selectors() {
+        // upstream normalize: a matched sequence containing U+200D keeps its
+        // U+FE0F parts (合字を含む1つの絵文字) while standalone chars strip.
+        assert_eq!(normalize("❤️‍🔥"), "❤️‍🔥");
+        assert_eq!(normalize("🙂"), "🙂");
+    }
+}
