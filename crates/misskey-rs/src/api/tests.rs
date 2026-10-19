@@ -9634,8 +9634,9 @@ async fn arena_streaming_channel_routing_matrix() {
         json!({ "listId": list_id }),
         "a-uls",
         &a_id,
-    );
-    assert!(list_reg.await, "userList connects");
+    )
+    .await;
+    assert!(list_reg, "userList connects");
     let (s, v) = post_json(
         app.clone(),
         "/api/notes/create",
@@ -9746,15 +9747,16 @@ async fn arena_streaming_userlist_mute_lanes() {
             crate::api::streaming::connect_channel(
                 &pool,
                 "userList",
-                json!({ "listId": list_id }),
+                &json!({ "listId": list_id }),
                 "a-ulm",
                 tx,
                 &a_id,
-            ),
+            )
+            .await,
             rx,
         )
     };
-    assert!(reg.await, "userList connects");
+    assert!(reg, "userList connects");
 
     // Control: bob's member note flows.
     let (s, v) = post_json(
@@ -10314,9 +10316,17 @@ async fn note_notify_following_list_notification_filter() {
         .iter()
         .map(|u| u["followeeId"].clone())
         .collect();
-    ids.sort();
+    ids.sort_by(|a, b| {
+        a.as_str()
+            .unwrap_or_default()
+            .cmp(b.as_str().unwrap_or_default())
+    });
     let mut want = vec![bob_id.clone(), carol_id.clone()];
-    want.sort();
+    want.sort_by(|a, b| {
+        a.as_str()
+            .unwrap_or_default()
+            .cmp(b.as_str().unwrap_or_default())
+    });
     assert_eq!(ids, want);
 
     // test 4: notify 'none' removes it from the notification list (stored
