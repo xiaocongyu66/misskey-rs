@@ -7482,16 +7482,16 @@ async fn noise_gate_muter_silence_and_thread_mute() {
     assert!(
         arr.iter()
             .any(|n| n["type"] == json!("follow") && n["userId"] == json!(b_id)),
-        "follow notification visible: {arr}"
+        "follow notification visible: {arr:?}"
     );
     assert!(
         arr.iter()
             .any(|n| n["type"] == json!("reaction") && n["userId"] == json!(b_id)),
-        "reaction notification visible: {arr}"
+        "reaction notification visible: {arr:?}"
     );
     assert!(
         !arr.iter().any(|n| n["userId"] == json!(c_id)),
-        "muted carol silent across reasons: {arr}"
+        "muted carol silent across reasons: {arr:?}"
     );
 
     // gate 2: i/notifications-grouped shares the same gate through the alias
@@ -7505,11 +7505,11 @@ async fn noise_gate_muter_silence_and_thread_mute() {
     let arr = v.as_array().unwrap();
     assert!(
         arr.iter().any(|n| n["userId"] == json!(b_id)),
-        "body: {arr}"
+        "body: {arr:?}"
     );
     assert!(
         !arr.iter().any(|n| n["userId"] == json!(c_id)),
-        "grouped list keeps the muter silence: {arr}"
+        "grouped list keeps the muter silence: {arr:?}"
     );
 
     // thread-mute wiring (thread-mute.ts): bob roots the thread with a
@@ -7570,19 +7570,19 @@ async fn noise_gate_muter_silence_and_thread_mute() {
     let arr = v.as_array().unwrap();
     assert!(
         !arr.iter().any(|n| n["id"] == json!(bob_note)),
-        "muted thread root excluded: {arr}"
+        "muted thread root excluded: {arr:?}"
     );
     assert!(
         !arr.iter().any(|n| n["id"] == json!(carol_reply)),
-        "muted-thread reply excluded: {arr}"
+        "muted-thread reply excluded: {arr:?}"
     );
     assert!(
         !arr.iter().any(|n| n["id"] == json!(carol_no_mention)),
-        "reply-target ride-along excluded by the thread gate: {arr}"
+        "reply-target ride-along excluded by the thread gate: {arr:?}"
     );
     assert!(
         arr.iter().any(|n| n["id"] == json!(control_note)),
-        "unmuted mention control visible: {arr}"
+        "unmuted mention control visible: {arr:?}"
     );
 
     // gate 4: i/notifications — the in-thread carol replies notify nobody
@@ -7598,11 +7598,11 @@ async fn noise_gate_muter_silence_and_thread_mute() {
         !arr.iter()
             .any(|n| n["note"]["id"] == json!(carol_reply)
                 || n["note"]["id"] == json!(carol_no_mention)),
-        "thread-muted reply legs stayed silent: {arr}"
+        "thread-muted reply legs stayed silent: {arr:?}"
     );
     assert!(
         !arr.iter().any(|n| n["userId"] == json!(c_id)),
-        "muted carol still silent: {arr}"
+        "muted carol still silent: {arr:?}"
     );
 
     let _ = pool;

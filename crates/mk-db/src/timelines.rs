@@ -365,9 +365,9 @@ pub async fn mentions_notes(
     let outer = wrap_outer(&sql, asc);
 
     let mut q = sqlx::query_as::<_, NoteRow>(&outer)
-        .bind(&no_followees)
+        .bind(no_followees)
         .bind(me_id)
-        .bind(&me_list)
+        .bind(me_list)
         .bind(until_id)
         .bind(since_id)
         .bind(limit);

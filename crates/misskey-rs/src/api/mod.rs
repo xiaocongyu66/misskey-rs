@@ -130,6 +130,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/mentions"
         || name == "notes/thread-muting/create"
         || name == "notes/thread-muting/delete"
+        // mute lane: the reset the Mute e2e stream legs run before each
+        // waitFire (endpoints/notifications/mark-all-as-read.ts, 204)
+        || name == "notifications/mark-all-as-read"
         // note-agent: note domain (local-timeline guest-ok)
         || name == "notes/timeline"
         || name == "notes/local-timeline"
@@ -201,6 +204,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "notes/thread-muting/create" || name == "notes/thread-muting/delete" {
             return notes_thread_muting(&state, name.as_str(), &body, token).await;
+        }
+        if name == "notifications/mark-all-as-read" {
+            return notifications_mark_all_as_read(&state, token).await;
         }
         // -- end notifications slice --
 
@@ -3643,13 +3649,13 @@ async fn mute_lane_me_id(
     token: Option<&str>,
 ) -> Result<String, Response> {
     let Some(token) = token else {
-        return api_err(ApiError::new(
+        return Err(api_err(ApiError::new(
             401,
             mk_types::api_error::ApiErrorKind::Client,
             "CREDENTIAL_REQUIRED",
             "1384574d-a912-4b81-8601-c7b1c4085df1",
             "Credential required.",
-        ));
+        )));
     };
     if token.len() != 16 {
         return authentication_failed();
@@ -3660,19 +3666,19 @@ async fn mute_lane_me_id(
     match mk_db::user::find_user_by_id(pool, &me_id).await {
         Ok(Some(row)) => {
             if row.is_suspended {
-                return api_err(ApiError::new(
+                return Err(api_err(ApiError::new(
                     403,
                     mk_types::api_error::ApiErrorKind::Permission,
                     "YOUR_ACCOUNT_SUSPENDED",
                     "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
                     "Your account has been suspended.",
-                ));
+                )));
             }
         }
         Ok(None) => return authentication_failed(),
         Err(e) => {
             tracing::error!(target: "dbg_mentions", error = %e, "find_user_by_id");
-            return api_err(ApiError::internal_error());
+            return Err(api_err(ApiError::internal_error()));
         }
     }
     Ok(me_id)
@@ -3832,6 +3838,26 @@ async fn notes_thread_muting(
         }
     } else if let Err(e) = mk_db::note::delete_thread_muting(pool, &me_id, &thread_id).await {
         tracing::error!(target: "dbg_mentions", error = %e, "delete_thread_muting");
+        return api_err(ApiError::internal_error());
+    }
+    (StatusCode::NO_CONTENT).into_response()
+}
+
+/// `POST /api/notifications/mark-all-as-read`
+/// (endpoints/notifications/mark-all-as-read.ts, requireCredential, void →
+/// 204): `NotificationService.readAllNotification` — every unread row of the
+/// caller flips isRead. The Mute e2e's stream legs run this reset before
+/// each waitFire.
+async fn notifications_mark_all_as_read(state: &AppState, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match mute_lane_me_id(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if let Err(e) = mk_db::notification::mark_as_read_all(pool, &me_id).await {
+        tracing::error!(target: "dbg_notifications", error = %e, "mark_as_read_all");
         return api_err(ApiError::internal_error());
     }
     (StatusCode::NO_CONTENT).into_response()
