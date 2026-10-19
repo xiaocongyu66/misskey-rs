@@ -11077,6 +11077,62 @@ fn two_factor_duplicated_totp_burn() {
     ));
 }
 
+// twofa-resume ================================================================
+// upstream test/e2e/2fa.ts (pinned ea2c3aed) security-key lane: the vendored
+// WebAuthn core in mk-db/src/webauthn.rs — SHA-256 (FIPS 180-4) and the
+// ECDSA P-256/SHA-256 verification (WebCrypto `subtle.verify` parity) the
+// passkey assertion lane rides.
+
+#[test]
+fn twofa_resume_sha256_vectors() {
+    // FIPS 180-4 / NIST CAVP: "abc" and the 448-bit two-block padding edge
+    assert_eq!(
+        mk_db::webauthn::sha256(b"abc"),
+        hex32("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    );
+    assert_eq!(
+        mk_db::webauthn::sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        hex32("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    );
+}
+
+#[test]
+fn twofa_resume_p256_ecdsa_verify() {
+    // RFC 6979 A.2.5 (NIST P-256, SHA-256, message "sample"): Ux/Uy + (r, s)
+    let ux = hex32("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6");
+    let uy = hex32("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299");
+    let r = hex32("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716");
+    let s = hex32("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8");
+    // DER ECDSA-Sig-Value { r INTEGER (0x00-padded), s INTEGER (0x00-padded) }
+    let mut der = Vec::new();
+    der.extend_from_slice(&[0x30, 0x46, 0x02, 0x21, 0x00]);
+    der.extend_from_slice(&r);
+    der.extend_from_slice(&[0x02, 0x21, 0x00]);
+    der.extend_from_slice(&s);
+    assert!(mk_db::webauthn::ecdsa_p256_sha256_verify(
+        b"sample", &ux, &uy, &der
+    ));
+    // a different message under the same signature (and a flipped signature
+    // byte under the right one) both stay invalid
+    assert!(!mk_db::webauthn::ecdsa_p256_sha256_verify(
+        b"samplE", &ux, &uy, &der
+    ));
+    let mut tampered = der.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(!mk_db::webauthn::ecdsa_p256_sha256_verify(
+        b"sample", &ux, &uy, &tampered
+    ));
+}
+
+fn hex32(s: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, c) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap();
+    }
+    out
+}
+
 fn hex20(s: &str) -> [u8; 20] {
     let mut out = [0u8; 20];
     for (i, c) in s.as_bytes().chunks(2).enumerate() {

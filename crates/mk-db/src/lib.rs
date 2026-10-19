@@ -27,6 +27,10 @@ pub mod delete_account;
 // base32/TOTP + user_profile twoFactor* paths + the used-step burn
 // UserAuthService.validateOtp rides)
 pub mod two_factor;
+// twofa-resume: the security-key lane (vendored std-only SHA-256/CBOR/P-256
+// ECDSA + user_security_key paths + the redis challenge store parity —
+// WebAuthnService.verifyRegistration/verifyAuthentication shape)
+pub mod webauthn;
 // i/update tail wave: drive files (upload), note pinings, personal memos
 pub mod drive;
 // note-agent: drive-file SQL for the note.ts slice (owned by-ids fetch +

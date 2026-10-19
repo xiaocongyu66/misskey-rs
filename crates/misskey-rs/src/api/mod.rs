@@ -511,11 +511,14 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END delete-account DISPATCH ARM ====
 
-    // ==== two-factor DISPATCH ARM (i/2fa/{register,done,unregister}) ====
+    // ==== two-factor DISPATCH ARM (i/2fa/{register,done,unregister} + the
+    // twofa-resume security-key family {register-key,key-done,password-less,
+    // update-key,remove-key}) ====
     // Self-contained block on the delete_account-arm pattern (2fa arena).
     // Method check, body parsing and token extraction live in the arm; the
     // requireCredential gate, the 2FA token gate and the bcrypt compare in
-    // api::two_factor (TOTP core + db paths in mk-db/src/two_factor.rs).
+    // api::two_factor (TOTP core + db paths in mk-db/src/two_factor.rs; the
+    // WebAuthn core + user_security_key db paths in mk-db/src/webauthn.rs).
     if two_factor::handles(name.as_str()) {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -1464,34 +1467,78 @@ async fn signin_route(state: &AppState, body: &Value) -> Response {
         }
         return signin_fail(pool, &user.id, 403, "cdf1235b-ac71-46d4-a3a6-84ccce48df6f").await;
     } else if body.get("credential").is_some() {
-        // passkey assertion lane — the webauthn verifier has no port-side
-        // implementation (2fa.ts security-key census rows stay red past this
-        // gate), a failed verify is fail(403, 93b86c4b…).
+        // twofa-resume: passkey assertion lane — SigninApiService L241-256:
+        // `!same && !usePasswordLessLogin` → fail(403, 932c…); then
+        // webAuthnService.verifyAuthentication (challenge/lookup errors are
+        // IdentifiableErrors → 500; a failed signature → fail(403, 93b86c4b…)).
         if !same && !profile.use_password_less_login {
             return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
         }
+        let rp_id = two_factor::rp_id(state);
+        let rp_origin = two_factor::rp_origin(state);
+        let credential = body.get("credential").unwrap();
+        let authorized = match mk_db::webauthn::verify_authentication(
+            pool,
+            &user.id,
+            rp_id.as_str(),
+            rp_origin.as_str(),
+            credential,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(target: "dbg_signin", error = ?e, "verify_authentication");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        if authorized {
+            return signin_ok(pool, &user.id, &user.token).await;
+        }
         return signin_fail(pool, &user.id, 403, "93b86c4b-72f9-40eb-9815-798928603d1e").await;
-    } else if profile.security_keys_available {
-        // initiateAuthentication stub: the census rows consuming it assert
-        // challenge/allowCredentials presence (never values).
-        let auth_request = json!({
-            "challenge": mk_types::id::gen_aid_now(),
-            "rpId": state.config.host(),
-            "timeout": 60_000,
-            "allowCredentials": [],
-        });
+    } else {
+        // live key-count gate (SigninApiService L145 countBy parity — not the
+        // legacy user_profile.securityKeysAvailable column)
+        let keys_available = match mk_db::webauthn::count_by_user(pool, &user.id).await {
+            Ok(c) => c > 0,
+            Err(e) => {
+                tracing::error!(target: "dbg_signin", error = %e, "count_by_user[signin]");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        if !keys_available {
+            if !same {
+                return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
+                    .await;
+            }
+            // reply body must be EXACTLY this shape (2fa.ts assert.deepStrictEqual)
+            return (
+                StatusCode::OK,
+                Json(json!({ "finished": false, "next": "totp" })),
+            )
+                .into_response();
+        }
+        // securityKeysAvailable lane: `!same && !usePasswordLessLogin` →
+        // fail(403, 932c…); then initiateAuthentication → the passkey prompt
+        if !same && !profile.use_password_less_login {
+            return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
+        }
+        let auth_request = match mk_db::webauthn::authentication_options(
+            pool,
+            two_factor::rp_id(state).as_str(),
+            &user.id,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(target: "dbg_signin", error = %e, "initiate_authentication");
+                return api_err(ApiError::internal_error());
+            }
+        };
         return (
             StatusCode::OK,
             Json(json!({ "finished": false, "next": "passkey", "authRequest": auth_request })),
-        )
-            .into_response();
-    } else if !same {
-        return signin_fail(pool, &user.id, 403, "932c904e-9460-45b7-9ce6-7ed33be7eb2c").await;
-    } else {
-        // reply body must be EXACTLY this shape (2fa.ts assert.deepStrictEqual)
-        return (
-            StatusCode::OK,
-            Json(json!({ "finished": false, "next": "totp" })),
         )
             .into_response();
     }
@@ -1858,6 +1905,8 @@ async fn i_route(
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
             apply_me_role_compat(&mut v);
+            // twofa-resume: the live securityKeys/securityKeysList tail
+            apply_me_security_keys(pool, profile.two_factor_enabled, &row.id, &mut v).await;
             v
         }),
     )
@@ -2380,6 +2429,9 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
             let mut v = mk_core::services::user_pack::pack_inline(&row, &profile, true, None, ctx);
             apply_me_unread(pool, &mut v).await;
             apply_me_role_compat(&mut v);
+            // twofa-resume: i/update packs the same MeDetailed includeSecrets
+            // shape — the live securityKeys/securityKeysList tail rides too
+            apply_me_security_keys(pool, profile.two_factor_enabled, &row.id, &mut v).await;
             v
         }),
     )
@@ -2397,6 +2449,50 @@ pub(crate) async fn apply_me_unread(pool: &mk_db::sqlx::PgPool, packed: &mut Val
             }
         }
         Err(e) => tracing::error!(target: "dbg_i", error = %e, "has_unread"),
+    }
+}
+
+/// twofa-resume: the `i` MeDetailed tail that reads live tables
+/// (UserEntityService.pack L578-586 + L627-639, includeSecrets shape):
+/// `securityKeys: profile.twoFactorEnabled ? count(user_security_key) >= 1 :
+/// false` — the static pack rides profile.securityKeysAvailable, the legacy
+/// column key-done never writes — and `securityKeysList: twoFactorEnabled ?
+/// user_security_key rows { id, name, lastUsed } : []`.
+pub(crate) async fn apply_me_security_keys(
+    pool: &mk_db::sqlx::PgPool,
+    two_factor_enabled: bool,
+    user_id: &str,
+    packed: &mut Value,
+) {
+    let briefs = if two_factor_enabled {
+        match mk_db::webauthn::list_briefs(pool, user_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(target: "dbg_i", error = %e, "list_security_keys");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if let Some(obj) = packed.as_object_mut() {
+        obj.insert(
+            "securityKeys".into(),
+            Value::Bool(two_factor_enabled && !briefs.is_empty()),
+        );
+        if obj.contains_key("securityKeysList") {
+            let list: Vec<Value> = briefs
+                .iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "name": k.name,
+                        "lastUsed": k.last_used,
+                    })
+                })
+                .collect();
+            obj.insert("securityKeysList".into(), Value::Array(list));
+        }
     }
 }
 

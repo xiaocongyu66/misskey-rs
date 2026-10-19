@@ -5,6 +5,12 @@
 //! twoFactor* db paths live in mk-db/src/two_factor.rs (vendored std-only
 //! SHA-1/HMAC-SHA1/base32/TOTP).
 //!
+//! twofa-resume: the security-key family i/2fa/{register-key,key-done,
+//! password-less,update-key,remove-key} joins beside the TOTP slice (upstream
+//! endpoints/i/2fa/*.ts over core/WebAuthnService.ts) — the WebAuthn
+//! verification core (vendored SHA-256/CBOR/P-256 ECDSA) + the
+//! user_security_key db paths live in mk-db/src/webauthn.rs.
+//!
 //! DEVIATIONS (documented): `QRCode.toDataURL(url)` is mirrored as a constant
 //! 1×1 png data URL (the e2e only asserts qr != undefined), and the
 //! GlobalEventService meUpdated main-stream publish has no port-side
@@ -22,7 +28,16 @@ use mk_db::two_factor::TwoFactorSecrets;
 
 /// Endpoint names owned by this module (all POST-only).
 pub(super) fn handles(name: &str) -> bool {
-    matches!(name, "i/2fa/register" | "i/2fa/done" | "i/2fa/unregister")
+    matches!(
+        name,
+        "i/2fa/register" | "i/2fa/done" | "i/2fa/unregister"
+            // twofa-resume: the security-key family
+            | "i/2fa/register-key"
+            | "i/2fa/key-done"
+            | "i/2fa/password-less"
+            | "i/2fa/update-key"
+            | "i/2fa/remove-key"
+    )
 }
 
 /// Entry from the two-factor dispatch arm in mod.rs.
@@ -35,7 +50,13 @@ pub(super) async fn handle(
     match name {
         "i/2fa/register" => i_register(state, body, token.as_deref()).await,
         "i/2fa/done" => i_done(state, body, token.as_deref()).await,
-        _ => i_unregister(state, body, token.as_deref()).await,
+        "i/2fa/unregister" => i_unregister(state, body, token.as_deref()).await,
+        // twofa-resume
+        "i/2fa/register-key" => i_register_key(state, body, token.as_deref()).await,
+        "i/2fa/key-done" => i_key_done(state, body, token.as_deref()).await,
+        "i/2fa/password-less" => i_password_less(state, body, token.as_deref()).await,
+        "i/2fa/update-key" => i_update_key(state, body, token.as_deref()).await,
+        _ => i_remove_key(state, body, token.as_deref()).await,
     }
 }
 
@@ -350,4 +371,432 @@ async fn i_unregister(state: &AppState, body: &Value, token: Option<&str>) -> Re
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ==== twofa-resume: the security-key family ==================================
+// upstream endpoints/i/2fa/{register-key,key-done,password-less,update-key,
+// remove-key}.ts over core/WebAuthnService.ts (WebAuthn verify core + the
+// user_security_key db paths live in mk-db/src/webauthn.rs).
+
+/// WebAuthnService.getRelyingParty() port. DEVIATION (documented in the
+/// mk-db::webauthn header): rpId pins `config.host()` (host WITH port) and
+/// origin pins config.url minus the trailing slash — the pinned 2fa.ts builds
+/// authData.rpIdHash from `config.host` and the origin from
+/// `scheme + '://' + config.host`, while upstream's own port-less URL makes
+/// host and hostname coincide.
+pub(crate) fn rp_id(state: &AppState) -> String {
+    state.config.host()
+}
+
+pub(crate) fn rp_origin(state: &AppState) -> String {
+    let url = &state.config.url;
+    url.trim_end_matches('/')
+        .to_string()
+}
+
+/// register-key.ts / key-done.ts / remove-key.ts shared gate (L77-96 shape):
+/// profile load → `if (profile.twoFactorEnabled) { token == null →
+/// Error('authentication failed'); verify fail → Error }` (plain Errors =
+/// 500 INTERNAL_ERROR) → bcrypt compare (ApiError INCORRECT_PASSWORD) →
+/// the optional `!profile.twoFactorEnabled` twoFactorNotEnabled ApiError
+/// (register-key/key-done only).
+async fn key_family_gate(
+    state: &AppState,
+    body: &Value,
+    token: Option<&str>,
+    me: &mk_db::user::LocalUserRow,
+    incorrect_pw_id: &str,
+) -> Result<mk_db::user::ProfileRow, Response> {
+    let Some(pool) = &state.pool else {
+        return Err(internal());
+    };
+    let profile = match mk_db::user::find_profile(pool, &me.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "find_profile[key-gate]");
+            return Err(internal());
+        }
+    };
+    if profile.two_factor_enabled {
+        let Some(t) = body.get("token").and_then(|v| v.as_str()) else {
+            return Err(internal()); // Error('authentication failed')
+        };
+        let secrets = match mk_db::two_factor::fetch_secrets(pool, &me.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "dbg_two_factor", error = %e, "fetch_secrets[key-gate]");
+                return Err(internal());
+            }
+        };
+        let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
+        if !two_factor_authenticate(pool, &me.id, &secrets, t, env).await {
+            return Err(internal()); // Error('authentication failed')
+        }
+    }
+    let matched = body
+        .get("password")
+        .and_then(Value::as_str)
+        .map(|password| {
+            profile
+                .password
+                .as_deref()
+                .map(|h| mk_core::services::verify_password(password, h).unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !matched {
+        return Err(incorrect_password(incorrect_pw_id));
+    }
+    Ok(profile)
+}
+
+/// Ajv paramDef shape helpers the key family shares.
+fn str_param(body: &Value, key: &str) -> Result<String, Response> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .ok_or_else(|| super::invalid_param(key, "required"))
+}
+
+/// `POST /api/i/2fa/register-key` — endpoints/i/2fa/register-key.ts. paramDef:
+/// password (required), token (nullable). Flow: gate → webAuthnService.
+/// initiateRegistration → PublicKeyCredentialCreationOptionsJSON.
+async fn i_register_key(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    let Ok(password) = str_param(body, "password") else {
+        return super::invalid_param("password", "required");
+    };
+    match body.get("token") {
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(_) => return super::invalid_param("token", "expected a string or null"),
+    }
+
+    let Some(pool) = &state.pool else {
+        return internal();
+    };
+    let Some(_me) = resolve_me(state, token).await.map(|(p, me)| me).ok() else {
+        return internal();
+    };
+
+    let profile = match mk_db::user::find_profile(pool, &_me.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "find_profile[register-key]");
+            return internal();
+        }
+    };
+    // 2FA token gate — token == null while enabled throws (plain Error = 500),
+    // a failing verify does the same; then password compare (ApiError 400);
+    // then the twoFactorNotEnabled gate.
+    if profile.two_factor_enabled {
+        let Some(t) = body.get("token").and_then(Value::as_str) else {
+            return internal();
+        };
+        let secrets = match mk_db::two_factor::fetch_secrets(pool, &_me.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "dbg_two_factor", error = %e, "fetch_secrets[register-key]");
+                return internal();
+            }
+        };
+        let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
+        if !two_factor_authenticate(pool, &_me.id, &secrets, t, env).await {
+            return internal();
+        }
+    }
+    let matched = profile
+        .password
+        .as_deref()
+        .map(|h| mk_core::services::verify_password(&password, h).unwrap_or(false))
+        .unwrap_or(false);
+    if !matched {
+        return incorrect_password("38769596-efe2-4faf-9bec-abbb3f2cd9ba");
+    }
+    if !profile.two_factor_enabled {
+        // ApiError(meta.errors.twoFactorNotEnabled)
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "TWO_FACTOR_NOT_ENABLED",
+            "bf32b864-449b-47b8-974e-f9a5468546f1",
+            "2fa not enabled.",
+        ));
+    }
+
+    // webAuthnService.initiateRegistration(me.id, username, user.name?)
+    let rp_name = mk_db::meta::fetch_nodeinfo_meta(pool)
+        .await
+        .ok()
+        .and_then(|m| m.name)
+        .unwrap_or_else(|| state.config.host());
+    let options = match mk_db::webauthn::registration_options(
+        pool,
+        rp_id(state).as_str(),
+        rp_name.as_str(),
+        &_me.id,
+        &_me.username,
+        _me.name.as_deref(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "registration_options");
+            return internal();
+        }
+    };
+    (StatusCode::OK, Json(options)).into_response()
+}
+
+/// `POST /api/i/2fa/key-done` — endpoints/i/2fa/key-done.ts. paramDef:
+/// password (required), name (1..30, required), credential (object,
+/// required), token (nullable). Flow: gate → webAuthnService.
+/// verifyRegistration → user_security_key insert → { id, name }.
+async fn i_key_done(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    if !body.get("password").is_some_and(Value::is_string) {
+        return super::invalid_param("password", "required");
+    }
+    let name = match body.get("name").and_then(Value::as_str) {
+        Some(n) if (1..=30).contains(&n.chars().count()) => n.to_string(),
+        Some(_) => return super::invalid_param("name", "expected a 1-30 character string"),
+        None => return super::invalid_param("name", "required"),
+    };
+    if !body.get("credential").is_some_and(Value::is_object) {
+        return super::invalid_param("credential", "expected an object");
+    }
+    match body.get("token") {
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(_) => return super::invalid_param("token", "expected a string or null"),
+    }
+
+    let Some((pool, me)) = resolve_me(state, token).await.ok() else {
+        return internal();
+    };
+    // key-done.ts L77-96 gate (profile load → 2FA token gate → bcrypt →
+    // twoFactorNotEnabled)
+    if let Err(resp) = key_family_gate(state, body, token, &me, "0d7ec6d2-e652-443e-a7bf-9ee9a0cd77b0").await {
+        return resp;
+    }
+
+    // webAuthnService.verifyRegistration (IdentifiableError surface → 500)
+    let credential = body.get("credential").unwrap();
+    let verified = match mk_db::webauthn::verify_registration(
+        &me.id,
+        rp_id(state).as_str(),
+        rp_origin(state).as_str(),
+        credential,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = ?e, "verify_registration");
+            return internal();
+        }
+    };
+    if let Err(e) = mk_db::webauthn::insert_key(
+        pool,
+        &verified.credential_id,
+        &me.id,
+        &name,
+        &verified.public_key_b64url,
+        verified.counter,
+        Some(verified.device_type),
+        Some(verified.backed_up),
+        verified.transports.clone(),
+    )
+    .await
+    {
+        tracing::error!(target: "dbg_two_factor", error = %e, "insert_key");
+        return internal();
+    }
+    // GlobalEventService meUpdated publish: no port-side publisher to ride.
+    (
+        StatusCode::OK,
+        Json(json!({ "id": verified.credential_id, "name": name })),
+    )
+        .into_response()
+}
+
+/// `POST /api/i/2fa/password-less` — endpoints/i/2fa/password-less.ts.
+/// paramDef: value (boolean, required). Flow: value === true requires ≥ 1
+/// security key (else the column flips false + NO_SECURITY_KEY ApiError);
+/// the write, then 204 NO_CONTENT.
+async fn i_password_less(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    let Some(value) = body.get("value") else {
+        return super::invalid_param("value", "required");
+    };
+    let Value::Bool(value) = value else {
+        return super::invalid_param("value", "expected a boolean");
+    };
+
+    let Some(pool) = &state.pool else {
+        return internal();
+    };
+    let Some(_me) = resolve_me(state, token).await.map(|(p, me)| me).ok() else {
+        return internal();
+    };
+
+    if *value {
+        let count = match mk_db::webauthn::count_by_user(pool, &_me.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(target: "dbg_two_factor", error = %e, "count_by_user[password-less]");
+                return internal();
+            }
+        };
+        if count == 0 {
+            if let Err(e) = mk_db::webauthn::set_use_password_less_login(pool, &_me.id, false).await {
+                tracing::error!(target: "dbg_two_factor", error = %e, "password_less_false");
+                return internal();
+            }
+            // ApiError(meta.errors.noKey) — the meta id as pinned (not a valid
+            // UUID upstream either)
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "NO_SECURITY_KEY",
+                "f9c54d7f-d4c2-4d3c-9a8g-a70daac86512",
+                "No security key.",
+            ));
+        }
+    }
+    if let Err(e) = mk_db::webauthn::set_use_password_less_login(pool, &_me.id, *value).await {
+        tracing::error!(target: "dbg_two_factor", error = %e, "set_use_password_less_login");
+        return internal();
+    }
+    // GlobalEventService meUpdated publish: no port-side publisher to ride.
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/i/2fa/update-key` — endpoints/i/2fa/update-key.ts. paramDef:
+/// name (1..30, required), credentialId (string, required). Flow: key lookup
+/// (NO_SUCH_KEY ApiError) → ownership (ACCESS_DENIED ApiError) → rename.
+async fn i_update_key(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    let name = match body.get("name").and_then(Value::as_str) {
+        Some(n) if (1..=30).contains(&n.chars().count()) => n.to_string(),
+        Some(_) => return super::invalid_param("name", "expected a 1-30 character string"),
+        None => return super::invalid_param("name", "required"),
+    };
+    let Ok(credential_id) = str_param(body, "credentialId") else {
+        return super::invalid_param("credentialId", "required");
+    };
+
+    let Some(pool) = &state.pool else {
+        return internal();
+    };
+    let Some(_me) = resolve_me(state, token).await.map(|(p, me)| me).ok() else {
+        return internal();
+    };
+
+    let key = match mk_db::webauthn::find_by_id(pool, &credential_id).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "find_by_id[update-key]");
+            return internal();
+        }
+    };
+    let Some(key) = key else {
+        // ApiError(meta.errors.noSuchKey)
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_KEY",
+            "f9c5467f-d492-4d3c-9a8g-a70dacc86512",
+            "No such key.",
+        ));
+    };
+    if key.user_id != _me.id {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "ACCESS_DENIED",
+            "1fb7cb09-d46a-4fff-b8df-057708cce513",
+            "You do not have edit privilege of this key.",
+        ));
+    }
+    if let Err(e) = mk_db::webauthn::set_key_name(pool, &key.id, &name).await {
+        tracing::error!(target: "dbg_two_factor", error = %e, "set_key_name");
+        return internal();
+    }
+    // GlobalEventService meUpdated publish: no port-side publisher to ride.
+    (StatusCode::OK, Json(json!({}))).into_response()
+}
+
+/// `POST /api/i/2fa/remove-key` — endpoints/i/2fa/remove-key.ts. paramDef:
+/// password (required), credentialId (required), token (nullable). Flow:
+/// 2FA gate → password compare → delete own row → keyCount === 0 flips
+/// usePasswordLessLogin false → {}.
+async fn i_remove_key(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    let Ok(password) = str_param(body, "password") else {
+        return super::invalid_param("password", "required");
+    };
+    if !body
+        .get("credentialId")
+        .is_some_and(|v| v.is_string())
+    {
+        return super::invalid_param("credentialId", "required");
+    }
+    match body.get("token") {
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(_) => return super::invalid_param("token", "expected a string or null"),
+    }
+
+    let Some(pool) = &state.pool else {
+        return internal();
+    };
+    let Some(me) = resolve_me(state, token).await.map(|(p, me)| me).ok() else {
+        return internal();
+    };
+
+    let profile = match mk_db::user::find_profile(pool, &me.id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "find_profile[remove-key]");
+            return internal();
+        }
+    };
+    if profile.two_factor_enabled {
+        let Some(t) = body.get("token").and_then(Value::as_str) else {
+            return internal();
+        };
+        let secrets = match mk_db::two_factor::fetch_secrets(pool, &me.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "dbg_two_factor", error = %e, "fetch_secrets[remove-key]");
+                return internal();
+            }
+        };
+        let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
+        if !two_factor_authenticate(pool, &me.id, &secrets, t, env).await {
+            return internal();
+        }
+    }
+    let matched = profile
+        .password
+        .as_deref()
+        .map(|h| mk_core::services::verify_password(&password, h).unwrap_or(false))
+        .unwrap_or(false);
+    if !matched {
+        return incorrect_password("141c598d-a825-44c8-9173-cfb9d92be493");
+    }
+
+    let credential_id = body.get("credentialId").unwrap().as_str().unwrap();
+    if let Err(e) = mk_db::webauthn::delete_own(pool, &me.id, credential_id).await {
+        tracing::error!(target: "dbg_two_factor", error = %e, "delete_own");
+        return internal();
+    }
+    // 使われているキーがなくなったらパスワードレスログインをやめる
+    let count = match mk_db::webauthn::count_by_user(pool, &me.id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(target: "dbg_two_factor", error = %e, "count_by_user[remove-key]");
+            return internal();
+        }
+    };
+    if count == 0 {
+        if let Err(e) = mk_db::webauthn::set_use_password_less_login(pool, &me.id, false).await {
+            tracing::error!(target: "dbg_two_factor", error = %e, "remove_key_password_less_flip");
+            return internal();
+        }
+    }
+    // GlobalEventService meUpdated publish: no port-side publisher to ride.
+    (StatusCode::OK, Json(json!({}))).into_response()
 }
