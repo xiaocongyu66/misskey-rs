@@ -697,7 +697,7 @@ mod tests {
     fn unit_services_user_lite_omits_detail_fields() {
         // upstream 'UserLite': memo / birthday / achievements are detail
         // fields — the lite shape carries none of them.
-        let v = user_lite_value_with_roles(&row(), &ctx(), None);
+        let v = user_lite_value_with_roles(&row(), ctx(), None);
         assert!(v.get("memo").is_none());
         assert!(v.get("birthday").is_none());
         assert!(v.get("achievements").is_none());
@@ -770,7 +770,7 @@ mod tests {
             .expect("relation");
         let mut p = profile();
         p.user_id = row.id.clone();
-        pack_inline_with_roles(&row, &p, false, Some(&rel), &ctx(), false, None)
+        pack_inline_with_roles(&row, &p, false, Some(&rel), ctx(), false, None)
     }
 
     /// upstream 'packManyによるpreloadがある時、preloadが無い時とpackの結果
