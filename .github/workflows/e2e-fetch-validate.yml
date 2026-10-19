@@ -1,0 +1,105 @@
+name: e2e-fetch-validate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetchvalidate-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: misskey_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rust server
+        run: cargo build --release --bin misskey-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: misskey-dev/misskey
+          ref: ea2c3aedc70ac87db3720a58f990dfaf301de6d9
+          path: upstream
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable pnpm
+        run: corepack enable
+        working-directory: upstream
+      - name: Upstream config
+        run: |
+          mkdir -p .config built
+          cat > .config/default.yml <<EOF
+          url: http://127.0.0.1:3000/
+          port: 3000
+          db:
+            host: 127.0.0.1
+            port: 5432
+            db: misskey_test
+            user: postgres
+            pass: postgres
+          redis:
+            host: 127.0.0.1
+            port: 6379
+          id: aid
+          EOF
+          node -e "console.log(JSON.stringify({ version: require('./package.json').version }))" > built/meta.json
+        working-directory: upstream
+      - name: Install upstream deps
+        run: pnpm install
+        working-directory: upstream
+      - name: Build e2e bundle (built-test)
+        run: pnpm --filter backend build:e2e
+        working-directory: upstream
+      - name: Compile upstream config
+        run: pnpm --filter backend compile-config
+        working-directory: upstream
+      - name: Install harness
+        run: |
+          cp e2e-harness/global-setup.mts upstream/packages/backend/global-setup.mts
+          cp e2e-harness/vitest.e2e-rs.config.ts upstream/packages/backend/vitest.e2e-rs.config.ts
+      - name: Run upstream fetch-validate-ap-deny.ts e2e against misskey-rs
+        working-directory: upstream/packages/backend
+        env:
+          E2E_INCLUDE: 'test/e2e/fetch-validate-ap-deny.ts'
+          MISSKEY_RS_BIN: ${{ github.workspace }}/target/release/misskey-rs
+          E2E_PORT: '3000'
+          MISSING_DEPS_OK: '1'
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/misskey_test
+        run: |
+          pnpm exec cross-env NODE_ENV=test pnpm exec vitest run \
+            --config vitest.e2e-rs.config.ts \
+            --reporter=verbose --reporter=junit \
+            --outputFile.junit=test-output/junit.xml \
+            || echo "::warning::e2e had failures (census run - see report)"
+      - name: Upload vitest report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetchvalidate-e2e-report
+          path: upstream/packages/backend/test-output/
+          if-no-files-found: ignore
+      - name: junit to log (quota-proof census)
+        if: always()
+        run: cat upstream/packages/backend/test-output/junit.xml || true
