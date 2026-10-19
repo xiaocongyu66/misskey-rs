@@ -14,6 +14,9 @@ pub mod announcement;
 // channels-agent: channels/* domain (channel/channel_following/channel_favorite
 // tables + the channels/timeline note db path)
 pub mod channel;
+// clips-agent: clips/* + users/clips domain (clip/clip_note/clip_favorite
+// tables ship in the 0001 baseline; CRUD + notes + favorites db paths)
+pub mod clips;
 // delete-account: i/delete-account + admin/delete-account soft-delete flag
 pub mod delete_account;
 // i/update tail wave: drive files (upload), note pinings, personal memos

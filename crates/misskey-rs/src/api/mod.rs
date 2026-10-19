@@ -34,6 +34,11 @@ mod delete_account;
 // channels-agent: channels/* domain (channels/create ../favorite slice of
 // upstream endpoints/channels/*) — db paths in mk-db/src/channel.rs
 mod channel;
+// clips-agent: the clips family (clips/{create,list,show,update,delete,
+// favorite,unfavorite,my-favorites,notes,add-note,remove-note} +
+// users/clips) — db paths in mk-db/src/clips.rs (clip/clip_note/
+// clip_favorite tables ship in the 0001 baseline).
+mod clips;
 // announcements-agent: the announcements family (announcements +
 // announcements/show + i/read-announcement + admin/announcements/*) — db
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
@@ -60,6 +65,12 @@ mod ftt;
 // `localTimeline` fanout of the notesStream event (upstream
 // GlobalEventService.publishNotesStream + stream/channels/{home,local}-timeline.ts).
 mod streaming;
+// ff-visibility arena: users/followers + users/following (upstream
+// endpoints/users/{followers,following}.ts per-visibility gates) + the AP
+// /users/:id/{followers,following} collections +
+// admin/update-meta federation persistence (api/ff_vis.rs; db paths in
+// mk-db/src/ff_visibility.rs).
+pub(crate) mod ff_vis;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -153,6 +164,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "pinned-users"
         || name == "users/notes"
         || name == "admin/update-meta"
+        // ff-arena: the following/followers list arena (upstream
+        // endpoints/users/{followers,following}.ts per-visibility gates)
+        || name == "users/followers"
+        || name == "users/following"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -251,6 +266,16 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "notes/polls/vote" || name == "notes/translate" {
             return note_extras::handle(&state, name.as_str(), &body, token).await;
         }
+        // ff-arena: persist meta."federation" on admin/update-meta before the
+        // note/freq lane arms apply their keys (MetaService.update partial
+        // patch; the ff-visibility.ts beforeAll flips it to 'all' and the AP
+        // /users/:id/{followers,following} collections gate on it). Errors
+        // return; success falls through so the other lanes' keys keep landing.
+        if name == "admin/update-meta" && body.get("federation").is_some() {
+            if let Err(resp) = ff_vis::persist_federation(&state, &body, token.as_deref()).await {
+                return *resp;
+            }
+        }
         // note-agent: the sensitiveWords/prohibitedWords patch of update-meta
         // (note.ts census keeps those lists in the meta row via this arm;
         // pinnedUsers and the rest still flow to the freq arm below).
@@ -259,6 +284,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "admin/update-meta" {
             return freq::update_meta(&state, &body, token.as_deref()).await;
+        }
+        // ff-arena arms: users/followers + users/following lists
+        if ff_vis::FF_ENDPOINTS.contains(&name.as_str()) {
+            return ff_vis::route(&state, name.as_str(), &body, token.as_deref()).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -507,6 +536,42 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return lists::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END ul-tl-agent DISPATCH ARM ====
+
+    // ==== clips-agent DISPATCH ARM (clips/* + users/clips) ====
+    // Self-contained block on the channels/ul-tl arm pattern: method check,
+    // body parsing, token extraction and the credential-declared probe live
+    // in this arm; the requireCredential gates (all but clips/show,
+    // clips/notes, users/clips) + endpoint bodies in api::clips (db paths in
+    // mk-db/src/clips.rs). None of the 12 names collide with an earlier arm
+    // ("users/clips" is not in the users/show group's name list), so this
+    // arm shadows nothing.
+    if clips::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return clips::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END clips-agent DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());

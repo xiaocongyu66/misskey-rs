@@ -8004,3 +8004,380 @@ async fn block_arena_gates() {
 
     let _ = pool;
 }
+// clips-arena: the e2e-needed slice of test/e2e/clips.ts — CRUD roundtrip +
+// favorite + notes attach (created 9f40e44.. lane; upstream refs in
+// mk-db/src/clips.rs + api/clips.rs headers).
+#[tokio::test]
+async fn clips_arena_crud_favorite_notes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkclips_arena").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+
+    let username = format!("alice{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool));
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+
+    // cap 1: create packs the Clip shape's me-gated keys, lastClippedAt NULL
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/create",
+        json!({ "name": "test", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["name"], "test");
+    assert_eq!(v["isPublic"], false);
+    assert_eq!(v["lastClippedAt"], Value::Null);
+    assert_eq!(v["favoritedCount"], 0);
+    assert_eq!(v["isFavorited"], false);
+    assert_eq!(v["notesCount"], 0);
+    assert_eq!(v["description"], Value::Null);
+    let clip_id = v["id"].as_str().unwrap().to_string();
+
+    // cap 2: clips/list roundtrip + clips/show by id agree
+    let (s, v) = post_json(app.clone(), "/api/clips/list", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "list: {v}");
+    assert_eq!(arr[0]["id"], clip_id, "list: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/show",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["id"], clip_id);
+    assert_eq!(v["name"], "test");
+
+    // the clip's source note
+    let (s, nv) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "clip me", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {nv}");
+    let note_id = nv["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // cap 3: add-note attaches (clips/notes ids) + feeds the notes/show
+    // clippedCount counter; a second attach answers ALREADY_CLIPPED
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/add-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let clipped: i16 =
+        mk_db::sqlx::query_scalar(r#"SELECT "clippedCount" FROM "note" WHERE "id" = $1"#)
+            .bind(&note_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(clipped, 1, "add-note must bump the note counter");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/notes",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v[0]["id"], note_id, "notes: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/add-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "ALREADY_CLIPPED", "body: {v}");
+    assert_eq!(
+        v["error"]["id"], "734806c4-542c-463a-9311-15c512803965",
+        "body: {v}"
+    );
+
+    // cap 4: favorite flips the pack counters, duplicate answers
+    // ALREADY_FAVORITED, unfavorite restores
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/favorite",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/show",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["favoritedCount"], 1, "body: {v}");
+    assert_eq!(v["isFavorited"], true, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/favorite",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "ALREADY_FAVORITED", "body: {v}");
+
+    // cap 5: update + delete roundtrip; a deleted clip answers NO_SUCH_CLIP
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/update",
+        json!({ "clipId": clip_id, "name": "updated", "isPublic": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["name"], "updated");
+    assert_eq!(v["isPublic"], true);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/delete",
+        json!({ "clipId": clip_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/clips/add-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "NO_SUCH_CLIP", "body: {v}");
+    assert_eq!(
+        v["error"]["id"], "d6e76cc0-a1b5-4c7c-a287-73fa9c716dcf",
+        "body: {v}"
+    );
+    let (s, v) = post_json(app.clone(), "/api/clips/list", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v.as_array().unwrap().len(), 0, "list after delete: {v}");
+
+    let _ = pool;
+}
+
+// ===== ff-arena: ff-visibility list gates + AP collections ===================
+//
+// users/followers + users/following run the per-visibility gate before the
+// list query (upstream endpoints/users/{followers,following}.ts L115-143:
+// public → anyone; followers → me or a follower, moderators bypass; private →
+// me only; ApiError kind=client → 400). The AP twins
+// (ActivityPubServerService.{followers,following}) 403 on federation 'none'
+// or any non-public visibility and serve activity+json OrderedCollections
+// otherwise — admin/update-meta {federation:'all'} must persist for the
+// public leg to reach 200, matching the ff-visibility.ts beforeAll flow.
+
+#[tokio::test]
+async fn ff_visibility_list_gates_and_ap_collections() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkffvis").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // alice signs up FIRST → unset meta rootUserId makes her the moderator/admin
+    let alice = signup(&app, &uname("ffva")).await;
+    let bob = signup(&app, &uname("ffvb")).await;
+    let (a_id, a_token) = (alice["id"].as_str().unwrap(), alice["token"].as_str().unwrap());
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+
+    // ff-arena 1: both public → any viewer gets 200 arrays with Following
+    // pack items (followeeId/followerId + populated followee/follower)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({
+            "i": a_token,
+            "followingVisibility": "public",
+            "followersVisibility": "public",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "public followers list: {v}");
+    assert_eq!(v, json!([]));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/following",
+        json!({ "userId": a_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "public following list needs no me: {v}");
+    assert_eq!(v, json!([]));
+
+    // ff-arena 2: followersVisibility='followers' — a non-follower gets 400
+    // FORBIDDEN, the owner still sees her own list
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": a_token, "followersVisibility": "followers" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s403, v403) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s403, StatusCode::BAD_REQUEST, "non-follower: {v403}");
+    assert_eq!(v403["error"]["code"], json!("FORBIDDEN"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "owner sees the followers-visibility list");
+
+    // bob follows alice → the followers gate opens for him (and the pack
+    // mirrors the edge + its follower user)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follower now allowed: {v}");
+    assert_eq!(v[0]["followerId"], json!(b_id));
+    assert_eq!(v[0]["followeeId"], json!(a_id));
+    assert_eq!(v[0]["follower"]["id"], json!(b_id));
+
+    // ff-arena 3: followersVisibility='private' — even a follower is locked
+    // out; only me (and moderators, root alice here) gets 200
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": a_token, "followersVisibility": "private" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "private locks followers out: {v}");
+    assert_eq!(v["error"]["code"], json!("FORBIDDEN"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/users/followers",
+        json!({ "userId": a_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "me sees the private list");
+
+    // ff-arena 4: the AP collections — federation 'none' (fresh meta) 403s;
+    // admin/update-meta {federation:'all'} (alice is root) + public
+    // visibility → 200 OrderedCollection with the activity+json content type;
+    // flipping visibility to private → 403 again
+    async fn ap_get(
+        app: axum::Router,
+        path: String,
+    ) -> (StatusCode, Option<String>, Value) {
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("accept", "application/activity+json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, ct, v)
+    }
+
+    let (s, _, v) = ap_get(
+        app.clone(),
+        format!("/users/{a_id}/followers"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "federation none: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": a_token, "federation": "all" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "federation 'all' patch: {v}");
+    let (s, ct, v) = ap_get(
+        app.clone(),
+        format!("/users/{a_id}/followers"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "public AP collection: {v}");
+    assert!(
+        ct.as_deref()
+            .unwrap_or_default()
+            .starts_with("application/activity+json"),
+        "ct: {ct:?}"
+    );
+    assert_eq!(v["type"], json!("OrderedCollection"));
+    assert_eq!(v["totalItems"], json!(1), "bob follows alice: {v}");
+    let (s, _, _) = ap_get(
+        app.clone(),
+        format!("/users/{a_id}/following"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "AP following public");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": a_token, "followingVisibility": "private" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, _, _) = ap_get(
+        app.clone(),
+        format!("/users/{a_id}/following"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "private AP collection must 403");
+
+    let _ = (b_id, pool);
+}
