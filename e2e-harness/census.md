@@ -1,3 +1,4 @@
+latest: run 39179590872 — timelines.ts CLEARED 378/378 (keyPrefix parity)
 # users.ts e2e census — misskey-rs（持续更新）
 
 上游规格：misskey-dev/misskey @ ea2c3aed，`packages/backend/test/e2e/users.ts`
