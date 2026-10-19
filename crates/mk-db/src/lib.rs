@@ -33,6 +33,10 @@ pub mod drive;
 // drive/files/update write), kept separate from the drive-arena agent's
 // drive.rs
 pub mod drive_note;
+// arena-exports: the export-job db plane (mk_export_blobs byte store + the
+// ExportClipsProcessorService clip/clipNote reads + drive/files {list,show,
+// delete} support queries)
+pub mod export_blob;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
 // ff-visibility arena: users/followers + users/following list edges + the

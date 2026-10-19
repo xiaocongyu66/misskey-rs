@@ -94,6 +94,12 @@ pub(crate) mod ff_vis;
 // mint (upstream endpoints/test.ts + endpoints/miauth/gen-token.ts; the
 // api.ts General-validation suite + createAppToken fixtures).
 mod miauth;
+// arena-exports: i/export-clips (upstream endpoints/i/export-clips.ts) + the
+// exportClips processor (upstream queue/processors/
+// ExportClipsProcessorService.ts) + the /files/{key}/{name} byte route +
+// drive/files {list,show,delete} (the exports.ts beforeEach / poll loop).
+// pub(crate): main.rs mounts the /files route + spawns the queue worker.
+pub(crate) mod exports;
 // arena-oauth: OAuth2 provider flows (upstream server/oauth/* + test/e2e/
 // oauth.ts) — /oauth/{authorize,decision,token} routes + the PKCE grant
 // caches + the access-token bearer resolution the notes/create kind gate
@@ -689,6 +695,28 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return clips::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END clips-agent DISPATCH ARM ====
+
+    // ==== arena-exports DISPATCH ARM (i/export-clips + drive/files trio) ====
+    // Self-contained block on the clips-arm pattern: method check, body
+    // parsing and token extraction live in this arm; the requireCredential
+    // gates + endpoint bodies in api::exports (the exportClips job runs on
+    // the mk-queue worker spawned in main.rs; db paths in
+    // mk-db/src/export_blob.rs + the 0006 mk_export_blobs byte store).
+    // None of the 4 names collide with an earlier arm, so this arm shadows
+    // nothing.
+    if exports::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return exports::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END arena-exports DISPATCH ARM ====
 
     // ==== antennas-v2 DISPATCH ARM (antennas/*) ====
     // Self-contained block on the clips/ul-tl arm pattern: method check, body

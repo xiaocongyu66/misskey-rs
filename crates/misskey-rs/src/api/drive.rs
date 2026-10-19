@@ -1210,7 +1210,8 @@ fn blurhash_placeholder(md5hex: &str) -> String {
 
 /// RFC 1321 MD5 (constants derived via K[i] = floor(|sin(i+1)| · 2³²), so no
 /// magic-table typos). Files upstream compute md5 in DriveService.upload.
-fn md5_hex(data: &[u8]) -> String {
+/// pub(crate): the arena-exports processor reuses it for the exported JSON.
+pub(crate) fn md5_hex(data: &[u8]) -> String {
     let k: [u32; 64] =
         core::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0).floor() as u32);
 

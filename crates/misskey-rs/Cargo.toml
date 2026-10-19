@@ -12,6 +12,9 @@ path = "src/main.rs"
 mk-types = { workspace = true }
 mk-db = { workspace = true }
 mk-core = { workspace = true }
+# arena-exports: the PG-brokered durable queue (mk_queue_jobs) the
+# `exportClips` job rides — spawn_export_worker + QueueHandle::enqueue.
+mk-queue = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }

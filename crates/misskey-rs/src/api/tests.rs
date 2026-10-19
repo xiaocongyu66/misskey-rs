@@ -11463,3 +11463,256 @@ fn oauth_html_client_scan_parity() {
         "u-logo resolves against the document URL"
     );
 }
+
+// arena-exports ==============================================================
+// upstream test/e2e/exports.ts (pinned ea2c3aed = the export-clips suite) at
+// the queue level: i/export-clips's enqueue-204 (204 NOW, the file LATER —
+// pollFirstDriveFile races the worker), the exportClips processor's JSON
+// shape + generateVisibilityQuery gate through the /files/{key}/{name} byte
+// route, and the drive/files {list,show,delete} metadata lane the beforeEach
+// + poll loop drive.
+
+#[tokio::test]
+async fn arena_exports_export_clips_queue_plane() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkexports").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("exa")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("exb")).await;
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // clip foo/bar (upstream 'basic export' setup)
+    let (s, clip) = post_json(
+        app.clone(),
+        "/api/clips/create",
+        json!({ "name": "foo", "description": "bar", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {clip}");
+    let clip_id = clip["id"].as_str().unwrap().to_string();
+
+    // bob posts a followers-only note; alice (NOT following) clips it — the
+    // export processor must exclude it (generateVisibilityQuery followers
+    // arm) even though the clip_note row exists
+    let (s, bnote) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "baz", "visibility": "followers", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {bnote}");
+    let bnote_id = bnote["createdNote"]["id"].as_str().unwrap().to_string();
+    // alice's own poll note — serializeClipNote's poll leg choices survive
+    let (s, pnote) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "baz1", "poll": { "choices": ["sakura", "izumi", "ako"] }, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {pnote}");
+    let pnote_id = pnote["createdNote"]["id"].as_str().unwrap().to_string();
+
+    for nid in [&bnote_id, &pnote_id] {
+        let (s, b) = post_json(
+            app.clone(),
+            "/api/clips/add-note",
+            json!({ "clipId": clip_id, "noteId": nid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    }
+
+    // 204 NOW — the job is durable before any worker touches it
+    let (s, b) = post_json(app.clone(), "/api/i/export-clips", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    assert_eq!(b, Value::Null, "void endpoint: empty body");
+    let jobs: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "mk_queue_jobs" WHERE "kind" = 'exportClips'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // claim on the harness races: run the claimed job inline (the spawn
+    // worker runs exactly this body; mk_queue's 500ms poll vs the e2e's
+    // 100ms drive/files loop)
+    let handle = mk_queue::QueueHandle::new(pool.clone());
+    let job = handle
+        .claim_next(&["exportClips"])
+        .await
+        .unwrap()
+        .expect("queued exportClips job claimable");
+    assert_eq!(jobs, 1, "exactly one durable exportClips row");
+    crate::api::exports::run_export_job(
+        &pool,
+        "http://127.0.0.1:3000",
+        &job.payload["user"]["id"].as_str().unwrap(),
+    )
+    .await
+    .expect("exportClips processor");
+
+    // pollFirstDriveFile plane: exactly one JSON drive file, url under /files
+    let (s, files) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {files}");
+    let files = files.as_array().expect("files array").clone();
+    assert_eq!(
+        files.len(),
+        1,
+        "exactly 1 drive file (Too many files? guard)"
+    );
+    assert_eq!(files[0]["type"], json!("application/json"));
+    assert!(files[0]["name"].as_str().unwrap().starts_with("clips-"));
+    let f1_id = files[0]["id"].as_str().unwrap().to_string();
+    let f1_url = files[0]["url"].as_str().unwrap().to_string();
+    assert!(
+        f1_url.contains("/files/"),
+        "internal-storage url shape: {f1_url}"
+    );
+
+    // drive/files/show round-trips the SAME url
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": f1_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["url"].as_str(), Some(f1_url.as_str()));
+
+    // the byte route: fetch file.url's path and parse the export JSON
+    let path = url::Url::parse(&f1_url).unwrap().path().to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let exported: Value = serde_json::from_slice(&bytes).expect("export JSON parses");
+    assert_eq!(exported[0]["name"], json!("foo"));
+    assert_eq!(exported[0]["description"], json!("bar"));
+    let clip_notes = exported[0]["clipNotes"].as_array().expect("clipNotes");
+    assert_eq!(
+        clip_notes.len(),
+        1,
+        "followers-only bob note hidden pre-follow"
+    );
+    assert_eq!(clip_notes[0]["note"]["text"], json!("baz1"));
+    assert_eq!(
+        clip_notes[0]["note"]["poll"]["choices"][0],
+        json!("sakura"),
+        "poll column survives the export"
+    );
+    assert_eq!(
+        clip_notes[0]["note"]["user"]["username"],
+        json!(alice["username"].as_str().unwrap())
+    );
+
+    // post-follow: the SAME bob clipNote joins the export on a second job
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": bob_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(app.clone(), "/api/i/export-clips", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let job = handle
+        .claim_next(&["exportClips"])
+        .await
+        .unwrap()
+        .expect("second exportClips job");
+    crate::api::exports::run_export_job(
+        &pool,
+        "http://127.0.0.1:3000",
+        &job.payload["user"]["id"].as_str().unwrap(),
+    )
+    .await
+    .expect("second exportClips processor");
+
+    let (s, files) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {files}");
+    let files = files.as_array().expect("files array").clone();
+    assert_eq!(files.len(), 2, "two exports = two drive files (force:true)");
+    // DESC list → newest export first; bob's followers-only note now included
+    let path = url::Url::parse(files[0]["url"].as_str().unwrap())
+        .unwrap()
+        .path()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let exported: Value = serde_json::from_slice(&bytes).expect("second export JSON");
+    let clip_notes = exported[0]["clipNotes"].as_array().expect("clipNotes");
+    assert_eq!(
+        clip_notes.len(),
+        2,
+        "bob's followers-only note visible post-follow"
+    );
+    assert_eq!(clip_notes[0]["note"]["text"], json!("baz"));
+    assert_eq!(
+        clip_notes[0]["note"]["user"]["username"],
+        json!(bob["username"].as_str().unwrap())
+    );
+
+    // beforeEach plane: drive/files/delete 204 (bytes dropped with the row),
+    // show on the gone file 400s NO_SUCH_FILE
+    for f in &files {
+        let (s, b) = post_json(
+            app.clone(),
+            "/api/drive/files/delete",
+            json!({ "fileId": f["id"].as_str().unwrap(), "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    }
+    let blobs: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "mk_export_blobs""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(blobs, 0, "blobs die with their drive rows");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": f1_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_FILE"));
+    let (s, files) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        files.as_array().unwrap().len(),
+        0,
+        "list empties (beforeEach clean)"
+    );
+}

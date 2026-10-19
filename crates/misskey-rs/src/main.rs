@@ -70,6 +70,9 @@ pub fn build_router(state: AppState) -> Router {
         // L450 fastify.get '/url' → UrlPreviewService.handle; sits outside
         // /api like the upstream web server).
         .route("/url", get(api::url_preview))
+        // arena-exports: the internal-storage byte route the exported drive
+        // files are fetched through (upstream FileServerService /files/*).
+        .route("/files/{*rest}", get(api::exports::files_serve))
         .route("/healthz", get(healthz))
         .layer(middleware::from_fn(json_utf8_charset))
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -116,6 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(db) => {
             let pool = mk_db::connect(&db.url()).await?;
             mk_db::run_migrations(&pool).await?;
+            // arena-exports: the exportClips consumer (upstream's db-queue
+            // BullMQ worker lane) — PG-brokered via mk_queue. config.url is
+            // the base the exported drive files' /files urls embed.
+            api::exports::spawn_export_worker(pool.clone(), config.url.clone());
             tracing::info!("postgres connected, migrations applied");
             Some(pool)
         }
