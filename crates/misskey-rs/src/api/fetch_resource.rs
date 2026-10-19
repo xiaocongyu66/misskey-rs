@@ -478,7 +478,10 @@ async fn user_html_page(state: AppState, seg: &str) -> Response {
 /// fastify `return` (200 empty); page miss → renderBase; hit → the page-id
 /// meta set.
 async fn page_html_page(state: AppState, seg: &str, pagename: &str) -> Response {
-    let (username, host) = split_acct(seg, &state.config.host());
+    // the host suffix only steers the lookup — find_local_user is
+    // host-IsNull-only, so foreign accts degrade to the user==null arm like
+    // upstream findOneBy({host: host ?? IsNull()}).
+    let (username, _host) = split_acct(seg, &state.config.host());
     let Some(pool) = &state.pool else {
         return base_page(&state).await;
     };
@@ -1370,13 +1373,28 @@ async fn foyer(state: AppState, _req: Request) -> Response {
 
 /// /streaming — non-WebSocket GET answers 503 (the client-server arm) so
 /// proxies never cache the path; WS upgrades delegate to the streaming hub.
-pub(crate) async fn streaming_get(
-    State(state): State<AppState>,
-    ws: Option<axum::extract::ws::WebSocketUpgrade>,
-    req: Request,
-) -> Response {
-    if let Some(ws) = ws {
-        return crate::api::drive::streaming::entry(State(state), ws, req).await;
+/// (axum 0.8's Option<T> extractor needs OptionalFromRequestParts — the ws
+/// extractor doesn't implement it, so the Upgrade header is probed manually.)
+pub(crate) async fn streaming_get(State(state): State<AppState>, req: Request) -> Response {
+    let wants_ws = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if wants_ws {
+        let (mut parts, body) = req.into_parts();
+        match axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(ws) => {
+                return crate::api::drive::streaming::entry(
+                    State(state),
+                    ws,
+                    Request::from_parts(parts, body),
+                )
+                .await;
+            }
+            Err(rejection) => return rejection.into_response(),
+        }
     }
     let mut res = StatusCode::SERVICE_UNAVAILABLE.into_response();
     res.headers_mut().insert(
