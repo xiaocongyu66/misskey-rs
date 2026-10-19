@@ -10220,3 +10220,275 @@ async fn arena_api_get_index_stats_app_token_matrix() {
     assert_eq!(s, StatusCode::OK, "body: {v}");
     assert!(v.is_array(), "pg_indexes rows: {v}");
 }
+
+// arena-notenotify ============================================================
+// upstream test/e2e/note-notify.ts (pinned ea2c3aed): the following-edge
+// notify flag — following/update.ts 'normal'/'none' stored as
+// following.notify 'normal'/NULL (insertFollowingDoc omits the column) —
+// read back by following/list `notification: true` (list.ts L56-58
+// `following.notify IS NOT NULL`), and the NoteCreateService.create
+// L790-813 fanout: non-'specified', non-reply notes push a notification
+// type 'note' (L806) carrying the fresh note id to every follower flagged
+// notify:'normal' (a pure renote adds the renoteMutings drop L800-804).
+
+#[tokio::test]
+async fn note_notify_following_list_notification_filter() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotenotify1").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let bob = signup(&app, "bob").await;
+    let carol = signup(&app, "carol").await;
+    let a = alice["token"].as_str().unwrap().to_string();
+    let (bob_id, carol_id) = (bob["id"].clone(), carol["id"].clone());
+
+    // notify.ts test 1: plain follow leaves notify NULL → notification:true
+    // returns [], the plain list still counts the followee.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "i": a, "userId": bob_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 0);
+    let (s, b) = post_json(app.clone(), "/api/following/list", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["followeeId"], bob_id);
+
+    // tests 2-3: notify 'normal' surfaces the edge; a second flagged followee
+    // returns both
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "i": a, "userId": carol_id, "withReplies": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": carol_id, "notify": "normal" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["followeeId"], carol_id);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": bob_id, "notify": "normal" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 2);
+    let mut ids: Vec<Value> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["followeeId"].clone())
+        .collect();
+    ids.sort();
+    let mut want = vec![bob_id.clone(), carol_id.clone()];
+    want.sort();
+    assert_eq!(ids, want);
+
+    // test 4: notify 'none' removes it from the notification list (stored
+    // NULL), the plain list keeps both
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": bob_id, "notify": "none" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["followeeId"], carol_id);
+    let (s, b) = post_json(app.clone(), "/api/following/list", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 2);
+
+    // test 5: the flag is per-edge — bob's own notify:'normal' list carries
+    // only his followee (carol), never alice's settings
+    let (s, b) = post_json(
+        &app,
+        "/api/following/create",
+        json!({ "i": bob["token"], "userId": carol_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        &app,
+        "/api/following/update",
+        json!({ "i": bob["token"], "userId": carol_id, "notify": "normal" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        &app,
+        "/api/following/list",
+        json!({ "i": bob["token"], "notification": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["followeeId"], carol_id);
+    let (s, b) = post_json(
+        &app,
+        "/api/following/delete",
+        json!({ "i": bob["token"], "userId": carol_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+
+    // test 8: limit 1..100 param narrows the page (bob re-flagged like the
+    // upstream ladder)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": bob_id, "notify": "normal" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/list",
+        json!({ "i": a, "notification": true, "limit": 0 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "limit 0 is outside 1..100");
+
+    // test 9: requireCredential — no token → CREDENTIAL_REQUIRED 401
+    let (s, _) = post_json(app.clone(), "/api/following/list", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn note_notify_push_leg_note_reason() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotenotify2").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let bob = signup(&app, "bob").await;
+    let a = alice["token"].as_str().unwrap().to_string();
+    let b_tok = bob["token"].as_str().unwrap().to_string();
+
+    // alice flags bob notify:'normal' (test 6 setup)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "i": a, "userId": bob["id"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": bob["id"], "notify": "normal" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+
+    // bob posts a text-only note (test 6 「normal通知設定時、投稿で通知が届く」)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": b_tok, "text": "ファイルなしの投稿" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let note_id = b["createdNote"]["id"].clone();
+
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/notifications/mark-all-as-read",
+        json!({ "i": a }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (s, b) = post_json(app.clone(), "/api/i/notifications", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let hits: Vec<&Value> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == json!("note") && n["note"]["id"] == note_id)
+        .collect();
+    assert_eq!(hits.len(), 1, "note notification missing: {b}");
+    assert_eq!(hits[0]["userId"], json!(bob["id"]));
+
+    // turning the flag back off stops the fanout (test-6 cleanup leg)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/following/update",
+        json!({ "i": a, "userId": bob["id"], "notify": "none" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": b_tok, "text": "通知設定解除後の投稿" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let silent_id = b["createdNote"]["id"].clone();
+    let (s, b) = post_json(app.clone(), "/api/i/notifications", json!({ "i": a })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let hits: Vec<&Value> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == json!("note") && n["note"]["id"] == silent_id)
+        .collect();
+    assert!(hits.is_empty(), "notify:'none' must not fan out: {b}");
+
+    let _ = pool;
+}
