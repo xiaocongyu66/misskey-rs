@@ -13,6 +13,88 @@
 
 use sqlx::PgPool;
 
+// ==== endpoints-arena: drive_folder rows (upstream endpoints/drive/folders/*
+// + DriveFolderEntityService) — the table ships in the 0001 baseline. ========
+
+/// Columns the api layer packs (id supplies the aid createdAt).
+#[derive(Debug, sqlx::FromRow)]
+pub struct DriveFolderRow {
+    #[sqlx(rename = "userId")]
+    pub user_id: String,
+    pub name: String,
+    #[sqlx(rename = "parentId")]
+    pub parent_id: Option<String>,
+}
+
+pub async fn insert_folder(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    name: &str,
+    parent_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "drive_folder" ("id", "userId", "name", "parentId") VALUES ($1, $2, $3, $4)"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(name)
+    .bind(parent_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Owner-scoped lookup (folders/{create,update}.ts findOneBy({id, userId})).
+pub async fn find_folder_owned(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+) -> Result<Option<DriveFolderRow>, sqlx::Error> {
+    sqlx::query_as::<_, DriveFolderRow>(
+        r#"SELECT "userId", "name", "parentId" FROM "drive_folder"
+           WHERE "id" = $1 AND "userId" = $2"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// UNscoped lookup — the folders/update.ts checkCircle walk uses
+/// findOneByOrFail without the owner filter.
+pub async fn find_folder_by_id(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<DriveFolderRow>, sqlx::Error> {
+    sqlx::query_as::<_, DriveFolderRow>(
+        r#"SELECT "userId", "name", "parentId" FROM "drive_folder" WHERE "id" = $1"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn update_folder(
+    pool: &PgPool,
+    id: &str,
+    name: Option<&str>,
+    parent_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "drive_folder" SET
+            "name" = COALESCE($2, "name"),
+            "parentId" = $3
+        WHERE "id" = $1"#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Columns consumed by the api layer (drive pack + avatar/banner swap).
 #[derive(Debug, Default, sqlx::FromRow)]
 pub struct DriveFileRow {

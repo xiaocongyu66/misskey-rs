@@ -434,7 +434,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // pattern: method check, body parsing and token extraction live here;
     // the endpoint bodies in api::drive (db paths in mk-db/src/drive.rs,
     // the /streaming hub routed in main.rs).
-    if name == "drive/files/attached-notes" || name == "drive/files/upload-from-url" {
+    if name == "drive/files/attached-notes"
+        || name == "drive/files/upload-from-url"
+        // endpoints-arena: the drive/folders family (upstream
+        // endpoints/drive/folders/{create,update}.ts)
+        || name == "drive/folders/create"
+        || name == "drive/folders/update"
+    {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }

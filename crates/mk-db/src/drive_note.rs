@@ -79,13 +79,16 @@ pub async fn update_file(
     is_sensitive: Option<bool>,
     set_comment: bool,
     comment: Option<&str>,
+    set_folder: bool,
+    folder_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE "drive_file" SET
             "name" = COALESCE($2, "name"),
             "isSensitive" = COALESCE($3, "isSensitive"),
-            "comment" = CASE WHEN $4 THEN $5 ELSE "comment" END
+            "comment" = CASE WHEN $4 THEN $5 ELSE "comment" END,
+            "folderId" = CASE WHEN $6 THEN $7 ELSE "folderId" END
         WHERE "id" = $1
         "#,
     )
@@ -94,6 +97,8 @@ pub async fn update_file(
     .bind(is_sensitive)
     .bind(set_comment)
     .bind(comment)
+    .bind(set_folder)
+    .bind(folder_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -154,15 +159,24 @@ mod tests {
                 .is_empty()
         );
 
-        update_file(&pool, "f1", Some("b.jpg"), Some(true), true, Some("hi"))
-            .await
-            .unwrap();
+        update_file(
+            &pool,
+            "f1",
+            Some("b.jpg"),
+            Some(true),
+            true,
+            Some("hi"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let f = find_file_by_id(&pool, "f1").await.unwrap().unwrap();
         assert_eq!(f.name, "b.jpg");
         assert!(f.is_sensitive);
         assert_eq!(f.comment.as_deref(), Some("hi"));
 
-        update_file(&pool, "f1", None, None, true, None)
+        update_file(&pool, "f1", None, None, true, None, false, None)
             .await
             .unwrap();
         let f = find_file_by_id(&pool, "f1").await.unwrap().unwrap();

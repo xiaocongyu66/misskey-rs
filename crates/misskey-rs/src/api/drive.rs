@@ -240,8 +240,277 @@ pub(crate) async fn handle_json(
     match name {
         "drive/files/attached-notes" => attached_notes(state, body, token).await,
         "drive/files/upload-from-url" => files_upload_from_url(state, body, token).await,
+        "drive/folders/create" => folders_create(state, body, token).await,
+        "drive/folders/update" => folders_update(state, body, token).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
+}
+
+// ==== endpoints-arena: drive/folders (upstream endpoints/drive/folders/*) ====
+
+/// ajv `misskey:id` format.
+fn is_alnum_folder_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn folder_meta_err(code: &'static str, id: &'static str, msg: &'static str) -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        code,
+        id,
+        msg,
+    ))
+}
+
+/// DriveFolderEntityService.pack subset (detail=false — the endpoints only
+/// read id/createdAt/name/parentId; createdAt derives from the aid).
+fn pack_folder(row: &mk_db::drive::DriveFolderRow, id: &str) -> Value {
+    json!({
+        "id": id,
+        "createdAt": mk_types::id::parse_aid_date(id)
+            .map(mk_core::services::signup::ms_to_iso)
+            .unwrap_or_default(),
+        "name": row.name,
+        "parentId": row.parent_id,
+    })
+}
+
+/// `POST /api/drive/folders/create` (requireCredential, write:drive) —
+/// folders/create.ts: name default 'Untitled' (maxLength 200), optional
+/// owner-scoped parentId (noSuchFolder on miss).
+pub(crate) async fn folders_create(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let name = match body.get("name") {
+        None | Some(Value::Null) => "Untitled".to_string(),
+        Some(Value::String(s)) => {
+            if s.chars().count() > 200 {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "name",
+                    "reason": "must be a string of up to 200 chars",
+                })));
+            }
+            s.clone()
+        }
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "name",
+                "reason": "must be a string",
+            })));
+        }
+    };
+    let parent_id = match body.get("parentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if !is_alnum_folder_id(s) {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "parentId",
+                    "reason": "must be an alphanumeric id",
+                })));
+            }
+            match mk_db::drive::find_folder_owned(pool, s, &me_id).await {
+                Ok(Some(_)) => Some(s.clone()),
+                Ok(None) => {
+                    return folder_meta_err(
+                        "NO_SUCH_FOLDER",
+                        "53326628-a00d-40a6-a3cd-8975105c0f95",
+                        "No such folder.",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(target: "dbg_drive", error = %e, "folders_create parent");
+                    return api_err(ApiError::internal_error());
+                }
+            }
+        }
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "parentId",
+                "reason": "must be an id or null",
+            })));
+        }
+    };
+
+    let id = mk_types::id::gen_aid_now();
+    if let Err(e) =
+        mk_db::drive::insert_folder(pool, &id, &me_id, &name, parent_id.as_deref()).await
+    {
+        tracing::error!(target: "dbg_drive", error = %e, "insert_folder");
+        return api_err(ApiError::internal_error());
+    }
+    let row = match mk_db::drive::find_folder_owned(pool, &id, &me_id).await {
+        Ok(Some(r)) => r,
+        _ => return api_err(ApiError::internal_error()),
+    };
+    (StatusCode::OK, Json(pack_folder(&row, &id))).into_response()
+}
+
+/// folders/update.ts checkCircle: walk the ancestor chain from
+/// `start` and report whether it reaches `target` (32-hop cap guards a
+/// dangling corrupt chain; upstream recurses until parentId is null).
+async fn folder_chain_hits(
+    pool: &mk_db::sqlx::PgPool,
+    start: &str,
+    target: &str,
+) -> Result<bool, mk_db::sqlx::Error> {
+    let mut next: Option<String> = Some(start.to_string());
+    for _ in 0..32 {
+        let Some(id) = next else {
+            return Ok(false);
+        };
+        match mk_db::drive::find_folder_by_id(pool, &id).await? {
+            Some(row) => {
+                if row.id == target {
+                    return Ok(true);
+                }
+                next = row.parent_id;
+            }
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// `POST /api/drive/folders/update` (requireCredential, write:drive) —
+/// folders/update.ts: owned folder (noSuchFolder), truthy-name rename,
+/// parentId undefined/null/id triple with the self + ancestor-cycle
+/// RECURSIVE_NESTING gates and noSuchParentFolder on an unowned parent.
+pub(crate) async fn folders_update(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let Some(folder_id) = body
+        .get("folderId")
+        .and_then(|v| v.as_str())
+        .filter(|s| is_alnum_folder_id(s))
+    else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "folderId",
+            "reason": "must be an alphanumeric id",
+        })));
+    };
+    let folder = match mk_db::drive::find_folder_owned(pool, folder_id, &me_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return folder_meta_err(
+                "NO_SUCH_FOLDER",
+                "f7974dac-2c0d-4a27-926e-23583b28e98e",
+                "No such folder.",
+            );
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "folders_update lookup");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    // `if (ps.name)` — truthy strings only (empty string leaves as-is)
+    let new_name = match body.get("name") {
+        Some(Value::String(s)) if !s.is_empty() => {
+            if s.chars().count() > 200 {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "name",
+                    "reason": "must be a string of up to 200 chars",
+                })));
+            }
+            Some(s.clone())
+        }
+        _ => None,
+    };
+
+    match body.get("parentId") {
+        None => {}
+        Some(Value::Null) => {
+            if let Err(e) =
+                mk_db::drive::update_folder(pool, folder_id, new_name.as_deref(), None).await
+            {
+                tracing::error!(target: "dbg_drive", error = %e, "update_folder root");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        Some(Value::String(pid)) => {
+            if !is_alnum_folder_id(pid) {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "parentId",
+                    "reason": "must be an alphanumeric id",
+                })));
+            }
+            if pid == folder_id {
+                return folder_meta_err(
+                    "RECURSIVE_NESTING",
+                    "dbeb0248-3789-4013-aed4-4279f9199740",
+                    "It can not be structured like nesting folders recursively.",
+                );
+            }
+            let parent = match mk_db::drive::find_folder_owned(pool, pid, &me_id).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return folder_meta_err(
+                        "NO_SUCH_PARENT_FOLDER",
+                        "ce104e3a-faaf-49d5-b459-10ff0cbbcaa1",
+                        "No such parent folder.",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(target: "dbg_drive", error = %e, "folders_update parent");
+                    return api_err(ApiError::internal_error());
+                }
+            };
+            // circular reference: walk the parent's ancestors
+            if let Some(gp) = &parent.parent_id {
+                let circle = match folder_chain_hits(pool, gp, folder_id).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(target: "dbg_drive", error = %e, "folder_chain_hits");
+                        return api_err(ApiError::internal_error());
+                    }
+                };
+                if circle {
+                    return folder_meta_err(
+                        "RECURSIVE_NESTING",
+                        "dbeb0248-3789-4013-aed4-4279f9199740",
+                        "It can not be structured like nesting folders recursively.",
+                    );
+                }
+            }
+            if let Err(e) =
+                mk_db::drive::update_folder(pool, folder_id, new_name.as_deref(), Some(pid)).await
+            {
+                tracing::error!(target: "dbg_drive", error = %e, "update_folder parent");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "parentId",
+                "reason": "must be an id or null",
+            })));
+        }
+    }
+
+    let row = match mk_db::drive::find_folder_owned(pool, folder_id, &me_id).await {
+        Ok(Some(r)) => r,
+        _ => return api_err(ApiError::internal_error()),
+    };
+    (StatusCode::OK, Json(pack_folder(&row, folder_id))).into_response()
 }
 
 /// POST /api/drive/files/create — requireCredential multipart upload.

@@ -80,12 +80,30 @@ pub(crate) async fn files_update(
             })));
         }
     };
-    // folderId: the schema allows id | null; this server has no folders, so
-    // the lookup always misses after the file itself resolves (upstream
-    // order: file → access → updateFile → folder lookup).
-    let has_folder = body
-        .get("folderId")
-        .is_some_and(|v| !v.is_null() && v.as_str().is_some());
+    // folderId: the schema allows id | null. Undefined leaves the folder
+    // untouched, null moves the file to root (親フォルダを無しにできる), an
+    // id re-parents after the owned-folder check (他人のフォルダには
+    // 入れられない / 存在しないフォルダで怒られる). Lookup order matches
+    // upstream: file → access → updateFile → folder lookup.
+    let folder_id = match body.get("folderId") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) => {
+            if !is_alnum_id(s) {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "folderId",
+                    "reason": "must be an alphanumeric id",
+                })));
+            }
+            Some(Some(s.clone()))
+        }
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "folderId",
+                "reason": "must be an id or null",
+            })));
+        }
+    };
 
     let Some(file) = (match mk_db::drive_note::find_file_by_id(pool, file_id).await {
         Ok(f) => f,
@@ -131,13 +149,27 @@ pub(crate) async fn files_update(
             );
         }
     }
-    if has_folder {
-        return meta_err(
-            "NO_SUCH_FOLDER",
-            "ea8fb7a5-af77-4a08-b608-c0218176cd73",
-            "No such folder.",
-        );
-    }
+    // resolve the target folder (files/update.ts ps.folderId → GetterService
+    // getFolder OwnedDriveFolder → NO_SUCH_FOLDER)
+    let set_folder = folder_id.is_some();
+    let new_folder = match &folder_id {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(fid)) => match mk_db::drive::find_folder_owned(pool, fid, &me_id).await {
+            Ok(Some(_)) => Some(Some(fid.clone())),
+            Ok(None) => {
+                return meta_err(
+                    "NO_SUCH_FOLDER",
+                    "ea8fb7a5-af77-4a08-b608-c0218176cd73",
+                    "No such folder.",
+                );
+            }
+            Err(e) => {
+                tracing::error!(target: "dbg_drive", error = %e, "find_folder_owned");
+                return api_err(ApiError::internal_error());
+            }
+        },
+    };
     if let (Some(false), true) = (is_sensitive, file.is_sensitive) {
         // alwaysMarkNsfw is the FILE OWNER's merged policy.
         let owner_always_nsfw = match &file.user_id {
@@ -161,9 +193,17 @@ pub(crate) async fn files_update(
         }
     }
 
-    if let Err(e) =
-        mk_db::drive_note::update_file(pool, file_id, name, is_sensitive, set_comment, comment)
-            .await
+    if let Err(e) = mk_db::drive_note::update_file(
+        pool,
+        file_id,
+        name,
+        is_sensitive,
+        set_comment,
+        comment,
+        set_folder,
+        new_folder.flatten().as_deref(),
+    )
+    .await
     {
         tracing::error!(target: "dbg_drive", error = %e, "update_file");
         return api_err(ApiError::internal_error());
