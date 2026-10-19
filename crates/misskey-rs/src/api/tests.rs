@@ -9007,3 +9007,134 @@ fn reaction_normalize_fallback_and_targets() {
     // ASCII/CJK prose never starts an emoji span → fallback
     assert_eq!(super::social::normalize_reaction(" TEN "), "❤");
 }
+
+// arena-nodeinfo =============================================================
+// upstream test/e2e/nodeinfo.ts (pinned ea2c3aed): two relativeFetch tests —
+// `nodeinfo/2.1` + `nodeinfo/2.0` — asserting res.ok + Access-Control-Allow-
+// Origin `*` + software.name 'misskey' on the mounted /nodeinfo/* routes
+// (NOT the /.well-known relay; that one is well_known_nodeinfo_links above).
+// Mirrored here with the NodeinfoServerService.nodeinfo2() census shape
+// deepened per the pinned truth: profile'd content types, the operative
+// version string (config.version — cargo-test arm resolves config/env to the
+// PINNED "2026.10.1-alpha.0"), real postgres usage counts, the 2.0 arm that
+// deletes software.repository while 2.1 overrides homepage to
+// meta.repositoryUrl (NodeinfoServerService L128-131), and the metadata
+// const keys — maxNoteTextLength = MAX_NOTE_TEXT_LENGTH 3000 (const.ts L6),
+// themeColor '#86b300' fallback, proxyAccountName 'proxy' (the
+// SystemAccountService.fetch created system user), openRegistrations off the
+// fresh meta row's disableRegistration default false.
+
+#[tokio::test]
+async fn arena_nodeinfo_21_document_shape() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknodeinfo1").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+
+    // nodeinfo.ts test 'nodeinfo 2.1': ok + ACAO `*` + software.name
+    let (s, h, body) = request_raw(&app, "GET", "/nodeinfo/2.1").await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(hdr(&h, "access-control-allow-origin").as_deref(), Some("*"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"")
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(v["version"], json!("2.1"));
+    assert_eq!(v["software"]["name"], json!("misskey"));
+    assert_eq!(v["software"]["version"], json!("2026.10.1-alpha.0"));
+    // 2.1 overrides BOTH repository and homepage to meta.repositoryUrl
+    assert_eq!(
+        v["software"]["homepage"],
+        json!("https://github.com/misskey-dev/misskey")
+    );
+    assert_eq!(
+        v["software"]["repository"],
+        json!("https://github.com/misskey-dev/misskey")
+    );
+    assert_eq!(v["protocols"], json!(["activitypub"]));
+    assert_eq!(v["services"]["outbound"], json!(["atom1.0", "rss2.0"]));
+    assert_eq!(v["services"]["inbound"], json!([]));
+
+    // real postgres counts: fresh pool + alice ⇒ users 1, notes 0
+    assert_eq!(v["usage"]["users"]["total"], json!(1), "alice: {v}");
+    assert_eq!(v["usage"]["users"]["activeHalfyear"], Value::Null);
+    assert_eq!(v["usage"]["users"]["activeMonth"], Value::Null);
+    assert_eq!(v["usage"]["localPosts"], json!(0));
+    assert_eq!(v["usage"]["localComments"], json!(0));
+
+    // openRegistrations flips off the meta row's disableRegistration default
+    assert_eq!(v["openRegistrations"], json!(true));
+    assert_eq!(v["metadata"]["disableRegistration"], json!(false));
+
+    // pinned metadata keys
+    assert_eq!(v["metadata"]["maxNoteTextLength"], json!(3000));
+    assert_eq!(v["metadata"]["themeColor"], json!("#86b300"));
+    assert_eq!(v["metadata"]["proxyAccountName"], json!("proxy"));
+    assert_eq!(v["metadata"]["langs"], json!([]));
+
+    let _ = alice;
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn arena_nodeinfo_20_document_shape() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknodeinfo2").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let a_token = alice["token"].as_str().unwrap();
+
+    // one real local note ⇒ usage.localPosts counts it (net of deletions)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": a_token, "text": "nodeinfo census note" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note create: {v}");
+
+    // nodeinfo.ts test 'nodeinfo 2.0': ok + ACAO `*` + software.name
+    let (s, h, body) = request_raw(&app, "GET", "/nodeinfo/2.0").await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(hdr(&h, "access-control-allow-origin").as_deref(), Some("*"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.0#\"")
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(v["version"], json!("2.0"));
+    assert_eq!(v["software"]["name"], json!("misskey"));
+    assert_eq!(v["software"]["version"], json!("2026.10.1-alpha.0"));
+    // the 2.0 arm deletes software.repository; homepage stays nodeinfo_homepage
+    assert!(
+        v["software"].get("repository").is_none(),
+        "2.0 deletes software.repository: {v}"
+    );
+    assert_eq!(v["software"]["homepage"], json!("https://misskey-hub.net"));
+    assert_eq!(v["protocols"], json!(["activitypub"]));
+
+    // real counts: alice + her one note
+    assert_eq!(v["usage"]["users"]["total"], json!(1));
+    assert_eq!(v["usage"]["localPosts"], json!(1), "one local note: {v}");
+
+    assert_eq!(v["metadata"]["maxNoteTextLength"], json!(3000));
+
+    // 2.0 keeps the repository URL inside metadata (only software loses it)
+    assert_eq!(
+        v["metadata"]["repositoryUrl"],
+        json!("https://github.com/misskey-dev/misskey")
+    );
+
+    let _ = pool;
+}

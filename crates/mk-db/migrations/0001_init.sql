@@ -2622,7 +2622,7 @@ CREATE TABLE public.meta (
     description character varying(1024),
     "maintainerName" character varying(1024),
     "maintainerEmail" character varying(1024),
-    "disableRegistration" boolean DEFAULT true NOT NULL,
+    "disableRegistration" boolean DEFAULT false NOT NULL,
     langs character varying(1024)[] DEFAULT '{}'::character varying[] NOT NULL,
     "hiddenTags" character varying(1024)[] DEFAULT '{}'::character varying[] NOT NULL,
     "blockedHosts" character varying(1024)[] DEFAULT '{}'::character varying[] NOT NULL,

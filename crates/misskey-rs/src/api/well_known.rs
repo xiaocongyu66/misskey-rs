@@ -27,7 +27,13 @@
 //! plain entity pass (the mirrored values never carry markup), the oauth
 //! metadata `scopes_supported` list is the static misskey-js `permissions`
 //! snapshot, and the activeHalfyear/activeMonth chart counters stay null
-//! (upstream defers them likewise).
+//! (upstream defers them likewise). The 10m MemorySingleCache is likewise
+//! unported — each request recomputes from postgres, so the upstream
+//! cache-taint quirk (a 2.0 re-fetch deleting software.repository off the
+//! SHARED cached base, later 2.1 relays inheriting the deletion within the
+//! 10m window) cannot reproduce and we ship the clean document instead.
+//! document usage counters read postgres directly where upstream reads the
+//! notes/users hour charts — fresh e2e dbs make both equal the real counts.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -820,7 +826,9 @@ async fn nodeinfo_document(state: &AppState, doc_version: &str) -> Value {
         description: None,
         maintainer_name: None,
         maintainer_email: None,
-        disable_registration: true,
+        // MiMeta / Init.js meta default — a fresh instance REGISTRATIONS OPEN
+        // (openRegistrations true); the meta table by extension.
+        disable_registration: false,
         langs: vec![],
         terms_of_service_url: None,
         privacy_policy_url: None,
