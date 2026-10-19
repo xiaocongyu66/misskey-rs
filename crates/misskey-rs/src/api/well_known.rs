@@ -56,8 +56,9 @@ const JRD: &str = "application/jrd+json";
 const XRD: &str = "application/xrd+xml";
 
 /// OAuth2ProviderService scopes_supported = misskey-js `permissions`
-/// (packages/misskey-js/src/consts.ts at the pinned commit).
-const OAUTH_KINDS: &[&str] = &[
+/// (packages/misskey-js/src/consts.ts at the pinned commit). pub(crate) for
+/// the arena-oauth authorize scope filter (oauth.rs).
+pub(crate) const OAUTH_KINDS: &[&str] = &[
     "read:account",
     "write:account",
     "read:blocks",
