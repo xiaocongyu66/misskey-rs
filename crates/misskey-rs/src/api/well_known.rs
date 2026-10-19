@@ -800,9 +800,13 @@ async fn nodeinfo_document(state: &AppState, doc_version: &str) -> Value {
                     .fetch_one(pool)
                     .await
                     .unwrap_or(0);
-            // usage.localPosts — the local-notes count (deleted excluded)
+            // usage.localPosts — the local-notes count. Upstream reads the
+            // notes hour chart (local.total[0]); the pinned MiNote model has
+            // NO deletedAt column and mk-db hard-DELETEs notes (note.rs
+            // delete_note), so a bare local count equals the chart's
+            // created-minus-deleted total on the fresh e2e dbs.
             let local_posts: i64 = mk_db::sqlx::query_scalar(
-                r#"SELECT count(*) FROM "note" WHERE "userHost" IS NULL AND "deletedAt" IS NULL"#,
+                r#"SELECT count(*) FROM "note" WHERE "userHost" IS NULL"#,
             )
             .fetch_one(pool)
             .await
@@ -826,9 +830,10 @@ async fn nodeinfo_document(state: &AppState, doc_version: &str) -> Value {
         description: None,
         maintainer_name: None,
         maintainer_email: None,
-        // MiMeta / Init.js meta default — a fresh instance REGISTRATIONS OPEN
-        // (openRegistrations true); the meta table by extension.
-        disable_registration: false,
+        // MiMeta COLUMN default true (models/Meta.ts L61-64) — the bootstrap
+        // row MetaService.fetch upserts rides entity defaults, not the Init.js
+        // DDL default; /api/admin/meta pins the same side (L3113).
+        disable_registration: true,
         langs: vec![],
         terms_of_service_url: None,
         privacy_policy_url: None,

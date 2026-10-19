@@ -9034,7 +9034,9 @@ fn reaction_normalize_fallback_and_targets() {
 // const keys — maxNoteTextLength = MAX_NOTE_TEXT_LENGTH 3000 (const.ts L6),
 // themeColor '#86b300' fallback, proxyAccountName 'proxy' (the
 // SystemAccountService.fetch created system user), openRegistrations off the
-// fresh meta row's disableRegistration default false.
+// fresh meta row's disableRegistration — MiMeta entity default true
+// (models/Meta.ts L61-64; MetaService.fetch upserts the row through entity
+// defaults, NOT the bare Init.js DDL default).
 
 #[tokio::test]
 async fn arena_nodeinfo_21_document_shape() {
@@ -9080,9 +9082,14 @@ async fn arena_nodeinfo_21_document_shape() {
     assert_eq!(v["usage"]["localPosts"], json!(0));
     assert_eq!(v["usage"]["localComments"], json!(0));
 
-    // openRegistrations flips off the meta row's disableRegistration default
-    assert_eq!(v["openRegistrations"], json!(true));
-    assert_eq!(v["metadata"]["disableRegistration"], json!(false));
+    // openRegistrations flips off the meta row's disableRegistration — the
+    // fresh row rides the MiMeta COLUMN default true (models/Meta.ts L61-64
+    // `default: true`; MetaService.fetch upserts {id:'x'} through entity
+    // defaults — the same side /api/admin/meta pins at L3113), even though
+    // the raw Init.js DDL default is false: every row the server reads is
+    // created through MetaService, never the bare DDL.
+    assert_eq!(v["openRegistrations"], json!(false));
+    assert_eq!(v["metadata"]["disableRegistration"], json!(true));
 
     // pinned metadata keys
     assert_eq!(v["metadata"]["maxNoteTextLength"], json!(3000));
