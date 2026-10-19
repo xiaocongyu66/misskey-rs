@@ -222,9 +222,11 @@ fn pack_role(created: mk_db::roles_lite::RoleRow, users_count: i64, now_iso: Str
         "preserveAssignmentOnMoveAccount": created.preserve_assignment_on_move_account,
         "canEditMembersByModerator": created.can_edit_members_by_moderator,
         "displayOrder": created.display_order,
-        // RoleEntityService.pack fills missing keys with the DEFAULT_POLICIES
-        // entry; the e2e `role()` helper already sends every key.
-        "policies": created.policies,
+        // RoleEntityService.pack (L47-56): every DEFAULT key renders from the
+        // stored entry (non-null) else the {useDefault,priority,value} fill;
+        // foreign keys drop (the utils `role()` helper sends garbage numeric
+        // pair keys from spreading an array — roles-v2 census pins the fill).
+        "policies": mk_core::services::roles_v2::pack_policies(&created.policies),
         "usersCount": users_count,
     })
 }

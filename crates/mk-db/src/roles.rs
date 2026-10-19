@@ -253,21 +253,13 @@ pub struct RoleUpdate {
     pub icon_url: Option<Option<String>>,
     pub target: Option<String>,
     pub cond_formula: Option<serde_json::Value>,
-    #[sqlx(rename = "isPublic")]
     pub is_public: Option<bool>,
-    #[sqlx(rename = "isModerator")]
     pub is_moderator: Option<bool>,
-    #[sqlx(rename = "isAdministrator")]
     pub is_administrator: Option<bool>,
-    #[sqlx(rename = "isExplorable")]
     pub is_explorable: Option<bool>,
-    #[sqlx(rename = "asBadge")]
     pub as_badge: Option<bool>,
-    #[sqlx(rename = "preserveAssignmentOnMoveAccount")]
     pub preserve_assignment_on_move_account: Option<bool>,
-    #[sqlx(rename = "canEditMembersByModerator")]
     pub can_edit_members_by_moderator: Option<bool>,
-    #[sqlx(rename = "displayOrder")]
     pub display_order: Option<i64>,
     pub policies: Option<serde_json::Value>,
 }
