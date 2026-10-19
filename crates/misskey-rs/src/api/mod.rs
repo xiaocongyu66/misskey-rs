@@ -86,6 +86,10 @@ pub(crate) mod well_known;
 // admin/update-meta federation persistence (api/ff_vis.rs; db paths in
 // mk-db/src/ff_visibility.rs).
 pub(crate) mod ff_vis;
+// arena-api: test-endpoint paramDef roundtrip + miauth/gen-token app-token
+// mint (upstream endpoints/test.ts + endpoints/miauth/gen-token.ts; the
+// api.ts General-validation suite + createAppToken fixtures).
+mod miauth;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -663,6 +667,31 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return antennas::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END antennas-v2 DISPATCH ARM ====
+
+    // ==== arena-api DISPATCH ARM (test + miauth/gen-token) ====
+    // api.ts arena on the clips-arm pattern: method check, JSON body parse
+    // and token extraction live here; the paramDef roundtrip
+    // (endpoints/test.ts — requireCredential: false) and the
+    // requireCredential app-token mint (endpoints/miauth/gen-token.ts) in
+    // api::miauth. Neither name collides with an earlier arm ("test" is not
+    // in M0_ENDPOINTS, "miauth/gen-token" is neither admin/* nor catalogued
+    // elsewhere), so this shadows nothing.
+    if name == "test" || name == "miauth/gen-token" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        if name == "test" {
+            return miauth::test_roundtrip(&body).await;
+        }
+        return miauth::gen_token(&state, &body, token).await;
+    }
+    // ==== END arena-api DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());

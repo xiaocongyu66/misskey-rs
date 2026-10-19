@@ -42,6 +42,9 @@ const ENDPOINTS: &[&str] = &[
     "admin/meta",
     "admin/server-info",
     "admin/stats",
+    // arena-api: the api.ts 管理者専用のAPIのアクセス制限 fixture —
+    // `SELECT * FROM pg_indexes` behind requireAdmin + the app-token kind.
+    "admin/get-index-stats",
 ];
 
 type ApiResult = Result<Response, Response>;
@@ -92,6 +95,7 @@ pub(super) async fn handle(state: &AppState, name: &str, req: Request) -> Respon
         "admin/show-users" => show_users(state, &body, token.as_deref()).await,
         "admin/meta" => admin_meta(state, token.as_deref()).await,
         "admin/server-info" => server_info(state, token.as_deref()).await,
+        "admin/get-index-stats" => get_index_stats(state, token.as_deref()).await,
         "admin/stats" => stats(state, token.as_deref()).await,
         _ => unreachable!("checked against ENDPOINTS above"),
     };
@@ -169,6 +173,11 @@ pub(crate) struct AdminCtx {
     me: mk_db::user::LocalUserRow,
     /// RoleService.isAdministrator(me) — used by show-user's admin-view gate.
     is_admin: bool,
+    /// arena-api: the access_token scope list when the credential was an
+    /// app/miauth token (the AuthenticateService non-native branch) — None
+    /// for native user tokens (upstream `token == null` rides the isSecure
+    /// path and skips the ep.meta.kind gate).
+    pub(crate) token_permission: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -238,20 +247,30 @@ pub(crate) async fn gate(
     let Some(token) = token else {
         return Err(credential_required());
     };
-    // Native 16-char tokens only (the app/access-token lookup lands later);
-    // the same resolution the i / i-update routes use.
-    if token.len() != 16 {
-        return Err(authentication_failed());
-    }
-    let me_id = match mk_db::user::find_local_user_id_by_token(pool, token).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(target: "dbg_admin", error = %e, "find_local_user_id_by_token");
-            return Err(api_err(ApiError::internal_error()));
+    // arena-api: AuthenticateService branch split — native 16-char tokens
+    // match user.token; everything else resolves through the access_token
+    // hash column and rides its permission list into the ep.meta.kind gate.
+    let (me_id, token_permission) = if token.len() != 16 {
+        match mk_db::access_token::find_by_hash(pool, token).await {
+            Ok(Some(at)) => (at.user_id, Some(at.permission)),
+            Ok(None) => return Err(authentication_failed()),
+            Err(e) => {
+                tracing::error!(target: "dbg_admin", error = %e, "access_token find_by_hash");
+                return Err(api_err(ApiError::internal_error()));
+            }
         }
-    };
-    let Some(me_id) = me_id else {
-        return Err(authentication_failed());
+    } else {
+        let me_id = match mk_db::user::find_local_user_id_by_token(pool, token).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(target: "dbg_admin", error = %e, "find_local_user_id_by_token");
+                return Err(api_err(ApiError::internal_error()));
+            }
+        };
+        match me_id {
+            Some(v) => (v, None),
+            None => return Err(authentication_failed()),
+        }
     };
     let me = match mk_db::user::find_user_by_id(pool, &me_id).await {
         Ok(r) => r,
@@ -274,7 +293,7 @@ pub(crate) async fn gate(
 
     if is_root {
         // call(): the meta.rootUserId bypass skips both role gates.
-        return Ok(AdminCtx { me, is_admin: true });
+        return Ok(AdminCtx { me, is_admin: true, token_permission });
     }
 
     let assigned = match mk_db::role::user_assigned_roles(pool, &me.id).await {
@@ -300,6 +319,7 @@ pub(crate) async fn gate(
     Ok(AdminCtx {
         me,
         is_admin: mk_core::services::role::has_administrator_role(&assigned),
+        token_permission,
     })
 }
 
@@ -693,6 +713,43 @@ fn db_err(e: mk_db::sqlx::Error) -> Response {
 /// `endpoints/admin/meta.ts` (requireAdmin). Composition reads the actual
 /// `meta` row (to_jsonb); keys without a backing column keep the schema
 /// default / null with the TODO(M3) marker, never fabricated values.
+/// `endpoints/admin/get-index-stats.ts` (requireCredential + requireAdmin,
+/// kind `read:admin:index-stats`) — the handler body is literally
+/// `SELECT * FROM pg_indexes` mapped to `{ tablename, indexname }` records.
+/// The api.ts 管理者専用のAPIのアクセス制限 matrix rides the requireAdmin
+/// role gate (root alice passes, bob 403s) plus the app-token kind gate
+/// (ApiCallService.call L465: an access token whose scope list misses the
+/// kind → PERMISSION_DENIED, AFTER the role gates — bob's scoped app token
+/// 403s ROLE_PERMISSION_DENIED before the scope check ever runs).
+async fn get_index_stats(state: &AppState, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, Gate::Admin).await?;
+    // ep.meta.kind gate (call() L465): app/miauth tokens only — native
+    // user tokens ride the token == null path upstream and skip this.
+    if let Some(perms) = &ctx.token_permission {
+        if !perms.iter().any(|p| p == "read:admin:index-stats") {
+            return Err(api_err(ApiError::new(
+                403,
+                mk_types::api_error::ApiErrorKind::Permission,
+                "PERMISSION_DENIED",
+                "1370e5b7-d4eb-4566-bb1d-7748ee6a1838",
+                "Your app does not have the necessary permissions to use this endpoint.",
+            )));
+        }
+    }
+    let pool = state.pool.as_ref().expect("gated");
+
+    let rows: Vec<(String, String)> =
+        mk_db::sqlx::query_as("SELECT tablename, indexname FROM pg_indexes")
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?;
+    let stats: Vec<Value> = rows
+        .into_iter()
+        .map(|(tablename, indexname)| json!({ "tablename": tablename, "indexname": indexname }))
+        .collect();
+    Ok((StatusCode::OK, Json(json!(stats))).into_response())
+}
+
 async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
     let _ctx = gate(state, token, Gate::Admin).await?;
     let pool = state.pool.as_ref().expect("gated");

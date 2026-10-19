@@ -52,6 +52,9 @@ pub mod role;
 pub mod roles_lite;
 // social-agent: social-graph writes (follow/mute/block/renote)
 pub mod social;
+// arena-api: MiAccessToken rows (api.ts miauth/gen-token mint + the app
+// token scope gate the admin/get-index-stats legs ride)
+pub mod access_token;
 // timelines arena: notes/timeline / notes/local-timeline / notes/hybrid-timeline
 pub mod timelines;
 pub mod user;

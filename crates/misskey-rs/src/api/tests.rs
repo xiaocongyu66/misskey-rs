@@ -9996,3 +9996,227 @@ async fn arena_streaming_main_events_and_app_token() {
     crate::api::drive::streaming::main_sinks_of(&ky_id);
     let _ = (ky_token, ky_id, ky_name, &pool, &app);
 }
+// ============================================================================
+// arena-api: api.ts — the test-endpoint paramDef roundtrip (General
+// validation), the WWW-Authenticate challenges (#sendApiError /
+// #sendAuthenticationError), and the 管理者専用のAPIのアクセス制限
+// get-index-stats matrix with the miauth app tokens (upstream
+// test/e2e/api.ts). POST-with-headers helper here because the well-known
+// request_raw probe is GET-only.
+// ============================================================================
+
+/// POST with optional Authorization header → (status, headers, body-json).
+async fn arena_api_post(
+    app: axum::Router,
+    path: &str,
+    body: Value,
+    bearer: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(tok) = bearer {
+        builder = builder.header("authorization", format!("Bearer {tok}"));
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, headers, v)
+}
+
+#[tokio::test]
+async fn arena_api_test_endpoint_roundtrip_and_validation() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapitest1").await;
+    let app = crate::build_router(test_state(pool));
+
+    // missing require param / wrong type → 400 (ajv required+type failures)
+    let (s, v) = post_json(app.clone(), "/api/test", json!({ "string": "a" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/test",
+        json!({ "required": true, "string": 42 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+
+    // invalid misskey:id (empty string) → 400 — the ^[a-zA-Z0-9]+$ `+`
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/test",
+        json!({ "required": true, "id": "" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+
+    // valid misskey:id + useDefaults echo (default/nullableDefault 'hello')
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/test",
+        json!({ "required": true, "id": "8wvhjghbxu" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["id"], json!("8wvhjghbxu"), "body: {v}");
+    assert_eq!(v["default"], json!("hello"), "body: {v}");
+    assert_eq!(v["nullableDefault"], json!("hello"), "body: {v}");
+
+    // explicit null passes the nullable channel un-defaulted
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/test",
+        json!({ "required": true, "nullableDefault": null }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["nullableDefault"], json!(null), "body: {v}");
+}
+
+#[tokio::test]
+async fn arena_api_www_authenticate_challenges() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapiwwwauth").await;
+    let app = crate::build_router(test_state(pool));
+
+    // 401 without a credential → exactly `Bearer realm="Misskey"` (the
+    // realm-only arm of #sendApiError L112)
+    let (s, h, v) =
+        arena_api_post(app.clone(), "/api/admin/get-index-stats", json!({}), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert_eq!(
+        v["error"]["code"],
+        json!("CREDENTIAL_REQUIRED"),
+        "body: {v}"
+    );
+    assert_eq!(
+        hdr(&h, "www-authenticate").as_deref(),
+        Some("Bearer realm=\"Misskey\""),
+        "challenge: {:?}",
+        hdr(&h, "www-authenticate")
+    );
+
+    // present-but-unresolvable token → #sendAuthenticationError's
+    // invalid_token challenge
+    let (s, h, v) = arena_api_post(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({ "i": "tsukawasete" }),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert_eq!(
+        v["error"]["code"],
+        json!("AUTHENTICATION_FAILED"),
+        "body: {v}"
+    );
+    let ch = hdr(&h, "www-authenticate").unwrap_or_default();
+    assert!(
+        ch.starts_with("Bearer realm=\"Misskey\", error=\"invalid_token\", error_description"),
+        "challenge: {ch}"
+    );
+
+    // a client-kind 400 → invalid_request challenge (#sendApiError L124):
+    // a REAL credential + notes/create text:true (the api.ts invalid_request
+    // leg — the token is fine, the param is not)
+    let bob = signup(&app, "bob").await;
+    let b_token = bob["token"].as_str().unwrap();
+    let (s, h, v) = arena_api_post(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": true, "i": b_token }),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INVALID_PARAM"), "body: {v}");
+    let ch = hdr(&h, "www-authenticate").unwrap_or_default();
+    assert!(
+        ch.starts_with("Bearer realm=\"Misskey\", error=\"invalid_request\""),
+        "challenge: {ch}"
+    );
+}
+
+#[tokio::test]
+async fn arena_api_get_index_stats_app_token_matrix() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapigidx").await;
+    let app = crate::build_router(test_state(pool));
+
+    // alice signs up FIRST → stamped meta."rootUserId" (root bypass)
+    let alice = signup(&app, "alice").await;
+    let a_token = alice["token"].as_str().unwrap();
+
+    // createAppToken fixture: miauth/gen-token mints a scoped access token
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s1", "permission": ["read:account"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let scoped_out = v["token"].as_str().unwrap().to_string();
+
+    // read:account scope misses the read:admin:index-stats kind →
+    // PERMISSION_DENIED (after alice's root role-gate pass — call() order)
+    let (s, h, v) = arena_api_post(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({}),
+        Some(&scoped_out),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("PERMISSION_DENIED"), "body: {v}");
+    assert_eq!(
+        v["error"]["id"],
+        json!("1370e5b7-d4eb-4566-bb1d-7748ee6a1838"),
+        "body: {v}"
+    );
+    let ch = hdr(&h, "www-authenticate").unwrap_or_default();
+    assert!(
+        ch.starts_with("Bearer realm=\"Misskey\", error=\"insufficient_scope\""),
+        "challenge: {ch}"
+    );
+
+    // a token carrying the endpoint kind rides through → 200 array body
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s2", "permission": ["read:admin:index-stats"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let admin_out = v["token"].as_str().unwrap().to_string();
+    let (s, _h, v) = arena_api_post(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({}),
+        Some(&admin_out),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert!(v.is_array(), "pg_indexes rows: {v}");
+}

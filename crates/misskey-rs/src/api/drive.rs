@@ -557,6 +557,15 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         return api_err(ApiError::internal_error());
     };
 
+    // arena-api: multipart credential — `Authorization: Bearer` wins over
+    // the `i` form part (ApiCallService multipart branch L274); the api.ts
+    // "Authentication header" multipart legs send the token header-only.
+    let bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
     let content_type = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -599,7 +608,21 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
             .and_then(|p| std::str::from_utf8(&p.data).ok())
     }
 
-    let token = field(&parts, "i").map(|s| s.to_string());
+    let token = bearer.or_else(|| field(&parts, "i").map(|s| s.to_string()));
+    // arena-api: requireCredential ordering — an ABSENT credential is
+    // CREDENTIAL_REQUIRED (the uploadFile() no-token leg pins the bare
+    // `Bearer realm="Misskey"` challenge on the 401); a present token that
+    // resolves to nobody rides require_credential_me_id's
+    // AUTHENTICATION_FAILED (the 'syuilo' bearer multipart legs).
+    if token.is_none() {
+        return api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CREDENTIAL_REQUIRED",
+            "1384574d-a912-4b81-8601-c7b1c4085df1",
+            "Credential required.",
+        ));
+    }
     // requireCredential chain (mirrors api::require_credential_me_id order)
     let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
         Ok(id) => id,
