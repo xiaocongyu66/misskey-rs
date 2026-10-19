@@ -1037,11 +1037,110 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
         // absent or explicit null → pure renote (paramDef text nullable)
         None => None,
     };
-    if let Err(e) =
-        mk_db::social::insert_renote_note(pool, &id, me_id, &target, text, visibility, local_only)
-            .await
+    // stream-final: the poll param rides the renote arm of the ONE upstream
+    // create() (notes/create { renoteId, poll } → same MiPoll insert,
+    // NoteCreateService.create L710-722; mustBeValidPoll arms L405-407). A
+    // poll-only renote is a QUOTE (misc/is-renote.ts isQuotePacked
+    // `note.poll != null`), so the withRenotes:false home leg must NOT drop
+    // it — the row previously never carried hasPoll, misclassifying every
+    // poll renote as a pure renote on the stream fanout. Param rules mirror
+    // the text lane's parse (choices 2..10 unique 1..50-char strings;
+    // multiple bool; expiresAt | expiredAfter ms, expiredAfter resolved
+    // against the request clock).
+    let request_ms = super::now_ms() as i64;
+    struct PollInput {
+        choices: Vec<String>,
+        multiple: bool,
+        expires_at_ms: Option<i64>,
+    }
+    let poll: Option<PollInput> = match body.get("poll") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => {
+            let Some(Value::Array(choices_raw)) = o.get("choices") else {
+                return super::invalid_param("poll.choices", "required");
+            };
+            if !(2..=10).contains(&choices_raw.len()) {
+                return super::invalid_param("poll.choices", "must have 2..10 items");
+            }
+            let mut choices: Vec<String> = Vec::with_capacity(choices_raw.len());
+            for v in choices_raw {
+                match v.as_str() {
+                    Some(c) if (1..=50).contains(&c.chars().count()) => {
+                        if choices.contains(&c.to_string()) {
+                            return super::invalid_param("poll.choices", "must be unique");
+                        }
+                        choices.push(c.to_string());
+                    }
+                    _ => return super::invalid_param("poll.choices", "must be 1..50 char strings"),
+                }
+            }
+            let multiple = match o.get("multiple") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return super::invalid_param("poll.multiple", "must be a boolean"),
+            };
+            let expires_at = match o.get("expiresAt") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(n)) => n.as_i64(),
+                Some(_) => return super::invalid_param("poll.expiresAt", "must be an integer"),
+            };
+            let expired_after = match o.get("expiredAfter") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(n)) => match n.as_i64() {
+                    Some(ms) if ms >= 1 => Some(ms),
+                    _ => return super::invalid_param("poll.expiredAfter", "must be >= 1"),
+                },
+                Some(_) => return super::invalid_param("poll.expiredAfter", "must be an integer"),
+            };
+            let expires_at_ms = match (expires_at, expired_after) {
+                (_, Some(ms)) => Some(request_ms + ms),
+                (e, None) => e,
+            };
+            Some(PollInput {
+                choices,
+                multiple,
+                expires_at_ms,
+            })
+        }
+        Some(_) => return super::invalid_param("poll", "must be an object"),
+    };
+    // incNotesCount + tag merge (a poll-only renote carries no hashtags —
+    // text quotes do, the same extract the text lane feeds the row's tags).
+    let hashtags = text
+        .map(mk_core::services::misc::extract_hashtags)
+        .unwrap_or_default();
+    if let Err(e) = mk_db::social::insert_renote_note(
+        pool,
+        &id,
+        me_id,
+        &target,
+        text,
+        visibility,
+        local_only,
+        &hashtags,
+        poll.is_some(),
+    )
+    .await
     {
         return db_err("renote insert", e);
+    }
+    // NoteCreateService.create L710-722: the poll row rides the create() —
+    // hasPoll rides the insert above; populatePoll reads it back through
+    // note.has_poll, so the packed stream fanout carries `poll`.
+    if let Some(p) = &poll {
+        if let Err(e) = mk_db::poll::insert_poll(
+            pool,
+            &id,
+            &p.choices,
+            p.multiple,
+            p.expires_at_ms,
+            &visibility,
+            me_id,
+        )
+        .await
+        {
+            return db_err("renote insert_poll", e);
+        }
     }
     // utl-misc (users/notes [チャンネル外リノート] チャンネルミュート leg +
     // the channels/timeline renote legs): insertNote's channel denormalization
@@ -1081,10 +1180,8 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
     {
         return db_err("renote channel stamp", e);
     }
-    // incNotesCount + tag merge (a textless renote carries no hashtags)
-    let hashtags = text
-        .map(mk_core::services::misc::extract_hashtags)
-        .unwrap_or_default();
+    // incNotesCount + tag merge (hashtags extracted above the insert — the
+    // same array rides the row's NOTE_TAGS)
     if let Err(e) = mk_db::note::credit_note_to_user(pool, me_id, &hashtags).await {
         tracing::error!(target: "dbg_social", error = %e, "renote credit_note_to_user");
     }

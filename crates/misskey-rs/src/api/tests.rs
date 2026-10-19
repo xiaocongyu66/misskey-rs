@@ -10587,3 +10587,223 @@ async fn arena_api_final_closeout_pins() {
         "body: {v}"
     );
 }
+
+// stream-final ==============================================================
+// The two residual failing legs of the streaming.ts e2e census (run
+// 39241716401, 15_Run rows 1-5), driven at the same routing level the arena
+// tests use — both sat UPSTREAM of the channel ladders: the notesStream
+// fanout packs never carried `poll` (the renote lane stored none, so every
+// poll renote packed poll:null and isQuotePacked saw a pure renote) nor
+// `tags` (insert_note never wrote NOTE_TAGS, so passes_hashtag matched
+// nothing). Upstream pins: test/e2e/streaming.ts L299-308 (投票のみの
+// リノートが流れる) + L740-825 (指定したハッシュタグの投稿が流れる family),
+// channels/home-timeline.ts L88-97, channels/hashtag.ts L51-54.
+
+#[tokio::test]
+async fn arena_streaming_final_poll_quote_and_hashtag() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkstreamfinal").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let ayano = signup(&app, &uname("sfa")).await; // home viewer + hashtag listener
+    let at = ayano["token"].as_str().unwrap().to_string();
+    let a_id = ayano["id"].as_str().unwrap().to_string();
+    let kyoko = signup(&app, &uname("sfk")).await; // renoter / hashtag author
+    let kt = kyoko["token"].as_str().unwrap().to_string();
+    let k_id = kyoko["id"].as_str().unwrap().to_string();
+
+    /// Drain into (subId, eventType, frameBody) triples (250ms idle gap =
+    /// done — publish_notes is awaited inside the create request path).
+    async fn frames(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<(String, String, Value)> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" {
+                        out.push((
+                            v["body"]["id"].as_str().unwrap_or_default().to_string(),
+                            v["body"]["type"].as_str().unwrap_or_default().to_string(),
+                            v["body"]["body"].clone(),
+                        ));
+                    }
+                }
+                _ => return out,
+            }
+        }
+    }
+
+    // Home leg precondition: the viewer follows the renoter (e2e beforeAll).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "i": at, "userId": k_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // homeTimeline withRenotes:false (home-timeline.ts L38: `?? true` default
+    // flipped; the L88-97 pure-renote drop must NOT bite a poll renote).
+    let (tx, mut home) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let ok = crate::api::streaming::connect_channel(
+        &pool,
+        "homeTimeline",
+        json!({ "withRenotes": false }),
+        "sf-home",
+        tx,
+        &a_id,
+    )
+    .await;
+    assert!(ok, "homeTimeline connects");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "base", "i": kt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let base_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // (a) 投票のみのリノートが流れる (L299-308): renoteId+poll → the stream
+    // pack carries `poll` → isQuotePacked → quote bypasses withRenotes:false.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({
+            "i": kt,
+            "renoteId": base_id,
+            "poll": { "choices": ["kinoko", "takenoko"] },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let poll_quote = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // (a') pure renote control (L281-289 のときリノートが流れない): still a
+    // pure renote → withRenotes:false drops it.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": kt, "renoteId": base_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let pure_renote = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got = frames(&mut home).await;
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "sf-home" && t == "note" && b["id"] == *poll_quote),
+        "withRenotes: false のとき投票のみのリノートが流れる — {got:?}"
+    );
+    assert!(
+        got.iter().any(|(s, t, b)| s == "sf-home"
+            && t == "note"
+            && b["id"] == *poll_quote
+            && b["poll"]["choices"].is_array()),
+        "the streamed pack materializes poll — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|(_, _, b)| b["id"] == *pure_renote),
+        "withRenotes: false のときリノートが流れない — {got:?}"
+    );
+
+    // (b) Hashtag q matrix (hashtag.ts L51-54: q.some(ANDed.every(tag →
+    // noteTags.includes(tag)))) over the persisted NOTE_TAGS — the single and
+    // the AND+OR [['foo','bar'],['piyo']] shapes together.
+    let (tx, mut single_tl) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let ok = crate::api::streaming::connect_channel(
+        &pool,
+        "hashtag",
+        json!({ "q": [["foo"]] }),
+        "sf-tag-single",
+        tx,
+        &a_id,
+    )
+    .await;
+    assert!(ok, "hashtag (single) connects");
+    let (tx, mut ador_tl) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let ok = crate::api::streaming::connect_channel(
+        &pool,
+        "hashtag",
+        json!({ "q": [["foo", "bar"], ["piyo"]] }),
+        "sf-tag-ador",
+        tx,
+        &a_id,
+    )
+    .await;
+    assert!(ok, "hashtag (AND+OR) connects");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#foo", "i": kt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let foo_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#foo #bar", "i": kt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let foobar_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#piyo", "i": kt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let piyo_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#waaa", "i": kt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let waaa_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got = frames(&mut single_tl).await;
+    assert!(
+        got.iter().any(|(s, t, b)| s == "sf-tag-single"
+            && t == "note"
+            && (b["id"] == *foo_note || b["id"] == *foobar_note)),
+        "指定したハッシュタグの投稿が流れる ([['foo']]) — {got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|(_, _, b)| b["id"] == *piyo_note || b["id"] == *waaa_note),
+        "[['foo']] 注文外のタグノートは流れない — {got:?}"
+    );
+
+    let got = frames(&mut ador_tl).await;
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "sf-tag-ador" && t == "note" && b["id"] == *foobar_note),
+        "指定したハッシュタグの投稿が流れる (AND [['foo','bar']]) — {got:?}"
+    );
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "sf-tag-ador" && t == "note" && b["id"] == *piyo_note),
+        "指定したハッシュタグの投稿が流れる (OR ['piyo']) — {got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|(_, _, b)| b["id"] == *foo_note || b["id"] == *waaa_note),
+        "AND 未満 / 任意タグ外のノートは流れない — {got:?}"
+    );
+
+    crate::api::streaming::remove_user(&a_id);
+    let _ = (kt, at, k_id, pool);
+}

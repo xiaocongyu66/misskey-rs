@@ -461,7 +461,11 @@ pub async fn find_renote_target(
 }
 
 /// Renote/quote row (visibility rules are applied by the caller; a quote
-/// passes `text` alongside the renoteId, a pure renote passes NULL).
+/// passes `text` alongside the renoteId, a pure renote passes NULL). A
+/// poll-carrying renote is a quote for the withRenotes stream lanes
+/// (misc/is-renote.ts isQuotePacked `note.poll != null`), so the fresh row
+/// carries `hasPoll` + the poll row via mk_db::poll (upstream rides the one
+/// create() paramDef — notes/create { renoteId, poll }).
 pub async fn insert_renote_note(
     pool: &PgPool,
     id: &str,
@@ -470,6 +474,8 @@ pub async fn insert_renote_note(
     text: Option<&str>,
     visibility: &str,
     local_only: bool,
+    tags: &[String],
+    has_poll: bool,
 ) -> Result<(), sqlx::Error> {
     // tl-remote: author host denormalization on the renote row too
     // (insertNote `userHost: user.host`) — a remote author's renote must not
@@ -483,7 +489,7 @@ pub async fn insert_renote_note(
            "pageCount", "userHost")
         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, '{}'::jsonb, $8::note_visibility_enum,
                 '{}'::varchar[], '{}'::varchar[], '{}'::varchar[], '{}'::varchar[],
-                '{}'::varchar[], '{}'::varchar[], FALSE, 0,
+                '{}'::varchar[], $9, $10, 0,
                 (SELECT "host" FROM "user" WHERE "id" = $4))
         "#,
     )
@@ -495,6 +501,8 @@ pub async fn insert_renote_note(
     .bind(renote.user_host.as_deref())
     .bind(local_only)
     .bind(visibility)
+    .bind(tags)
+    .bind(has_poll)
     .execute(pool)
     .await?;
     Ok(())
