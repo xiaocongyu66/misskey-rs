@@ -171,32 +171,6 @@ pub async fn find_replies(
     .await
 }
 
-/// notes/replies.ts: direct replies of one note, id paging (sinceId → ASC
-/// else DESC), dense $1..$4 in bind order (reply, until, since, limit) —
-/// the same positional-fill trap search_channels hit.
-pub async fn find_replies(
-    pool: &PgPool,
-    reply_id: &str,
-    since_id: Option<&str>,
-    until_id: Option<&str>,
-    limit: i64,
-) -> Result<Vec<NoteRow>, sqlx::Error> {
-    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
-    sqlx::query_as::<_, NoteRow>(&format!(
-        r#"SELECT {NOTE_COLS} FROM "note"
-           WHERE "replyId" = $1
-             AND ($2::varchar IS NULL OR "id" < $2)
-             AND ($3::varchar IS NULL OR "id" > $3)
-           ORDER BY "id" {dir} LIMIT $4"#
-    ))
-    .bind(reply_id)
-    .bind(until_id)
-    .bind(since_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-}
-
 pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "threadId" AS "thread_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
 
 #[derive(Debug, sqlx::FromRow)]
