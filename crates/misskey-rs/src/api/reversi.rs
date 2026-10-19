@@ -386,9 +386,11 @@ fn winner_value(game: &ReversiGameRow, user1: &Value, user2: &Value) -> Value {
 }
 
 /// ReversiService.matched — the game row the accept path inserts (default
-/// eighteight map, bw 'random', logs []).
+/// eighteight map, bw 'random', logs []). `state` rides the signature for
+/// stream-event parity (publishReversiStream 'matched' — unported, see the
+/// module header).
 async fn matched(
-    state: &AppState,
+    _state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     parent_id: &str,
     child_id: &str,
@@ -518,7 +520,10 @@ async fn match_specific(
             tracing::error!(target: "dbg_reversi", error = %e, "remove_invite");
             return internal();
         }
-        let game = matched(state, pool, target_id, me_id, false).await?;
+        let game = match matched(state, pool, target_id, me_id, false).await {
+            Ok(g) => g,
+            Err(resp) => return resp,
+        };
         return send_game_detail(state, pool, &game).await;
     }
 
@@ -571,14 +576,20 @@ async fn match_any(
             tracing::error!(target: "dbg_reversi", error = %e, "remove_invite");
             return internal();
         }
-        let game = matched(state, pool, invitor, me_id, false).await?;
+        let game = match matched(state, pool, invitor, me_id, false).await {
+            Ok(g) => g,
+            Err(resp) => return resp,
+        };
         return send_game_detail(state, pool, &game).await;
     }
 
     match match_any_take_for(me_id) {
         Some(entry) => {
             let game =
-                matched(state, pool, &entry.user_id, me_id, entry.no_irregular).await?;
+                match matched(state, pool, &entry.user_id, me_id, entry.no_irregular).await {
+                    Ok(g) => g,
+                    Err(resp) => return resp,
+                };
             send_game_detail(state, pool, &game).await
         }
         None => {
@@ -764,7 +775,10 @@ async fn surrender(state: &AppState, body: &Value, token: Option<String>) -> Res
 /// {desynced: true, game} on a crc mismatch (a never-started game has crc32
 /// null — always a mismatch) and {desynced: false} otherwise.
 async fn verify(state: &AppState, body: &Value) -> Response {
-    let pool = state.pool.clone().ok_or_else(internal)?;
+    let pool = match state.pool.clone() {
+        Some(p) => p,
+        None => return internal(),
+    };
     let Some(game_id) = body.get("gameId").and_then(Value::as_str).map(|s| s.to_string()) else {
         return invalid_param();
     };

@@ -329,23 +329,23 @@ pub async fn list_games(
     sql.push_str(GAME_COLS);
     sql.push_str(r#" FROM "reversi_game" WHERE 1 = 1"#);
     let mut binds: Vec<String> = Vec::new();
-    let mut next = 1u8;
     if let Some(since) = since_id {
-        sql.push_str(&format!(r#" AND "id" > ${next} COLLATE "C""#));
+        // placeholders are 1-based in bind order: the next slot is len+1
+        let ph = binds.len() + 1;
+        sql.push_str(&format!(r#" AND "id" > ${ph} COLLATE "C""#));
         binds.push(since.to_string());
-        next += 1;
     }
     if let Some(until) = until_id {
-        sql.push_str(&format!(r#" AND "id" < ${next} COLLATE "C""#));
+        let ph = binds.len() + 1;
+        sql.push_str(&format!(r#" AND "id" < ${ph} COLLATE "C""#));
         binds.push(until.to_string());
-        next += 1;
     }
     if let Some(me) = me_id.filter(|_| my_only) {
+        let ph = binds.len() + 1;
         sql.push_str(&format!(
-            r#" AND ("user1Id" = ${next} OR "user2Id" = ${next})"#
+            r#" AND ("user1Id" = ${ph} OR "user2Id" = ${ph})"#
         ));
         binds.push(me.to_string());
-        next += 1;
     } else {
         sql.push_str(r#" AND "isStarted" = TRUE"#);
     }
