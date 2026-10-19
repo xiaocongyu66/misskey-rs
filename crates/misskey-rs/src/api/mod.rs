@@ -4958,4 +4958,4 @@ mod stream_auth;
 /// (ClientServerService SSR pages + feeds + assets, ActivityPubServerService
 /// apOrHtml arms) and the pages{,/flash,{,gallery}/posts}/create fixtures;
 /// mod.rs only registers the module and the single dispatch arm above.
-mod fetch_resource;
+pub(crate) mod fetch_resource;
