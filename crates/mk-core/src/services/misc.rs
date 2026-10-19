@@ -247,6 +247,7 @@ mod keyword_tests {
 //                      visibility, featured fetch trials, renderDocument
 //                      dimensions, JSON-LD compaction); none of those
 //                      services exist (mk-ap stub) — skipped.
+#[cfg(test)]
 mod unit_ap {
     use super::extract_mentions;
 
