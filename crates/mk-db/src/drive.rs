@@ -291,14 +291,14 @@ pub async fn files_find_by_md5(
 
 /// `drive/files/check-existence.ts`: EXISTS(md5 + userId).
 pub async fn md5_exists(pool: &PgPool, user_id: &str, md5: &str) -> Result<bool, sqlx::Error> {
-    let row: (bool,) = sqlx::query_as(
+    let hit: Option<(bool,)> = sqlx::query_as(
         r#"SELECT EXISTS(SELECT 1 FROM "drive_file" WHERE "md5" = $1 AND "userId" = $2)"#,
     )
     .bind(md5)
     .bind(user_id)
     .fetch_one(pool)
     .await?;
-    Ok(row.0)
+    Ok(hit.map(|(v,)| v).unwrap_or(false))
 }
 
 /// `drive/files/show.ts` `findOneBy([{ url }, { webpublicUrl },
