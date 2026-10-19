@@ -443,12 +443,28 @@ pub(crate) async fn resolve_acct_user(
 ) -> Result<Option<mk_db::user::LocalUserRow>, mk_db::sqlx::Error> {
     let local = match host {
         None => true,
-        Some(h) => h == config_host,
+        Some(h) => same_host(h, config_host),
     };
     if !local || username.is_empty() {
         return Ok(None);
     }
     mk_db::user::find_local_user_by_username(pool, &username.to_lowercase()).await
+}
+
+/// census rn39319126124: `Config.host()` carries the port (`127.0.0.1:3000`
+/// — the URI host-token split used by the identicon/badge planes) while a
+/// parsed acct NEVER carries one (`@bob@127.0.0.1` → host `127.0.0.1` like
+/// `new URL(config.url).hostname`). RemoteUserResolveService.compare-config
+/// parity therefore normalizes BOTH sides: strip the port, lowercase (the
+/// JS side punycodes/lowercases hosts).
+pub(crate) fn same_host(a: &str, b: &str) -> bool {
+    let bare = |h: &str| -> String {
+        h.split_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(h)
+            .to_lowercase()
+    };
+    bare(a) == bare(b)
 }
 
 async fn move_route(

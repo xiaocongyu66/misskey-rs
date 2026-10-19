@@ -12802,6 +12802,22 @@ fn arena_move_local_uri_roundtrip() {
         &aliases,
         "http://127.0.0.1:3000/users/o"
     ));
+    // census rn39319126124: a bare acct hostname (`@bob@127.0.0.1`, like
+    // new URL(config.url).hostname) must compare EQUAL to the port-suffixed
+    // Config.host() token (`127.0.0.1:3000`) — the remote-branch misroute
+    // pulled every multi-host acct into NO_SUCH_USER.
+    assert!(crate::api::move_account::same_host(
+        "127.0.0.1",
+        "127.0.0.1:3000"
+    ));
+    assert!(crate::api::move_account::same_host(
+        "Cli1.Example.com",
+        "cli1.example.com"
+    ));
+    assert!(!crate::api::move_account::same_host(
+        "127.0.0.1",
+        "127.0.0.2"
+    ));
 }
 
 // ============================================================================
