@@ -1128,3 +1128,88 @@ fn nested_followers_reply_leg(note: &Value) -> Option<(String, String)> {
     let vis = r.get("visibility")?.as_str()?.to_string();
     Some((uid, vis))
 }
+
+// unit-misc: upstream test/unit/misc/is-renote.ts, 1:1. The upstream file
+// drives the entity shape (`isRenote`/`isQuote` over MiNote, where the poll
+// arm is `hasPoll: true`); this module pins the packed-shape siblings
+// (`isRenotePacked`/`isQuotePacked`) the timeline filters actually run, where
+// the poll arm surfaces as a non-null `poll` object.
+#[cfg(test)]
+mod unit_misc_is_renote {
+    use super::*;
+
+    fn base_note() -> Value {
+        json!({
+            "id": "some-note-id",
+            "replyId": Value::Null,
+            "renoteId": Value::Null,
+            "text": Value::Null,
+            "cw": Value::Null,
+            "userId": "some-user-id",
+            "fileIds": [],
+        })
+    }
+
+    fn with(overrides: Value) -> Value {
+        let mut note = base_note();
+        let obj = note.as_object_mut().unwrap();
+        if let Value::Object(m) = overrides {
+            for (k, v) in m {
+                obj.insert(k, v);
+            }
+        }
+        note
+    }
+
+    #[test]
+    fn note_without_renote_id_should_not_be_renote() {
+        let note = base_note();
+        assert!(!is_renote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_should_be_renote_and_not_be_quote() {
+        let note = with(json!({ "renoteId": "some-renote-id" }));
+        assert!(is_renote_packed(&note));
+        assert!(!is_quote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_and_text_should_be_quote() {
+        let note = with(json!({ "renoteId": "some-renote-id", "text": "some-text" }));
+        assert!(is_renote_packed(&note));
+        assert!(is_quote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_and_cw_should_be_quote() {
+        let note = with(json!({ "renoteId": "some-renote-id", "cw": "some-cw" }));
+        assert!(is_renote_packed(&note));
+        assert!(is_quote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_and_reply_id_should_be_quote() {
+        let note = with(json!({ "renoteId": "some-renote-id", "replyId": "some-reply-id" }));
+        assert!(is_renote_packed(&note));
+        assert!(is_quote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_and_poll_should_be_quote() {
+        // upstream entity shape: hasPoll: true
+        let note = with(json!({
+            "renoteId": "some-renote-id",
+            "poll": { "choices": ["a", "b"], "multiple": false },
+        }));
+        assert!(is_renote_packed(&note));
+        assert!(is_quote_packed(&note));
+    }
+
+    #[test]
+    fn note_with_renote_id_and_non_empty_file_ids_should_be_quote() {
+        let note = with(json!({ "renoteId": "some-renote-id", "fileIds": ["some-file-id"] }));
+        assert!(is_renote_packed(&note));
+        assert!(is_quote_packed(&note));
+    }
+}
