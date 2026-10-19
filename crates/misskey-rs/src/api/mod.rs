@@ -169,6 +169,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "notes/timeline"
         || name == "notes/local-timeline"
         || name == "notes/hybrid-timeline"
+        // note-notify: following/list (endpoints/following/list.ts) — the
+        // following.notify read side (`notification: true` → notify IS NOT NULL)
+        || name == "following/list"
         // timelines matrix: following/update flips the following.withReplies
         // push flag the Home/Hybrid reply legs read (social lane may absorb)
         || name == "following/update"
@@ -260,6 +263,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         // timelines matrix arm: withReplies/notify flag flip on a follow edge
         if name == "following/update" {
             return social::following_update(&state, &body, token.as_deref()).await;
+        }
+        // note-notify arena arm: the notify-flag read side
+        if name == "following/list" {
+            return social::following_list(&state, &body, token.as_deref()).await;
         }
         if name == "notes/reactions" {
             return social::notes_reactions(&state, &body, token.as_deref()).await;
@@ -3324,6 +3331,15 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     }
     for (notifiee, reason) in &notify_queue {
         social::notify_note_event(pool, notifiee, &me_id, reason, &id).await;
+    }
+    // note-notify: NoteCreateService.create L790-813 — the `data.reply == null`
+    // branch fans a 'note' notification (L806 createNotification('note',
+    // { noteId })) out to every follower whose following row carries
+    // notify: 'normal'; the whole branch sits behind the `visibility !==
+    // 'specified'` guard (L796) and never fires on replies. (The renote lane
+    // carries the same leg with the pure-renote renoteMutings drop.)
+    if reply.is_none() && visibility != "specified" {
+        social::notify_note_to_followers(pool, &me_id, &id, false).await;
     }
 
     let note = match pack_note_for(state, pool, &id, Some(&me_id)).await {
