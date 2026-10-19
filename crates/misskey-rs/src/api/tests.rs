@@ -13555,6 +13555,10 @@ async fn fetchres_create_fixture_endpoints() {
 /// already holds (`alice.<field> toBe body.<field>`): the picker rides the
 /// same packed me JSON and fills the UserLite presence defaults, and NO
 /// me-only keys (token policies securityKeysList …) leak into the payload.
+/// `instance` is absent on BOTH sides of the pinned compare (pack L506:
+/// `user.host ? (cache hit ? {...} : undefined) : undefined` — the key stays
+/// omitted for local users and cache-miss remote hosts, never null; a null
+/// here turned the row into `expected undefined, received null`).
 #[test]
 fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
     use crate::api::system_webhook::webhook_user_lite_from_pack;
@@ -13562,7 +13566,7 @@ fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
         "id": "a1", "name": null, "username": "alice", "host": null,
         "avatarUrl": "http://127.0.0.1:3000/avatar.png",
         "avatarBlurhash": null, "avatarDecorations": [],
-        "isBot": false, "isCat": false, "instance": null,
+        "isBot": false, "isCat": false,
         "emojis": {}, "onlineStatus": "unknown", "badgeRoles": [],
         // me-only tail that must NOT bleed into the UserLite payload
         "token": "0123456789abcdef", "policies": {}, "securityKeysList": [],
@@ -13573,12 +13577,15 @@ fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
         "avatarDecorations", "isBot", "isCat", "instance", "emojis",
         "onlineStatus", "badgeRoles",
     ] {
-        assert!(lite.get(key).is_some(), "userCreated lite missing {key}");
-        assert_eq!(lite.get(key), packed_me.get(key), "{key} rides the pack");
+        assert_eq!(lite.get(key), packed_me.get(key), "{key}: undefined parity");
     }
+    assert!(
+        lite.get("instance").is_none(),
+        "local-user instance stays omitted (undefined === undefined in the e2e row)"
+    );
     assert_eq!(
         lite.as_object().unwrap().len(),
-        13,
+        12,
         "exactly the UserLite slice the synalio rows field-equal"
     );
     assert!(lite.get("token").is_none(), "me secrets stay out of the hook body");
@@ -13610,4 +13617,68 @@ fn arena_synalio_webhook_envelope_and_abuse_keys() {
     }
     assert_eq!(report["id"], "r1");
     assert_eq!(report["resolved"], serde_json::json!(false));
+}
+
+// synalio-final // — the userCreated emit leg (SignupService.ts L158 →
+// UserService.notifySystemWebhook → SystemWebhookService.enqueueSystemWebhook).
+// Two enqueue-level gates behind the e2e lane's three userCreated rows,
+// pinned without a live webhook receiver (the live POST matrix rides the
+// e2e-synalio census; the SignupService fire side is the spawned
+// system_webhook::fire in signup_route).
+
+/// Emit-on-create + Webhookが無効: the fresh-signup enqueue scans ONLY active
+/// hooks (the row-3 gate lives in the SQL), and an active hook whose `"on"`
+/// carries `userCreated` rides the deliver fan-out (the row-1 emit).
+#[test]
+fn synalio_final_user_created_enqueue_emit_and_inactive_sql_gate() {
+    use crate::api::system_webhook::hook_matches_event;
+    let hook = mk_db::webhook::SystemWebhookRow {
+        id: "hook1".to_string(),
+        is_active: true,
+        name: "n".to_string(),
+        on: vec!["userCreated".to_string()],
+        url: "http://localhost:15080".to_string(),
+        secret: "seed".to_string(),
+        latest_status: None,
+        updated_at_ms: 0,
+    };
+    assert!(
+        hook_matches_event(&hook, "userCreated", &[]),
+        "active hook with 'userCreated' in \"on\" enqueues the POST"
+    );
+    assert!(
+        mk_db::webhook::ACTIVE_SYSTEM_WEBHOOKS_SQL.contains("\"isActive\" = true"),
+        "the enqueue leg filters inactive hooks at the SQL (無効 hook -> no POST)"
+    );
+}
+
+/// 未許可 row: `on: []` (userCreated NOT in hook.events) and the type
+/// mismatch (hook.on carries a different event) both drop out of the gate
+/// before any deliver spawn.
+#[test]
+fn synalio_final_user_created_unpermitted_and_type_mismatch_no_enqueue() {
+    use crate::api::system_webhook::hook_matches_event;
+    let hook = mk_db::webhook::SystemWebhookRow {
+        id: "hook2".to_string(),
+        is_active: true,
+        name: "n".to_string(),
+        on: vec![], // 未許可: `on: []` never carries userCreated
+        url: "http://localhost:15080".to_string(),
+        secret: "seed".to_string(),
+        latest_status: None,
+        updated_at_ms: 0,
+    };
+    assert!(
+        !hook_matches_event(&hook, "userCreated", &[]),
+        "an unpermitted hook never enqueues"
+    );
+    let mismatch = mk_db::webhook::SystemWebhookRow {
+        on: vec!["abuseReport".to_string()],
+        is_active: true,
+        ..hook
+    };
+    assert!(
+        !hook_matches_event(&mismatch, "userCreated", &[]),
+        "a hook without the event type never enqueues"
+    );
 }

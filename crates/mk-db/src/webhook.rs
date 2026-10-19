@@ -120,20 +120,26 @@ pub async fn list_system_webhooks(pool: &PgPool) -> Result<Vec<SystemWebhookRow>
     .await?)
 }
 
-/// Upstream SystemWebhookService.fetchActiveSystemWebhooks: active hooks only
-/// (the `on.includes(type)` filter runs at the enqueue site — kept there).
+/// The enqueue-leg hook query (SystemWebhookService.fetchActiveSystemWebhooks —
+/// active hooks only; the `on.includes(type)` filter runs at the enqueue site's
+/// per-hook gate): ONLY active hooks reach the deliver fan-out, so an inactive
+/// `system_webhook` row can never produce a userCreated POST. Pulled out as a
+/// pub const so the synalio-final test tail pins the inactive-no-post gate
+/// without a live DB.
+pub const ACTIVE_SYSTEM_WEBHOOKS_SQL: &str = r#"
+    SELECT "id", "isActive", "name", "on", "url", "secret", "latestStatus",
+           (EXTRACT(EPOCH FROM "updatedAt") * 1000)::bigint AS "updated_at_ms"
+    FROM "system_webhook" WHERE "isActive" = true ORDER BY "id" DESC
+"#;
+
 pub async fn list_active_system_webhooks(
     pool: &PgPool,
 ) -> Result<Vec<SystemWebhookRow>, sqlx::Error> {
-    Ok(sqlx::query_as::<_, SystemWebhookRow>(
-        r#"
-        SELECT "id", "isActive", "name", "on", "url", "secret", "latestStatus",
-               (EXTRACT(EPOCH FROM "updatedAt") * 1000)::bigint AS "updated_at_ms"
-        FROM "system_webhook" WHERE "isActive" = true ORDER BY "id" DESC
-        "#,
+    Ok(
+        sqlx::query_as::<_, SystemWebhookRow>(ACTIVE_SYSTEM_WEBHOOKS_SQL)
+            .fetch_all(pool)
+            .await?,
     )
-    .fetch_all(pool)
-    .await?)
 }
 
 pub async fn delete_system_webhook(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {

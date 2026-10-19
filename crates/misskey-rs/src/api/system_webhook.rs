@@ -344,9 +344,15 @@ pub(crate) fn webhook_envelope(
 /// rides the SAME packed JSON (id/name/username/host/avatarUrl/avatarBlurhash/
 /// avatarDecorations/isBot/isCat/instance/emojis/onlineStatus/badgeRoles)
 /// with the UserLite presence defaults for any absent key.
+///
+/// `instance` is the one exception: pack L506 gates it on
+/// `user.host ? (cache hit ? {...} : undefined) : undefined` — the key is
+/// ABSENT (JS undefined) for local users and cache-miss remote hosts, never
+/// null. A `null` here made the pinned row's
+/// `expect(alice.instance).toEqual(body.instance)` compare undefined vs null.
 pub(crate) fn webhook_user_lite_from_pack(packed_me: &Value) -> Value {
     let pick = |key: &str, default: Value| packed_me.get(key).cloned().unwrap_or(default);
-    json!({
+    let mut lite = json!({
         "id": pick("id", Value::Null),
         "name": pick("name", Value::Null),
         "username": pick("username", Value::Null),
@@ -356,11 +362,16 @@ pub(crate) fn webhook_user_lite_from_pack(packed_me: &Value) -> Value {
         "avatarDecorations": pick("avatarDecorations", json!([])),
         "isBot": pick("isBot", json!(false)),
         "isCat": pick("isCat", json!(false)),
-        "instance": pick("instance", Value::Null),
         "emojis": pick("emojis", json!({})),
         "onlineStatus": pick("onlineStatus", json!("unknown")),
         "badgeRoles": pick("badgeRoles", json!([])),
-    })
+    });
+    if let Some(instance) = packed_me.get("instance") {
+        lite.as_object_mut()
+            .expect("json! literal is always an object")
+            .insert("instance".to_string(), instance.clone());
+    }
+    lite
 }
 
 /// `AbuseReportService.createAbuseReport/resolve` payload — the report entity
@@ -381,6 +392,21 @@ async fn deliver(url: String, hook_id: String, secret: String, hook_host: String
         .body(bytes)
         .send()
         .await;
+}
+
+/// The per-hook enqueue gate (SystemWebhookService.enqueueSystemWebhook):
+/// the hook's `"on"` event list must carry the event type (the unpermitted /
+/// type-mismatch rows) and the hook must not sit in the inactive-recipient
+/// excludes (abuse events only; the userCreated path passes none). isActive
+/// is filtered upstream of this loop — `list_active_system_webhooks` carries
+/// the `isActive = true` SQL (see mk-db ACTIVE_SYSTEM_WEBHOOKS_SQL), so an
+/// inactive hook never reaches the deliver fan-out.
+pub(crate) fn hook_matches_event(
+    hook: &mk_db::webhook::SystemWebhookRow,
+    event: &str,
+    excludes: &[String],
+) -> bool {
+    hook.on.iter().any(|on| on == event) && !excludes.iter().any(|ex| ex == &hook.id)
 }
 
 /// SystemWebhookService.enqueueSystemWebhook: active hooks with `type` in
@@ -408,10 +434,7 @@ pub(crate) async fn fire(
         Vec::new()
     };
     for hook in hooks {
-        if !hook.on.iter().any(|on| on == event) {
-            continue;
-        }
-        if excludes.iter().any(|ex| ex == &hook.id) {
+        if !hook_matches_event(&hook, event, &excludes) {
             continue;
         }
         let payload = webhook_envelope(&hook.id, &server_url, event, content.clone());

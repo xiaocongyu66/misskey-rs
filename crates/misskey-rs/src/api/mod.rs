@@ -1205,11 +1205,17 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
         if let Err(e) = mk_db::user::username_exists_local(pool, &username_lower).await {
             tracing::error!(target: "dbg_signup", error = %e, "username_exists_local");
         }
+        // SignupService.ts L83-88: the unconditional pre-transaction checks
+        // throw Error('DUPLICATED_USERNAME'/'USED_USERNAME'); the API catch
+        // (SignupApiService L261) rethrows FastifyReplyError(400,
+        // err.toString()) and fastify's default handler answers the
+        // {statusCode,error,message} JSON — a plain-text body here left the
+        // harness `api()` body null (synalio user-create rows 2-3).
         if let Ok(true) = mk_db::user::username_exists_local(pool, &username_lower).await {
-            return reply_plain(400, "DUPLICATED_USERNAME");
+            return reply_fastify_error(400, "Error: DUPLICATED_USERNAME");
         }
         if let Ok(true) = mk_db::user::used_username_exists(pool, &username_lower).await {
-            return reply_plain(400, "USED_USERNAME");
+            return reply_fastify_error(400, "Error: USED_USERNAME");
         }
     } else {
         return api_err(ApiError::internal_error());
@@ -1228,7 +1234,15 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
 
     let outcome = match mk_core::services::build_signup(username, password, None, host_param) {
         Ok(o) => o,
-        Err(code) => return reply_plain(400, code),
+        // SignupService.ts L64: Error('INVALID_USERNAME') → the same
+        // FastifyReplyError-toString → fastify-default JSON path as above.
+        Err("INVALID_USERNAME") => {
+            return reply_fastify_error(400, "Error: INVALID_USERNAME");
+        }
+        Err(code) => {
+            tracing::error!(target: "dbg_signup", code = %code, "signup build failure");
+            return api_err(ApiError::internal_error());
+        }
     };
 
     if let Some(pool) = &state.pool {
@@ -1295,11 +1309,37 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
     (StatusCode::OK, Json(packed)).into_response()
 }
 
-/// Upstream `FastifyReplyError(400, '...')`: plain-text body, no envelope.
+/// Plain-text body, no envelope (kept for raw reply arms that genuinely
+/// carry text upstream — the 405 no-body arms, bios/flush guards).
+/// (The signup error lane moved to `reply_fastify_error`: the harness
+/// `api()` helper parses only `application/json; charset=utf-8` bodies and
+/// reads fields off the parsed object even on 400s.)
+#[allow(dead_code)]
 fn reply_plain(status: u16, text: &str) -> Response {
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
         text.to_string(),
+    )
+        .into_response()
+}
+
+/// Fastify's DEFAULT error handler for the raw routes (signup/signin): a
+/// thrown `FastifyReplyError(status, message)` is serialized as
+/// `{ statusCode, error, message }` JSON (http.STATUS_CODES reason phrase).
+/// The json_utf8_charset layer upgrades `Json`'s bare application/json to
+/// `application/json; charset=utf-8` — load-bearing because the e2e harness
+/// `api()` helper parses the body ONLY for that exact content-type, leaving
+/// every other body null (the synalio user-create lane reads `alice.id` off
+/// the parsed signup body even on 400s: a plain-text 400 kept `alice` null).
+fn reply_fastify_error(status: u16, message: &str) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+    (
+        code,
+        Json(json!({
+            "statusCode": status,
+            "error": code.canonical_reason().unwrap_or("Error"),
+            "message": message,
+        })),
     )
         .into_response()
 }
