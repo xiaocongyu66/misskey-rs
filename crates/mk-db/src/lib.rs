@@ -67,6 +67,10 @@ pub mod social;
 pub mod access_token;
 // timelines arena: notes/timeline / notes/local-timeline / notes/hybrid-timeline
 pub mod timelines;
+// arena-reversi: the reversi game domain (reversi_game + reversi_matching
+// ship in the 0001 baseline; the matching table models the redis
+// matchSpecific invitation zset on the legacy schema shape — no migration)
+pub mod reversi;
 pub mod user;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {

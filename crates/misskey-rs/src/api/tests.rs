@@ -12451,3 +12451,171 @@ fn roles_v2_can_public_note_explicit_override_wins() {
         true
     ));
 }
+
+// arena-reversi ==============================================================
+// upstream test/e2e/reversi-game.ts at the match lane: alice invites bob
+// (204, body null via the empty-204 content-type probe), bob's cross-invite
+// 200s with the packed game whose user1 = alice (the invitor) / user2 = bob
+// (the acceptor) — ReversiService.matchSpecificUser + matched() + the
+// ReversiGameEntityService packDetail seats; plus the match.ts error metas,
+// the invitations plane (invited ids pack as UserLite), the matchAny
+// rendezvous and the surrender gate ladder (ACCESS_DENIED → 204 + endGame
+// winner/surrendered credits on show-game).
+
+#[tokio::test]
+async fn arena_reversi_match_invitations_lane() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkreversi_a").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("rva")).await;
+    let bob = signup(&app, &uname("rvb")).await;
+    let carol = signup(&app, &uname("rvc")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let ct = carol["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+    let carol_id = carol["id"].as_str().unwrap().to_string();
+
+    // response1 plane: the pending invite → 204, body null
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/api/reversi/match",
+        json!({ "userId": bob_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::NO_CONTENT, "body: {b1}");
+    assert_eq!(b1, Value::Null, "204 empty body (response1.body === null)");
+
+    // invitations plane (while the invite is still pending): bob's list
+    // carries alice as a UserLite (packMany over the invitation ids)
+    let (s5, b5) = post_json(app.clone(), "/api/reversi/invitations", json!({ "i": bt })).await;
+    assert_eq!(s5, StatusCode::OK, "body: {b5}");
+    let inv = b5.as_array().expect("invitations array");
+    let inv_ids: Vec<&str> = inv
+        .iter()
+        .map(|u| u["id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(inv_ids.contains(&alice_id.as_str()), "invited by alice: {b5}");
+
+    // response2 plane: bob's cross-invite accepts — user1 = alice (invitor),
+    // user2 = bob (acceptor), the matched() insert defaults (unstarted,
+    // eighteight map, bw random, rules at column defaults)
+    let (s2, b2) = post_json(
+        app.clone(),
+        "/api/reversi/match",
+        json!({ "userId": alice_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["user1"]["id"], alice_id, "user1 = the invitor");
+    assert_eq!(b2["user2"]["id"], bob_id, "user2 = the acceptor");
+    assert_eq!(b2["isStarted"], json!(false));
+    assert_eq!(b2["isEnded"], json!(false));
+    assert!(b2["map"].as_array().is_some(), "eighteight map rows");
+    assert_eq!(b2["map"].as_array().unwrap().len(), 8, "8x8 rows");
+    assert_eq!(b2["bw"], json!("random"));
+    assert_eq!(b2["noIrregularRules"], json!(false));
+    assert_eq!(b2["logs"], json!([]));
+    let game_id = b2["id"].as_str().unwrap().to_string();
+
+    // match.ts meta plane: yourself + unknown target ride the per-file ids
+    let (s3, b3) = post_json(
+        app.clone(),
+        "/api/reversi/match",
+        json!({ "userId": alice_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::BAD_REQUEST, "body: {b3}");
+    assert_eq!(b3["error"]["code"], json!("TARGET_IS_YOURSELF"));
+    let (s4, b4) = post_json(
+        app.clone(),
+        "/api/reversi/match",
+        json!({ "userId": "zzzzzzzzzzzzzzzz", "i": at }),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::BAD_REQUEST, "body: {b4}");
+    assert_eq!(b4["error"]["code"], json!("NO_SUCH_USER"));
+    assert_eq!(
+        b4["error"]["id"],
+        json!("0b4f0559-b484-4e31-9581-3f73cee89b28")
+    );
+
+    // cancel-match: bob cancels his own pending invite TO carol (no-op
+    // upstream zrem) — still 204; carol's invitations stay empty
+    let (s7, b7) = post_json(
+        app.clone(),
+        "/api/reversi/cancel-match",
+        json!({ "userId": carol_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s7, StatusCode::NO_CONTENT, "body: {b7}");
+
+    // surrender gate ladder: a non-member (carol) rides ACCESS_DENIED; the
+    // owner's surrender credits winner = the OTHER user + surrenderedUserId
+    // = me (endGame), visible on the unauthenticated show-game reflect
+    let (s8, b8) = post_json(
+        app.clone(),
+        "/api/reversi/surrender",
+        json!({ "gameId": game_id, "i": ct }),
+    )
+    .await;
+    assert_eq!(s8, StatusCode::BAD_REQUEST, "body: {b8}");
+    assert_eq!(b8["error"]["code"], json!("ACCESS_DENIED"));
+    let (s9, b9) = post_json(
+        app.clone(),
+        "/api/reversi/surrender",
+        json!({ "gameId": game_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s9, StatusCode::NO_CONTENT, "body: {b9}");
+    let (s10, b10) = post_json(app.clone(), "/api/reversi/show-game", json!({ "gameId": game_id })).await;
+    assert_eq!(s10, StatusCode::OK, "body: {b10}");
+    assert_eq!(b10["isEnded"], json!(true));
+    assert_eq!(b10["winnerId"], bob_id, "alice surrendered → bob wins");
+    assert_eq!(b10["surrenderedUserId"], alice_id);
+    // the second surrender rides ALREADY_ENDED
+    let (s11, b11) = post_json(
+        app.clone(),
+        "/api/reversi/surrender",
+        json!({ "gameId": game_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s11, StatusCode::BAD_REQUEST, "body: {b11}");
+    assert_eq!(b11["error"]["code"], json!("ALREADY_ENDED"));
+}
+
+#[tokio::test]
+async fn arena_reversi_match_any_waiting_room_lane() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkreversi_b").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("rwx")).await;
+    let bob = signup(&app, &uname("rwy")).await;
+    let bt = alice["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let bt2 = bob["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // alice queues (no userId → matchAnyUser) → 204 pending...
+    let (s1, b1) = post_json(app.clone(), "/api/reversi/match", json!({ "i": bt })).await;
+    assert_eq!(s1, StatusCode::NO_CONTENT, "body: {b1}");
+    // ...bob's queue-pop lands the matched() pair: user1 = the waiter
+    // (upstream matched(matchedUserId, me.id)), user2 = the joiner
+    let (s2, b2) = post_json(app.clone(), "/api/reversi/match", json!({ "i": bt2 })).await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(b2["user1"]["id"], alice_id, "user1 = the waiter (alice)");
+    assert_eq!(b2["user2"]["id"], bob_id, "user2 = the joiner (bob)");
+    assert_eq!(b2["isStarted"], json!(false));
+    assert_eq!(b2["bw"], json!("random"));
+}

@@ -71,6 +71,12 @@ mod lists;
 // antenna table + the 0004 antenna_note fanout projection); the note-creation
 // fanout hook rides notes_create below.
 mod antennas;
+// arena-reversi: the reversi/* domain (upstream endpoints/reversi/
+// {match,cancel-match,invitations,games,show-game,surrender,verify}.ts +
+// core/ReversiService.ts + ReversiGameEntityService packDetail/packLite;
+// reversi-game.ts census) — db paths in mk-db/src/reversi.rs (reversi_game +
+// reversi_matching ship in the 0001 baseline, no 0007).
+mod reversi;
 // ftt2: the FTT Redis push pipeline (NoteCreateService.pushToTl +
 // FanoutTimelineService.push; the timelines.ts `FTT:` probes read
 // `list:homeTimeline:*` Redis lists literally).
@@ -452,6 +458,28 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return two_factor::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END two-factor DISPATCH ARM ====
+
+    // ==== arena-reversi DISPATCH ARM (reversi/*) ====
+    // Self-contained block on the two-factor-arm pattern (census rn39315268103:
+    // the lone reversi-game.ts row 404'd POST /api/reversi/match unknown-
+    // endpoint). Method check, body parsing and token extraction live in the
+    // arm; the requireCredential gates (match/cancel-match/invitations/
+    // surrender require, games/show-game default false, verify has none) +
+    // endpoint bodies in api::reversi (SQL in mk-db/src/reversi.rs). None of
+    // the 7 names collide with an earlier arm, so this shadows nothing.
+    if reversi::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return reversi::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END arena-reversi DISPATCH ARM ====
 
     // ==== arena-streaming DISPATCH ARM (miauth/gen-token) ====
     // The /streaming hub's app-token lane (streaming.ts Authentication test):
