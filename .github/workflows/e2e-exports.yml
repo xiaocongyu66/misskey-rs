@@ -74,8 +74,8 @@ jobs:
       - name: Compile upstream config
         run: pnpm --filter backend compile-config
         working-directory: upstream
-      - name: Build misskey-js (exports.ts boots the Nest queue app)
-        run: pnpm --filter misskey-js build
+      - name: Build misskey-js + misskey-reversi (the Nest boot resolves them)
+        run: pnpm --filter misskey-js build && pnpm --filter misskey-reversi build
         working-directory: upstream
       - name: Install harness
         run: |
