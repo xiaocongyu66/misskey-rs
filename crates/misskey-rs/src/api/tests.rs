@@ -10887,13 +10887,15 @@ fn two_factor_totp_rfc6238_vectors() {
         mk_db::two_factor::totp_code_at(secret, 1111111109).as_deref(),
         Some("081804")
     );
+    // RFC 6238 App B SHA-1, 8-digit {14050471, 89005924} → last-six pins
+    // (the first two vectors above already pin the same derivation).
     assert_eq!(
         mk_db::two_factor::totp_code_at(secret, 1111111111).as_deref(),
-        Some("050597")
+        Some("050471")
     );
     assert_eq!(
         mk_db::two_factor::totp_code_at(secret, 1234567896).as_deref(),
-        Some("359130")
+        Some("005924")
     );
     // ±1 window acceptance mirrors OTPAuth validate({ window: 1 }): a code
     // one step behind the wall clock still verifies (delta -1).
