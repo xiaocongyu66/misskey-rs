@@ -398,7 +398,7 @@ pub async fn unfavorite(pool: &PgPool, me_id: &str, channel_id: &str) -> Result<
 
 /// Column list mirrors `note.rs NOTE_COLS` (kept local: note.rs is not this
 /// agent's file; `NoteRow`/`packers::note::note_pack_min` are still shared).
-const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
+const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "threadId" AS "thread_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn timeline_notes(

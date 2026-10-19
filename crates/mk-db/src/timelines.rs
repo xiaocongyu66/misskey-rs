@@ -309,6 +309,71 @@ pub async fn timeline_notes(
         .await
 }
 
+/// generateMutedNoteThreadQuery (QueryService.ts L178-192): the note's own row
+/// and its thread root must BOTH sit outside the viewer's note_thread_muting
+/// set (mute key = `note.threadId ?? note.id`, so an unthreaded root is
+/// excluded by the first clause alone).
+const THREAD_MUTE_ME: &str = r#" AND n."id" NOT IN
+              (SELECT "threadId" FROM "note_thread_muting" WHERE "userId" = :ME:)
+        AND (n."threadId" IS NULL OR n."threadId" NOT IN
+              (SELECT "threadId" FROM "note_thread_muting" WHERE "userId" = :ME:))"#;
+
+/// notes/mentions (endpoints/notes/mentions.ts getFromDb): notes addressing
+/// the viewer — `me <@ mentions OR me <@ visibleUserIds` — paged newest-first
+/// (sinceId-only → oldest-first), through generateVisibilityQuery
+/// (VIS_ME), generateBaseNoteFilteringQuery (BASE_ME incl. muted/blocked
+/// author / reply / renote target) and generateMutedNoteThreadQuery
+/// (THREAD_MUTE_ME). Upstream's CONCAT(id) ordering degenerates to the plain
+/// id sort (aid ids are monotonically sortable strings).
+/// Bind map: $1 followees (unused — kept for the shared VIS_ME followers
+/// branch), $2 me, $3 [me], $4 untilId, $5 sinceId, $6 limit, $7 visibility.
+#[allow(clippy::too_many_arguments)]
+pub async fn mentions_notes(
+    pool: &PgPool,
+    me_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+    visibility: Option<&str>,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let me_list = vec![me_id.to_string()];
+    let no_followees: Vec<String> = Vec::new();
+    let asc = since_id.is_some();
+
+    let mut inner = String::from(INNER);
+    // mentions.ts L63-67: `:meIdAsList <@ note.mentions OR
+    // :meIdAsList <@ note.visibleUserIds` (array-contains-me, the same
+    // `<@` shape VIS_ME's specified-visibility branches use).
+    inner.push_str(
+        r#"((:MELIST::varchar[] <@ n."mentions") OR (:MELIST::varchar[] <@ n."visibleUserIds"))"#,
+    );
+    inner.push_str(VIS_ME);
+    inner.push_str(BASE_ME);
+    inner.push_str(THREAD_MUTE_ME);
+    if visibility.is_some() {
+        // mentions.ts L80-82 (`note.visibility = :visibility`).
+        inner.push_str(r#" AND n."visibility" = $7::varchar"#);
+    }
+    inner.push_str(PAGER);
+
+    let inner = expand(&inner, 2, 3, 1, 4, 5, 6, dir_asc(since_id));
+    let sql = inner
+        .replace("MUTE_SEL", &expand(MUTE_SEL, 2, 3, 1, 4, 5, 6, ""))
+        .replace("BLOCK_SEL", &expand(BLOCK_SEL, 2, 3, 1, 4, 5, 6, ""));
+
+    let mut q = sqlx::query_as::<_, NoteRow>(&wrap_outer(&sql, asc))
+        .bind(&no_followees)
+        .bind(me_id)
+        .bind(&me_list)
+        .bind(until_id)
+        .bind(since_id)
+        .bind(limit);
+    if let Some(vis) = visibility {
+        q = q.bind(vis);
+    }
+    q.fetch_all(pool).await
+}
+
 /// notes/local-timeline: `visibility='public' AND userHost IS NULL AND
 /// channelId IS NULL`, guest-visible, mute/block gates for logged-in viewers
 /// (NULL me degrades the sub-selects to no-ops). Upstream's db path applies no

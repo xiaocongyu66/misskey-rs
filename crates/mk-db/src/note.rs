@@ -145,7 +145,7 @@ pub async fn bump_replies_count(
 }
 
 /// Columns carried by the detail-with-reactions note pack.
-pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
+pub const NOTE_COLS: &str = r#""id", ("replyId") AS "reply_id", ("renoteId") AS "renote_id", "text", "cw", ("userId") AS "user_id", "userHost" AS "user_host", ("localOnly") AS "local_only", ("visibility"::text) AS "visibility", "mentions", "emojis", "tags", ("hasPoll") AS "has_poll", ("reactionAcceptance"::text) AS "reaction_acceptance", ("reactions"::text) AS "reactions", "renoteCount" AS "renote_count", "repliesCount" AS "replies_count", "fileIds" AS "file_ids", "visibleUserIds" AS "visible_user_ids", "replyUserId" AS "reply_user_id", "threadId" AS "thread_id", "clippedCount" AS "clipped_count", "channelId" AS "channel_id", "uri", "url""#;
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct NoteRow {
@@ -177,6 +177,10 @@ pub struct NoteRow {
     pub visible_user_ids: Vec<String>,
     #[sqlx(rename = "reply_user_id")]
     pub reply_user_id: Option<String>,
+    /// reply-chain root id (upstream `threadId` = reply.threadId ?? reply.id;
+    /// the thread-mute gates and the notification legs key on it).
+    #[sqlx(rename = "thread_id")]
+    pub thread_id: Option<String>,
     #[sqlx(rename = "clipped_count")]
     pub clipped_count: i16,
     #[sqlx(rename = "channel_id")]
@@ -207,6 +211,16 @@ pub async fn find_note_by_id(pool: &PgPool, id: &str) -> Result<Option<NoteRow>,
     .await
 }
 
+/// Upstream `note.threadId ?? note.id` scalar (NotesCreateService.compute
+/// thread id; the thread-mute insert key and the NotificationService gate
+/// key both derive from the REPLY target's threadId ?? id).
+pub async fn thread_key(pool: &PgPool, note_id: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "threadId" FROM "note" WHERE "id" = $1"#)
+        .bind(note_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// `noteThreadMutingsRepository.exists({ userId, threadId })` — gates mention
 /// and reply notifications upstream (NoteCreateService).
 pub async fn thread_muted(
@@ -222,6 +236,43 @@ pub async fn thread_muted(
     .fetch_one(pool)
     .await?;
     Ok(n > 0)
+}
+
+/// `notes/thread-muting/create` repo part
+/// (`noteThreadMutingsRepository.insert({ id, threadId, userId })` — upstream
+/// gen()s the id; the table carries no createdAt).
+pub async fn insert_thread_muting(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    thread_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "note_thread_muting" ("id", "userId", "threadId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `notes/thread-muting/delete` repo part
+/// (`noteThreadMutingsRepository.delete({ threadId, userId })`); returns rows
+/// affected (upstream ignores the count).
+pub async fn delete_thread_muting(
+    pool: &PgPool,
+    user_id: &str,
+    thread_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let r =
+        sqlx::query(r#"DELETE FROM "note_thread_muting" WHERE "userId" = $1 AND "threadId" = $2"#)
+            .bind(user_id)
+            .bind(thread_id)
+            .execute(pool)
+            .await?;
+    Ok(r.rows_affected())
 }
 
 // ---------------------------------------------------------------------------

@@ -166,8 +166,11 @@ fn user_id_param<'a>(body: &'a Value) -> Result<&'a str, Response> {
 
 /// NotificationService.createNotification gates for note-reasoned
 /// notifications (mention/reply/renote/quote/reaction): a notifier cannot
-/// notify itself and is dropped when the notifiee mutes it (recieveConfig /
-/// suspended-notifier pack filtering not modeled — TODO(M2+)).
+/// notify itself and is dropped when the notifiee mutes it — the muting gate
+/// is TYPE-AGNOSTIC (NotificationService.ts L111-114, checked before the
+/// recieveConfig ladder), so the follow-family legs drop the same way
+/// (recieveConfig / suspended-notifier pack filtering not modeled —
+/// TODO(M2+)). Insert side only: the Redis-stream fanout is not ported.
 pub(crate) async fn notify_note_event(
     pool: &mk_db::sqlx::PgPool,
     notifiee_id: &str,
@@ -200,6 +203,48 @@ pub(crate) async fn notify_note_event(
     .await
     {
         tracing::error!(target: "dbg_social", error = %e, "notify_note_event insert");
+    }
+}
+
+/// createNotification legs WITHOUT a bound note (packed shape keeps
+/// id/createdAt/type/userId/user — the follow family):
+/// - 'follow' (UserFollowingService.insertFollowingDoc L357:
+///   `createNotification(followee.id, 'follow', {}, follower.id)`),
+/// - 'receiveFollowRequest' (createFollowRequest L543).
+/// Both carry a notifier, so both ride the SAME type-agnostic muting gate
+/// (NotificationService.ts L111-114) — the Mute e2e follow/followRequest
+/// legs read exactly that drop.
+pub(crate) async fn notify_follow_family_event(
+    pool: &mk_db::sqlx::PgPool,
+    notifiee_id: &str,
+    notifier_id: &str,
+    reason: &str, // "follow" | "receiveFollowRequest"
+) {
+    if notifiee_id == notifier_id {
+        return;
+    }
+    match mk_db::social::muting_exists(pool, notifiee_id, notifier_id).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "notify_follow_family muting_exists");
+            return;
+        }
+    }
+    if let Err(e) = mk_db::notification::insert_notification(
+        pool,
+        &mk_db::notification::NewNotification {
+            id: &mk_types::id::gen_aid_now(),
+            r#type: reason,
+            user_id: notifiee_id,
+            notifier_id: Some(notifier_id),
+            note_id: None,
+            reaction: None,
+        },
+    )
+    .await
+    {
+        tracing::error!(target: "dbg_social", error = %e, "notify_follow_family insert");
     }
 }
 
@@ -316,6 +361,10 @@ async fn following_create(
             )
             .await
             .map_err(|e| db_err("following_create insert_follow_request", e))?;
+            // UserFollowingService.createFollowRequest L543: the followee
+            // gets a 'receiveFollowRequest' notification (muting-gated —
+            // the Mute e2e フォローリクエスト leg).
+            notify_follow_family_event(pool, user_id, me_id, "receiveFollowRequest").await;
             // the endpoint still answers with the packed followee
             return Ok(ok_json(pack_target(state, pool, &followee, me_id).await?));
         }
@@ -335,7 +384,10 @@ async fn following_create(
         .await
         .map_err(|e| db_err("following_create bump", e))?;
 
-    // TODO(M2+): 'follow'/'followed' notifications (notifications family)
+    // UserFollowingService.insertFollowingDoc L357: the followee is notified
+    // 'follow' (notifier = the follower; muting-gated — the Mute e2e
+    // フォロー通知 leg).
+    notify_follow_family_event(pool, user_id, me_id, "follow").await;
     Ok(ok_json(pack_target(state, pool, &followee, me_id).await?))
 }
 

@@ -7385,3 +7385,225 @@ async fn renote_mute_stream_timeline_fanout() {
     crate::api::streaming::remove_user(&a_id);
     let _ = pool;
 }
+// ===== mute lane noise-gates: muter silence + thread-mute wiring ============
+//
+// Unit-level mirror of the batch-social arena legs (upstream
+// test/e2e/mute.ts + thread-mute.ts). Every notification reason that
+// carries a notifier drops when the notifiee mutes the notifier
+// (NotificationService.#createNotificationInternal L111-114 — the muting
+// check is TYPE-AGNOSTIC, so the follow family gates identically), the
+// notes/mentions plane runs visibility + base (muted author) + the muted-
+// note-THREAD gates (QueryService.generateMutedNoteThreadQuery), and the
+// reply/mention notification legs stay silent inside a thread-muted thread
+// (NoteCreateService L856/L991). CI judges the e2e file; this prevents the
+// wires from silently detaching between runs.
+
+#[tokio::test]
+async fn noise_gate_muter_silence_and_thread_mute() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknoisemute").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("nga")).await;
+    let bob = signup(&app, &uname("ngb")).await;
+    let carol = signup(&app, &uname("ngc")).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+    let (c_id, c_token) = (
+        carol["id"].as_str().unwrap(),
+        carol["token"].as_str().unwrap(),
+    );
+    let a_name = alice["username"].as_str().unwrap().to_string();
+
+    // Mute: alice ==> carol (mute.ts beforeAll)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": c_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    // notification reasons 1+2: reaction + follow from both sides
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hi", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let alice_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": alice_note, "reaction": "like", "i": b_token }),
+    )
+    .await;
+    assert!(s.is_success(), "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": alice_note, "reaction": "like", "i": c_token }),
+    )
+    .await;
+    assert!(s.is_success(), "body: {body}");
+
+    // gate 1: bob's follow + reaction notifications visible, carol's rows
+    // (BOTH reasons) dropped — the muting gate is type-agnostic
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications",
+        json!({ "i": a_token, "markAsRead": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|n| n["type"] == json!("follow") && n["userId"] == json!(b_id)),
+        "follow notification visible: {arr}"
+    );
+    assert!(
+        arr.iter()
+            .any(|n| n["type"] == json!("reaction") && n["userId"] == json!(b_id)),
+        "reaction notification visible: {arr}"
+    );
+    assert!(
+        !arr.iter().any(|n| n["userId"] == json!(c_id)),
+        "muted carol silent across reasons: {arr}"
+    );
+
+    // gate 2: i/notifications-grouped shares the same gate through the alias
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications-grouped",
+        json!({ "i": a_token, "markAsRead": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert!(
+        arr.iter().any(|n| n["userId"] == json!(b_id)),
+        "body: {arr}"
+    );
+    assert!(
+        !arr.iter().any(|n| n["userId"] == json!(c_id)),
+        "grouped list keeps the muter silence: {arr}"
+    );
+
+    // thread-mute wiring (thread-mute.ts): bob roots the thread with a
+    // mention, alice replies, then mutes the THREAD; alice's standalone
+    // mention control must stay visible while the muted-thread rows vanish.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": format!("@{a_name} standalone"), "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let control_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": format!("@{a_name} root note"), "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "child note", "replyId": bob_note, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let alice_reply = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/thread-muting/create",
+        json!({ "noteId": bob_note, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": format!("@{a_name} child note"), "replyId": bob_note, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let carol_reply = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "child note", "replyId": alice_reply, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let carol_no_mention = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // gate 3: notes/mentions — muted-thread rows (root / mid-thread reply /
+    // thread-muted reply author) excluded, the standalone mention control kept
+    let (s, v) = post_json(app.clone(), "/api/notes/mentions", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert!(
+        !arr.iter().any(|n| n["id"] == json!(bob_note)),
+        "muted thread root excluded: {arr}"
+    );
+    assert!(
+        !arr.iter().any(|n| n["id"] == json!(carol_reply)),
+        "muted-thread reply excluded: {arr}"
+    );
+    assert!(
+        !arr.iter().any(|n| n["id"] == json!(carol_no_mention)),
+        "reply-target ride-along excluded by the thread gate: {arr}"
+    );
+    assert!(
+        arr.iter().any(|n| n["id"] == json!(control_note)),
+        "unmuted mention control visible: {arr}"
+    );
+
+    // gate 4: i/notifications — the in-thread carol replies notify nobody
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications",
+        json!({ "i": a_token, "markAsRead": false }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert!(
+        !arr.iter()
+            .any(|n| n["note"]["id"] == json!(carol_reply)
+                || n["note"]["id"] == json!(carol_no_mention)),
+        "thread-muted reply legs stayed silent: {arr}"
+    );
+    assert!(
+        !arr.iter().any(|n| n["userId"] == json!(c_id)),
+        "muted carol still silent: {arr}"
+    );
+
+    let _ = pool;
+}

@@ -118,7 +118,18 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "users"
         // -- notifications slice (M2): param line + arm kept at the END of
         // -- the dispatch group so co-agent rebases stay trivial
+        // -- (mute lane: upstream keeps the `i/` namespacing on both the
+        // -- plain and the grouped list, endpoints/i/notifications[-grouped].ts;
+        // -- the grouped pack shapes are TODO(M2+) — the arena legs gate on
+        // -- `userId` presence, which both share)
         || name == "notifications"
+        || name == "i/notifications"
+        || name == "i/notifications-grouped"
+        // mute lane: notes/mentions (endpoints/notes/mentions.ts) +
+        // notes/thread-muting/{create,delete} (endpoints/notes/thread-muting/)
+        || name == "notes/mentions"
+        || name == "notes/thread-muting/create"
+        || name == "notes/thread-muting/delete"
         // note-agent: note domain (local-timeline guest-ok)
         || name == "notes/timeline"
         || name == "notes/local-timeline"
@@ -178,8 +189,18 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return users_list(&state, &body, token).await;
         }
         // -- notifications slice (M2) — added lines; keep at END of group --
-        if name == "notifications" {
+        // mute lane: the `i/`-prefixed aliases ride the same handler
+        // (upstream endpoint files sit at i/notifications[-grouped].ts).
+        if name == "notifications" || name == "i/notifications" || name == "i/notifications-grouped"
+        {
             return notifications_route(&state, &body, token).await;
+        }
+        // mute lane: notes/mentions + the thread-muting pair
+        if name == "notes/mentions" {
+            return notes_mentions(&state, &body, token).await;
+        }
+        if name == "notes/thread-muting/create" || name == "notes/thread-muting/delete" {
+            return notes_thread_muting(&state, name.as_str(), &body, token).await;
         }
         // -- end notifications slice --
 
@@ -2956,11 +2977,13 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
 
     // ---- insertNote (+ poll, repliesCount bump) ----
     let id = mk_types::id::gen_aid_now();
+    // upstream `threadId = reply.threadId ?? reply.id` (NoteCreateService):
+    // reply chains keep the ROOT id, one-level replies take the parent id.
     let (reply_user_id, reply_user_host, thread_id) = match &reply {
         Some(r) => (
             Some(r.user_id.clone()),
             r.user_host.clone(),
-            Some(r.reply_id.clone().unwrap_or_else(|| r.id.clone())),
+            Some(r.thread_id.clone().unwrap_or_else(|| r.id.clone())),
         ),
         None => (None, None, None),
     };
@@ -3050,17 +3073,48 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     )
     .await;
 
-    // NoteCreateService non-AP notify branch: reply → target author;
-    // mentioned local users → 'mention' (gates live in the social helper).
+    // NoteCreateService non-AP notify branch (create() L845-869 +
+    // createMentionedEvents L991-1035): the reply-target author and every
+    // mentioned local user run through the NotificationManager queue — at
+    // most ONE notification per notifiee, and a queued 'mention' is
+    // upgraded to 'reply' (push() L88-101), so both surfaces collapse to a
+    // single 'reply' row. Thread muting gates BOTH legs BEFORE the queue:
+    // the reply leg on `data.reply.threadId ?? data.reply.id` (L856) and the
+    // mention leg on `note.threadId ?? note.id` (L993) — the same key (the
+    // new row's threadId IS the parent's). Muting/self drops ride the
+    // notification helper (NotificationService.createNotification — the
+    // muting gate is type-agnostic, NotificationService.ts L111-114).
+    let notify_thread_key = thread_id.clone().unwrap_or_else(|| id.clone());
+    let mut notify_queue: Vec<(String, &'static str)> = Vec::new();
     if let Some(rid) = reply_id {
         if let Ok(Some(target)) = mk_db::note::find_note_by_id(pool, rid).await {
-            social::notify_note_event(pool, &target.user_id, &me_id, "reply", &id).await;
+            match mk_db::note::thread_muted(pool, &target.user_id, &notify_thread_key).await {
+                Ok(false) => notify_queue.push((target.user_id.clone(), "reply")),
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "thread_muted[reply-leg]");
+                }
+            }
         }
     }
     for uid in &mentioned_user_ids {
-        if uid != &me_id {
-            social::notify_note_event(pool, uid, &me_id, "mention", &id).await;
+        if uid == &me_id {
+            continue;
         }
+        match mk_db::note::thread_muted(pool, uid, &notify_thread_key).await {
+            Ok(false) => {
+                if !notify_queue.iter().any(|(u, _)| u == uid) {
+                    notify_queue.push((uid.clone(), "mention"));
+                }
+            }
+            Ok(true) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "thread_muted[mention-leg]");
+            }
+        }
+    }
+    for (notifiee, reason) in &notify_queue {
+        social::notify_note_event(pool, notifiee, &me_id, reason, &id).await;
     }
 
     let note = match pack_note_for(state, pool, &id, Some(&me_id)).await {
@@ -3380,6 +3434,16 @@ fn opt_id_param<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Respo
     }
 }
 
+/// Optional nullable string param (e.g. notes/mentions `visibility` —
+/// paramDef `{ type: 'string' }`, any value, null = unset).
+fn opt_str_param(body: &Value, key: &str) -> Result<Option<String>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_param(key, "expected a string")),
+    }
+}
+
 /// `POST /api/notifications` — requireCredential list + mark-as-read flow.
 /// Upstream order: fetch → `readAllNotification` when `markAsRead` (default
 /// true) → pack. Params: limit (1..=100, default 10), sinceId/untilId
@@ -3565,6 +3629,212 @@ async fn notifications_route(state: &AppState, body: &Value, token: Option<Strin
     }
 
     (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+// mute lane: notes/mentions + notes/thread-muting/{create,delete}
+// ---------------------------------------------------------------------------
+
+/// requireCredential chain copied from notifications_route (mentions.ts
+/// meta.requireCredential + ApiCallService call() order): no token →
+/// CREDENTIAL_REQUIRED (401), unresolvable → AUTHENTICATION_FAILED,
+/// suspended → YOUR_ACCOUNT_SUSPENDED (403).
+async fn mute_lane_me_id(
+    pool: &mk_db::sqlx::PgPool,
+    token: Option<&str>,
+) -> Result<String, Response> {
+    let Some(token) = token else {
+        return api_err(ApiError::new(
+            401,
+            mk_types::api_error::ApiErrorKind::Client,
+            "CREDENTIAL_REQUIRED",
+            "1384574d-a912-4b81-8601-c7b1c4085df1",
+            "Credential required.",
+        ));
+    };
+    if token.len() != 16 {
+        return authentication_failed();
+    }
+    let Some(me_id) = resolve_me(pool, Some(token)).await else {
+        return authentication_failed();
+    };
+    match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(Some(row)) => {
+            if row.is_suspended {
+                return api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_SUSPENDED",
+                    "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                    "Your account has been suspended.",
+                ));
+            }
+        }
+        Ok(None) => return authentication_failed(),
+        Err(e) => {
+            tracing::error!(target: "dbg_mentions", error = %e, "find_user_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    }
+    Ok(me_id)
+}
+
+/// `POST /api/notes/mentions` (endpoints/notes/mentions.ts, requireCredential
+/// read:account): self-addressed notes — `me <@ mentions ∨ me <@
+/// visibleUserIds` — one aid page (sinceId-only → ASC, else DESC), each row
+/// through visibility + base-filtering (muted/blocked author — the gate the
+/// Mute e2e 「自分宛ての投稿」 leg reads) + the muted-note-THREAD gates
+/// (QueryService.generateMutedNoteThreadQuery, which the thread-mute e2e
+/// notes/mentions leg reads). Params: limit (1..=100, default 10),
+/// sinceId/untilId (exclusive), visibility (exact match). Upstream's
+/// `following` (followings join) and sinceDate/untilDate remain TODO(M2+).
+async fn notes_mentions(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match mute_lane_me_id(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+
+    let (limit, since_id, until_id, visibility) = {
+        let limit = opt_int_param(body, "limit").map(|v| v.unwrap_or(10).clamp(1, 100));
+        let since_id = opt_id_param(body, "sinceId").map(|v| v.map(String::from));
+        let until_id = opt_id_param(body, "untilId").map(|v| v.map(String::from));
+        // paramDef: plain `{ type: 'string' }` — any string, null = unset.
+        let visibility = opt_str_param(body, "visibility");
+        match (limit, since_id, until_id, visibility) {
+            (Ok(l), Ok(s), Ok(u), Ok(v)) => (l, s, u, v),
+            (Err(r), _, _, _) | (_, Err(r), _, _) | (_, _, Err(r), _) | (_, _, _, Err(r)) => {
+                return r;
+            }
+        }
+    };
+
+    let rows = match mk_db::timelines::mentions_notes(
+        pool,
+        &me_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+        visibility.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_mentions", error = %e, "mentions_notes");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    // packMany(mentions, me) — the me-aware detail pack (poll isVoted /
+    // myReaction ride the viewer).
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match pack_note_for(state, pool, &row.id, Some(&me_id)).await {
+            Ok(v) => out.push(v),
+            Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `POST /api/notes/thread-muting/{create,delete}`
+/// (endpoints/notes/thread-muting/, requireCredential write:account).
+/// create: getNote (invisible/un existing → NO_SUCH_NOTE), existing mute →
+/// ALREADY_MUTING, insert `{ id: gen(), threadId: note.threadId ?? note.id,
+/// userId }` → void (204). delete: getNote then delete by
+/// (threadId, userId) — no NOT_MUTING check in this pinned tree → 204.
+async fn notes_thread_muting(
+    state: &AppState,
+    name: &str,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match mute_lane_me_id(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(note_id) = body.get("noteId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "noteId",
+            "reason": "required",
+        })));
+    };
+    // GetterService.getNote: missing (or invisible-to-me — the helper mirrors
+    // NoteEntityService.isVisibleForMe) → NO_SUCH_NOTE.
+    let note = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "NO_SUCH_NOTE",
+                "5ff67ada-ed3b-2e71-8e87-a1a421e177d2",
+                "No such note.",
+            ));
+        }
+        Err(e) => {
+            tracing::error!(target: "dbg_mentions", error = %e, "find_note_by_id");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    if !matches!(note_is_visible_for_me(pool, &note, &me_id).await, Ok(true)) {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_NOTE",
+            "5ff67ada-ed3b-2e71-8e87-a1a421e177d2",
+            "No such note.",
+        ));
+    }
+    // mute key = `note.threadId ?? note.id` (create.ts L46/L49: fetched via
+    // the thread_key scalar — NoteRow does not carry the column).
+    let thread_id = match mk_db::note::thread_key(pool, &note.id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => note.id.clone(),
+        Err(e) => {
+            tracing::error!(target: "dbg_mentions", error = %e, "thread_key");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    if name == "notes/thread-muting/create" {
+        match mk_db::note::thread_muted(pool, &me_id, &thread_id).await {
+            Ok(true) => {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "ALREADY_MUTING",
+                    "c146e22d-1141-4b31-b28d-176371014d18",
+                    "You are already muting that thread.",
+                ));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_mentions", error = %e, "thread_muted");
+                return api_err(ApiError::internal_error());
+            }
+        }
+        if let Err(e) = mk_db::note::insert_thread_muting(
+            pool,
+            &mk_types::id::gen_aid_now(),
+            &me_id,
+            &thread_id,
+        )
+        .await
+        {
+            tracing::error!(target: "dbg_mentions", error = %e, "insert_thread_muting");
+            return api_err(ApiError::internal_error());
+        }
+    } else if let Err(e) = mk_db::note::delete_thread_muting(pool, &me_id, &thread_id).await {
+        tracing::error!(target: "dbg_mentions", error = %e, "delete_thread_muting");
+        return api_err(ApiError::internal_error());
+    }
+    (StatusCode::NO_CONTENT).into_response()
 }
 
 #[cfg(test)]
