@@ -1,0 +1,49 @@
+name: e2e-rustregs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rust-regs:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: misskey_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build test targets
+        run: cargo build --workspace --all-targets
+      - name: Run the six failing rust tests isolated
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
+        run: |
+          cargo test --workspace -- --test-threads=1 --nocapture \
+            api::tests::apivis_show_pack_hide_lanes \
+            api::tests::arena_streaming_channel_routing_matrix \
+            api::tests::arena_streaming_main_events_and_app_token \
+            api::tests::arena_streaming_userlist_mute_lanes \
+            api::tests::ff_visibility_list_gates_and_ap_collections \
+            api::tests::social_follow_flow \
+            || echo "::warning::regs reproduction run done (see report)"
