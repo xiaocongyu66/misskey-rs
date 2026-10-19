@@ -1783,4 +1783,42 @@ mod tests {
         // mismatched ext is appended, not replaced
         assert_eq!(correct_filename("notes.txt", Some("png")), "notes.txt.png");
     }
+
+    // unit-misc: upstream test/unit/misc/correct-filename.ts, 1:1 (all 13
+    // describe cases).
+    #[test]
+    fn upstream_correct_filename_cases() {
+        // 'no ext to null'
+        assert_eq!(correct_filename("test", None), "test.unknown");
+        // 'no ext to jpg'
+        assert_eq!(correct_filename("test", Some("jpg")), "test.jpg");
+        // 'jpg to webp'
+        assert_eq!(correct_filename("test.jpg", Some("webp")), "test.jpg.webp");
+        // 'jpg to .webp'
+        assert_eq!(correct_filename("test.jpg", Some(".webp")), "test.jpg.webp");
+        // 'jpeg to jpg'
+        assert_eq!(correct_filename("test.jpeg", Some("jpg")), "test.jpeg");
+        // 'JPEG to jpg'
+        assert_eq!(correct_filename("test.JPEG", Some("jpg")), "test.JPEG");
+        // 'jpg to jpg'
+        assert_eq!(correct_filename("test.jpg", Some("jpg")), "test.jpg");
+        // 'JPG to jpg'
+        assert_eq!(correct_filename("test.JPG", Some("jpg")), "test.JPG");
+        // 'tiff to tif'
+        assert_eq!(correct_filename("test.tiff", Some("tif")), "test.tiff");
+        // 'skip gz'
+        assert_eq!(
+            correct_filename("test.unitypackage", Some("gz")),
+            "test.unitypackage"
+        );
+        // 'skip text file'
+        assert_eq!(correct_filename("test.txt", None), "test.txt");
+        // 'unknown'
+        assert_eq!(correct_filename("test.hoge", None), "test.hoge");
+        // 'non ascii with space'
+        assert_eq!(
+            correct_filename("ファイル 名前", Some("jpg")),
+            "ファイル 名前.jpg"
+        );
+    }
 }
