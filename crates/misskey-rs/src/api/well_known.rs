@@ -361,6 +361,15 @@ fn nodeinfo_links(origin: &str) -> Value {
 pub(crate) async fn well_known_dispatch(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    // owned extracts BEFORE any await: `&Request` across an await makes the
+    // future non-Send (axum::body::Body is not Sync) and the Handler bound —
+    // E0277 on CI 39208798436 / 39210555086 — never resolves.
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let resource = extract_resource(&req);
 
     // fastify.options(allPath) → 204 (hook headers ride along).
     if method == Method::OPTIONS {
@@ -376,7 +385,7 @@ pub(crate) async fn well_known_dispatch(State(state): State<AppState>, req: Requ
         "/.well-known/host-meta.json" => host_meta_json(&state).await,
         "/.well-known/nodeinfo" => nodeinfo_index(&state).await,
         "/.well-known/oauth-authorization-server" => oauth_authorization_server(&state).await,
-        "/.well-known/webfinger" => webfinger(&state, &req).await,
+        "/.well-known/webfinger" => webfinger(state, resource, accept).await,
         // WellKnownServerService change-password redirect (302 → /settings/security)
         "/.well-known/change-password" => {
             let mut res = Response::builder()
@@ -542,11 +551,11 @@ fn acct_parse(acct: &str) -> (String, Option<String>) {
     (username, host)
 }
 
-async fn webfinger(state: &AppState, req: &Request) -> Response {
+async fn webfinger(state: &AppState, resource: Option<String>, accept: Option<String>) -> Response {
     if let Some(res) = federation_gate(state).await {
         return res;
     }
-    let Some(resource) = extract_resource(req) else {
+    let Some(resource) = resource else {
         // `typeof request.query.resource !== 'string'` → 400
         return wk_status(StatusCode::BAD_REQUEST);
     };
@@ -594,12 +603,7 @@ async fn webfinger(state: &AppState, req: &Request) -> Response {
     let subscribe = format!("{origin}/authorize-follow?acct={{uri}}");
 
     // vary(reply.raw, 'Accept') + Cache-Control (hook ACEH header exposes it)
-    let wants_xrd = prefers_xrd(
-        req.headers()
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let wants_xrd = prefers_xrd(accept.as_deref().unwrap_or(""));
 
     if wants_xrd {
         let body = xrd(&[
