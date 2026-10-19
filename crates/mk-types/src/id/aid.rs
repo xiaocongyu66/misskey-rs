@@ -150,6 +150,27 @@ mod tests {
         assert_eq!(parse_aid_date(&id).unwrap(), t);
     }
 
+    // unit-misc: upstream test/unit/misc/id.ts 'aid' case, 1:1 — genAid at a
+    // caller-supplied timestamp must satisfy aidRegExp (^[0-9a-z]{10}$) and
+    // parse back to the exact ms. The remaining id.ts cases (aidx, meid,
+    // meidg, objectid, ulid) are upstream-only: this tree ports the aid
+    // scheme alone.
+    #[test]
+    fn upstream_id_aid_case() {
+        let date = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let got_aid = gen_aid(date);
+        assert_eq!(got_aid.len(), 10);
+        assert!(
+            got_aid
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9'|b'a'..=b'z'))
+        );
+        assert_eq!(parse_aid_date(&got_aid).unwrap(), date);
+    }
+
     #[test]
     fn base36_padding() {
         assert_eq!(to_base36_padded(0, 8), "00000000");
