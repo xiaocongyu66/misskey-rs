@@ -670,7 +670,7 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
                 "Cannot upload the file because it is an unallowed file type.",
             ));
         }
-        if 1024 * 1024 * policies.max_file_size_mb < file.1.data.len() as i64 {
+        if ((1024.0 * 1024.0 * policies.max_file_size_mb) as i64) < file.1.data.len() as i64 {
             return api_err(ApiError::new(
                 413,
                 mk_types::api_error::ApiErrorKind::Client,

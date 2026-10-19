@@ -1398,6 +1398,28 @@ pub(crate) async fn notes_reactions_create(
             {
                 tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
             }
+            // isDuplicateKeyValueError arm (ReactionService.create L176-196):
+            // the new reaction is INSERTED after the delete — the duplicate
+            // path REPLACES, it is not a bare toggle-off (the map must show
+            // the new emoji).
+            if let Err(e) = mk_db::note::insert_note_reaction(
+                pool,
+                &mk_types::id::gen_aid_now(),
+                me_id,
+                note_id,
+                &reaction,
+            )
+            .await
+            {
+                tracing::error!(target: "dbg_notes", error = %e, "replace insert_note_reaction");
+                return crate::api::api_err(crate::api::ApiError::internal_error());
+            }
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, &reaction, 1).await {
+                tracing::error!(target: "dbg_notes", error = %e, "replace bump_reactions_map");
+            }
+            if let Some(note) = &note_row {
+                notify_note_event(pool, &note.user_id, me_id, "reaction", note_id).await;
+            }
         }
         Ok(None) => {
             if let Err(e) = mk_db::note::insert_note_reaction(

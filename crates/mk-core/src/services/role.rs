@@ -89,7 +89,7 @@ pub struct UserPolicy {
     #[serde(rename = "driveCapacityMb")]
     pub drive_capacity_mb: i64,
     #[serde(rename = "maxFileSizeMb")]
-    pub max_file_size_mb: i64,
+    pub max_file_size_mb: f64,
     #[serde(rename = "uploadableFileTypes")]
     pub uploadable_file_types: Vec<String>,
     #[serde(rename = "pinLimit")]
@@ -114,7 +114,7 @@ impl UserPolicy {
             chat_availability: ChatAvailability::Available,
             mention_limit: 20,
             drive_capacity_mb: 100,
-            max_file_size_mb: 30,
+            max_file_size_mb: 30.0,
             uploadable_file_types: vec!["*/*".to_string()],
             pin_limit: 5,
             antenna_limit: 5,
@@ -147,7 +147,7 @@ impl UserPolicy {
         if let Some(v) = obj.get("driveCapacityMb").and_then(|v| v.as_i64()) {
             base.drive_capacity_mb = v;
         }
-        if let Some(v) = obj.get("maxFileSizeMb").and_then(|v| v.as_i64()) {
+        if let Some(v) = obj.get("maxFileSizeMb").and_then(|v| v.as_f64()) {
             base.max_file_size_mb = v;
         }
         if let Some(arr) = obj.get("uploadableFileTypes").and_then(|v| v.as_array()) {
@@ -191,7 +191,7 @@ impl UserPolicy {
             chat_availability: merge_chat(assigned, base.chat_availability, "chatAvailability"),
             mention_limit: merge_max(assigned, base.mention_limit, "mentionLimit"),
             drive_capacity_mb: merge_max(assigned, base.drive_capacity_mb, "driveCapacityMb"),
-            max_file_size_mb: merge_max(assigned, base.max_file_size_mb, "maxFileSizeMb"),
+            max_file_size_mb: merge_f64(assigned, base.max_file_size_mb, "maxFileSizeMb"),
             pin_limit: merge_max(assigned, base.pin_limit, "pinLimit"),
             antenna_limit: merge_max(assigned, base.antenna_limit, "antennaLimit"),
             word_mute_limit: merge_max(assigned, base.word_mute_limit, "wordMuteLimit"),
@@ -293,6 +293,17 @@ fn merge_types(assigned: &[AssignedRole], base: &[String], key: &str) -> Vec<Str
         }
     }
     out
+}
+
+fn merge_f64(assigned: &[AssignedRole], base_val: f64, key: &str) -> f64 {
+    if assigned.is_empty() {
+        return base_val;
+    }
+    let base_json = serde_json::json!(base_val);
+    tier(assigned, key)
+        .iter()
+        .map(|e| entry_value(e, &base_json).as_f64().unwrap_or(base_val))
+        .fold(base_val, f64::max)
 }
 
 fn merge_any_true(assigned: &[AssignedRole], base_val: bool, key: &str) -> bool {

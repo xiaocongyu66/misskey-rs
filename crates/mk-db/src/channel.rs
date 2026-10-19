@@ -194,22 +194,24 @@ pub async fn search_channels(
         .replace('%', "\\%")
         .replace('_', "\\_");
     let pat = format!("%{escaped}%");
-    // empty patterns keep $4 BOUND (a dangling placeholder with a
-    // positional bind count mismatch 500s the statement)
+    // placeholders are DENSE $1..$4 (bind order: until, since, pattern,
+    // limit) — sqlx-postgres fills parameters positionally, so gapped
+    // numbers ($2..$5 with 4 binds) shifted the ILIKE slot onto the limit
+    // (varchar ~~* bigint) and starved the empty-query statement entirely.
     let clause = if query.is_empty() {
-        " AND ($4::varchar IS DISTINCT FROM NULL)".to_string()
+        " AND $3::varchar IS NOT NULL".to_string()
     } else if name_only {
-        r#" AND "name" ILIKE $4"#.to_string()
+        r#" AND "name" ILIKE $3"#.to_string()
     } else {
-        r#" AND ("name" ILIKE $4 OR "description" ILIKE $4)"#.to_string()
+        r#" AND ("name" ILIKE $3 OR "description" ILIKE $3)"#.to_string()
     };
     let dir = if since_id.is_some() { "ASC" } else { "DESC" };
     sqlx::query_as::<_, ChannelRow>(&format!(
         r#"SELECT {CHANNEL_COLS} FROM "channel"
            WHERE "isArchived" = FALSE{clause}
-             AND ($2::varchar IS NULL OR "id" < $2)
-             AND ($3::varchar IS NULL OR "id" > $3)
-           ORDER BY "id" {dir} LIMIT $5"#
+             AND ($1::varchar IS NULL OR "id" < $1)
+             AND ($2::varchar IS NULL OR "id" > $2)
+           ORDER BY "id" {dir} LIMIT $4"#
     ))
     .bind(until_id)
     .bind(since_id)
