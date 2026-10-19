@@ -11,6 +11,16 @@
 //! admin/update-meta (timelines.ts L104) between the true/false legs; when
 //! it is off, NO key may exist (`exists == 0`, L951).
 //!
+//! Key namespace: upstream's redis clients are built from the SAME resolved
+//! options the test uses (GlobalModule `new Redis(config.redisForTimelines)`)
+//! and convertRedisOptions (config.ts L372-380) sets
+//! `keyPrefix: '${options.prefix ?? host}:'` — host = `new URL(url).host`
+//! (port kept). ioredis prepends keyPrefix to every key on read/write
+//! commands, so `list:homeTimeline:${uid}` physically lands as
+//! `127.0.0.1:3000:list:homeTimeline:${uid}` — and the pinned e2e probes
+//! `redisForTimelines.exists/lrange` through that same prefix. We therefore
+//! derive the identical prefix from config.url and store the full name.
+//!
 //! Pushed: `list:homeTimeline:${followerId}` for local, non-hibernated
 //! followers (with the isReply/withReplies gate and the specified-visibility
 //! gate), `list:homeTimeline:${authorId}` for local authors, and the
@@ -192,6 +202,9 @@ pub(crate) async fn push_to_tl(
         tracing::warn!(target: "dbg_ftt", "fanout: config.redis missing, cannot push");
         return;
     };
+    // ioredis keyPrefix parity: `${new URL(config.url).host}:` (ftt.rs module
+    // doc — convertRedisOptions, config.ts L378). Every key below rides it.
+    let prefix = format!("{}:", state.config.host());
 
     let mut pushes: Vec<(String, String)> = Vec::new();
     if let Some(cid) = channel_id {
@@ -206,10 +219,13 @@ pub(crate) async fn push_to_tl(
         .await
         .unwrap_or_default();
         for follower in followers {
-            pushes.push((format!("list:homeTimeline:{follower}"), note_id.to_string()));
+            pushes.push((
+                format!("{prefix}list:homeTimeline:{follower}"),
+                note_id.to_string(),
+            ));
             if file_count > 0 {
                 pushes.push((
-                    format!("list:homeTimelineWithFiles:{follower}"),
+                    format!("{prefix}list:homeTimelineWithFiles:{follower}"),
                     note_id.to_string(),
                 ));
             }
@@ -240,10 +256,13 @@ pub(crate) async fn push_to_tl(
                     continue;
                 }
             }
-            pushes.push((format!("list:homeTimeline:{follower}"), note_id.to_string()));
+            pushes.push((
+                format!("{prefix}list:homeTimeline:{follower}"),
+                note_id.to_string(),
+            ));
             if file_count > 0 {
                 pushes.push((
-                    format!("list:homeTimelineWithFiles:{follower}"),
+                    format!("{prefix}list:homeTimelineWithFiles:{follower}"),
                     note_id.to_string(),
                 ));
             }
@@ -256,12 +275,12 @@ pub(crate) async fn push_to_tl(
         {
             tracing::info!(target: "dbg_ftt", author_id, author_host = ?author_host, visibility, visible = visible_user_ids.len(), "self HTL push leg");
             pushes.push((
-                format!("list:homeTimeline:{author_id}"),
+                format!("{prefix}list:homeTimeline:{author_id}"),
                 note_id.to_string(),
             ));
             if file_count > 0 {
                 pushes.push((
-                    format!("list:homeTimelineWithFiles:{author_id}"),
+                    format!("{prefix}list:homeTimelineWithFiles:{author_id}"),
                     note_id.to_string(),
                 ));
             }

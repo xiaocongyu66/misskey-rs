@@ -7015,14 +7015,20 @@ async fn ftt2_redis_home_timeline_push_shape() {
     let pool = fresh_pool("mkftt2r").await;
 
     let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let cfg = crate::config::Config {
+        port: 0,
+        url: "http://127.0.0.1:3000".to_string(),
+        db: None,
+        redis: Some(redis_cfg.clone()),
+        test: true,
+    };
+    // The e2e probes ride ioredis `keyPrefix: '<url.host>:'` (config.ts
+    // convertRedisOptions L378 — see ftt.rs module doc), so the probes must
+    // spell the physical key exactly as `redisForTimelines.*` does.
+    let prefix = format!("{}:", cfg.host());
+    let hkey = |uid: &str| format!("{prefix}list:homeTimeline:{uid}");
     let app = crate::build_router(crate::AppState {
-        config: crate::config::Config {
-            port: 0,
-            url: "http://127.0.0.1:3000".to_string(),
-            db: None,
-            redis: Some(redis_cfg.clone()),
-            test: true,
-        },
+        config: cfg,
         pool: Some(pool.clone()),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
     });
@@ -7063,12 +7069,8 @@ async fn ftt2_redis_home_timeline_push_shape() {
     assert_eq!(s, StatusCode::OK, "body: {v}");
     let note = v["createdNote"]["id"].as_str().unwrap().to_string();
 
-    let bob_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{b_id}"))
-        .await
-        .unwrap();
-    let alice_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{a_id}"))
-        .await
-        .unwrap();
+    let bob_list = ftt::debug_lrange(&redis_cfg, &hkey(&b_id)).await.unwrap();
+    let alice_list = ftt::debug_lrange(&redis_cfg, &hkey(&a_id)).await.unwrap();
     assert!(
         bob_list.iter().any(|n| n == &note) && alice_list.iter().any(|n| n == &note),
         "FTT: ローカルユーザーの HTL にはプッシュされる — note={note} bob={bob_list:?} alice={alice_list:?}"
@@ -7092,12 +7094,129 @@ async fn ftt2_redis_home_timeline_push_shape() {
     assert_eq!(s, StatusCode::OK, "body: {v}");
     let gated_note = v["createdNote"]["id"].as_str().unwrap().to_string();
     let c_id = carol["id"].as_str().unwrap().to_string();
-    let carol_list = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{c_id}"))
-        .await
-        .unwrap();
+    let carol_list = ftt::debug_lrange(&redis_cfg, &hkey(&c_id)).await.unwrap();
     assert!(
         !carol_list.iter().any(|n| n == &gated_note),
         "fanout:false arm must not push (exists == 0): {carol_list:?}"
+    );
+
+    let _ = pool;
+}
+
+// ===== ftt3: timeline KEY NAMESPACE parity with the e2e ioredis probe ======
+//
+// The last census failure (`FTT: ローカルユーザーの HTL にはプッシュされる`,
+// timelines.ts L933-958) was NOT the push pipeline — the wire log showed the
+// follower LPUSH replying :1 — it was the KEY NAME. Upstream builds every
+// redis client from convertRedisOptions (config.ts L372-380):
+// `keyPrefix: '${options.prefix ?? host}':` with host = new URL(url).host,
+// and BOTH the server (GlobalModule `new Redis(config.redisForTimelines)`)
+// and the pinned test (`new Redis(loadConfig().redisForTimelines)`) ride the
+// same prefix. ioredis prepends it on every read/write command, so the test's
+// `exists('list:homeTimeline:${bob.id}')` physically asks for
+// `127.0.0.1:3000:list:homeTimeline:${bob.id}`. This probe replicates the
+// e2e sequence over the HTTP surface and reads through the identical
+// keyPrefix (plus a negative on the raw name — an unprefixed key is
+// unreachable for the e2e client and must not exist).
+
+#[tokio::test]
+async fn ftt3_e2e_keyprefix_parity_probe() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    let redis_cfg = crate::config::RedisConfig {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        pass: None,
+    };
+    if tokio::net::TcpStream::connect(("127.0.0.1", 6379))
+        .await
+        .is_err()
+    {
+        return; // no redis service — CI always provisions one
+    }
+    init_tracing();
+    let pool = fresh_pool("mkftt3r").await;
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let cfg = crate::config::Config {
+        port: 0,
+        url: "http://127.0.0.1:3000".to_string(),
+        db: None,
+        redis: Some(redis_cfg.clone()),
+        test: true,
+    };
+    // same ioredis keyPrefix shape as ftt2 — the exact name the pinned e2e
+    // `redisForTimelines.exists/lrange` computes for the followee's HTL.
+    let prefix = format!("{}:", cfg.host());
+    let hkey = |uid: &str| format!("{prefix}list:homeTimeline:{uid}");
+    let app = crate::build_router(crate::AppState {
+        config: cfg,
+        pool: Some(pool.clone()),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+    });
+
+    // first signup = root (SignupService L160) — update-meta is requireAdmin
+    let root = signup(&app, &uname("f3r")).await;
+
+    // timelines.ts L935: alice/bob/carol signup() then bob follows alice
+    let alice = signup(&app, &uname("f3a")).await;
+    let bob = signup(&app, &uname("f3b")).await;
+    let at = alice["token"].as_str().unwrap();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+    let b_id = bob["id"].as_str().unwrap().to_string();
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": bob["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // describe.each true arm (timelines.ts L104) — then the three posts
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "i": root["token"].as_str().unwrap(), "enableFanoutTimeline": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "I'm Alice.", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let alice_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "I'm Bob.", "i": bob["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // L944/L946-948 through the ioredis nameshaping: exists == 1 and both
+    // notes present (order [bobNote, aliceNote] — LPUSH prepends per note).
+    let bob_htl = ftt::debug_lrange(&redis_cfg, &hkey(&b_id)).await.unwrap();
+    assert_eq!(
+        bob_htl,
+        vec![bob_note.clone(), alice_note.clone()],
+        "FTT: ローカルユーザーの HTL にはプッシュされる — prefixed bob key"
+    );
+
+    // the raw name is INVISIBLE to the prefixed client and must not exist
+    let raw = ftt::debug_lrange(&redis_cfg, &format!("list:homeTimeline:{b_id}"))
+        .await
+        .unwrap();
+    assert!(
+        raw.is_empty(),
+        "unprefixed key leaked — e2e client could never read it: {raw:?}"
     );
 
     let _ = pool;
