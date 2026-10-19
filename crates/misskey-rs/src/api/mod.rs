@@ -151,6 +151,8 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "i/notifications-grouped"
         // mute lane: notes/mentions (endpoints/notes/mentions.ts) +
         // notes/thread-muting/{create,delete} (endpoints/notes/thread-muting/)
+        // notes/replies (endpoints/notes/replies.ts, requireCredential)
+        || name == "notes/replies"
         || name == "notes/mentions"
         || name == "notes/thread-muting/create"
         || name == "notes/thread-muting/delete"
@@ -227,6 +229,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             return notifications_route(&state, &body, token).await;
         }
         // mute lane: notes/mentions + the thread-muting pair
+        if name == "notes/replies" {
+            return notes_replies(&state, &body, token).await;
+        }
         if name == "notes/mentions" {
             return notes_mentions(&state, &body, token).await;
         }
@@ -3847,6 +3852,66 @@ async fn notes_mentions(state: &AppState, body: &Value, token: Option<String>) -
     // myReaction ride the viewer).
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
+        match pack_note_for(state, pool, &row.id, Some(&me_id)).await {
+            Ok(v) => out.push(v),
+            Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `POST /api/notes/replies` (endpoints/notes/replies.ts, requireCredential)
+/// — the target note's direct replies (findReplies id-paging), each
+/// visibility-filtered for the viewer before the me-aware pack (the
+/// endpoints.ts visibility leg expects 200 + [] for an invisible reply).
+async fn notes_replies(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match mute_lane_me_id(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(reply_id) = body.get("noteId").and_then(|v| v.as_str()) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "noteId",
+            "reason": "required",
+        })));
+    };
+    let (limit, since_id, until_id) = {
+        let limit = opt_int_param(body, "limit").map(|v| v.unwrap_or(10).clamp(1, 100));
+        let since = opt_id_param(body, "sinceId").map(|v| v.map(String::from));
+        let until = opt_id_param(body, "untilId").map(|v| v.map(String::from));
+        match (limit, since, until) {
+            (Ok(l), Ok(s), Ok(u)) => (l, s, u),
+            (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => return r,
+        }
+    };
+    let rows = match mk_db::note::find_replies(
+        pool,
+        reply_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_replies", error = %e, "find_replies");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match note_is_visible_for_me(pool, row, Some(&me_id)).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::error!(target: "dbg_replies", error = %e, "visible");
+                return api_err(ApiError::internal_error());
+            }
+        }
         match pack_note_for(state, pool, &row.id, Some(&me_id)).await {
             Ok(v) => out.push(v),
             Err(r) => return *r,
