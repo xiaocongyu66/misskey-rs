@@ -156,6 +156,19 @@ mod tests {
         crate::run_migrations(&pool).await.unwrap();
         let a = "aaaa".to_owned();
         let b = "bbbb".to_owned();
+        // fresh_db starts from bare migrations: the following rows join onto
+        // "user" (FK_24e0042143a18157b234df186c3 followeeId → user.id, plus
+        // the matching followerId FK), so seed both endpoints first — same
+        // (id, username, usernameLower) shape the sibling suites use.
+        for u in [&a, &b] {
+            sqlx::query(
+                r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $1, $1)"#,
+            )
+            .bind(u)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         edge(&pool, &b, &a, "0000000001").await; // bob follows alice
         edge(&pool, &a, &b, "0000000002").await; // alice follows bob
 
