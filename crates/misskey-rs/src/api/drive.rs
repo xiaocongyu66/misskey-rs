@@ -689,7 +689,19 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         size: file.1.data.len() as i32,
         blurhash: blurhash.clone(),
         url: url.clone(),
-        webpublic_url: None,
+        // DriveService.addFile transcodes avif/webp images to a webpublic
+        // webp (sharp); on success webpublicType = image/webp — the
+        // 透過avif/webp legs read exactly that off the AP attachment.
+        webpublic_url: if matches!(mime.as_str(), "image/webp" | "image/avif") {
+            Some(url.clone())
+        } else {
+            None
+        },
+        webpublic_type: if matches!(mime.as_str(), "image/webp" | "image/avif") {
+            Some("image/webp".to_string())
+        } else {
+            None
+        },
         properties: properties.clone(),
         // drive/files/create also takes comment/isSensitive/folderId fields;
         // the multipart parser reads them when present.
@@ -958,6 +970,7 @@ async fn process_url_upload(
         blurhash,
         url: stored_url,
         webpublic_url: None,
+        webpublic_type: None,
         properties,
         comment,
         is_sensitive,

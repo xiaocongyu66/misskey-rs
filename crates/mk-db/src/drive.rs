@@ -115,6 +115,8 @@ pub struct DriveFileRow {
     pub url: String,
     #[sqlx(rename = "webpublicUrl")]
     pub webpublic_url: Option<String>,
+    #[sqlx(rename = "webpublicType")]
+    pub webpublic_type: Option<String>,
     pub properties: serde_json::Value,
     /// upload-from-url / files/create `comment` param (max 512).
     pub comment: Option<String>,
@@ -137,10 +139,11 @@ pub async fn insert_drive_file(
         INSERT INTO "drive_file"
             ("id", "userId", "userHost", "md5", "name", "type", "size", "comment",
              "properties", "storedInternal", "url", "thumbnailUrl", "webpublicUrl",
+             "webpublicType",
              "accessKey", "isSensitive", "isLink", "blurhash", "maybeSensitive", "maybePorn",
              "folderId")
         VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8::jsonb, FALSE, $9, NULL, NULL,
-                $10, $11, FALSE, $12, FALSE, FALSE, $13)
+                $10, $11, FALSE, $12, FALSE, FALSE, $13, $14)
         "#,
     )
     .bind(&row.id)
@@ -156,6 +159,7 @@ pub async fn insert_drive_file(
     .bind(row.is_sensitive)
     .bind(&row.blurhash)
     .bind(&row.folder_id)
+    .bind(&row.webpublic_type)
     .execute(pool)
     .await?;
     Ok(())
@@ -164,7 +168,8 @@ pub async fn insert_drive_file(
 pub async fn find_drive_file(pool: &PgPool, id: &str) -> Result<Option<DriveFileRow>, sqlx::Error> {
     sqlx::query_as::<_, DriveFileRow>(
         r#"SELECT "id", "userId", "md5", "name", ("type"::text) AS "type", "size",
-                  "blurhash", "url", "webpublicUrl", ("properties"::text)::jsonb AS "properties",
+                  "blurhash", "url", "webpublicUrl", "webpublicType",
+                  ("properties"::text)::jsonb AS "properties",
                   "comment", "isSensitive", "folderId"
            FROM "drive_file" WHERE "id" = $1"#,
     )
@@ -183,7 +188,7 @@ pub async fn files_owned_ordered(
 ) -> Result<Vec<DriveFileRow>, sqlx::Error> {
     sqlx::query_as::<_, DriveFileRow>(
         r#"SELECT f."id", f."userId", f."md5", f."name", ("f"."type"::text) AS "type", f."size",
-                  f."blurhash", f."url", f."webpublicUrl", ("f"."properties"::text)::jsonb AS "properties",
+                  f."blurhash", f."url", f."webpublicUrl", f."webpublicType", ("f"."properties"::text)::jsonb AS "properties",
                   f."comment", f."isSensitive", f."folderId"
            FROM "drive_file" f
            WHERE f."userId" = $1 AND f."id" = ANY($2::varchar[])

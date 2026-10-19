@@ -4106,7 +4106,7 @@ pub(crate) async fn ap_note(
             Ok(Some(f)) => {
                 attachment.push(json!({
                     "type": "Document",
-                    "mediaType": f.file_type,
+                    "mediaType": f.webpublic_type.as_deref().unwrap_or(&f.file_type),
                     "url": f.url,
                     "name": f.comment,
                 }));

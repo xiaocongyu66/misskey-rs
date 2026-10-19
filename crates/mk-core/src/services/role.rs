@@ -300,10 +300,14 @@ fn merge_f64(assigned: &[AssignedRole], base_val: f64, key: &str) -> f64 {
         return base_val;
     }
     let base_json = serde_json::json!(base_val);
+    // upstream calc(): `aggregate(policies.map(policy => policy.useDefault ?
+    // basePolicies[name] : policy.value))` — the fold covers exactly the
+    // tier's substituted values with NO base seed (Math.max(...vs)); a base
+    // seed would let DEFAULT_POLICIES 30 mask a fractional override.
     tier(assigned, key)
         .iter()
         .map(|e| entry_value(e, &base_json).as_f64().unwrap_or(base_val))
-        .fold(base_val, f64::max)
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 fn merge_any_true(assigned: &[AssignedRole], base_val: bool, key: &str) -> bool {
