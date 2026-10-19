@@ -9360,7 +9360,9 @@ async fn apivis_show_pack_hide_lanes() {
         json!({ "noteId": fol, "reaction": "👍", "i": f_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "follower reacts: {s}");
+    // reactions/create has no res body upstream → 204 (endpoints.ts shape),
+    // same as the port's handler; a plain 200 assert broke the serial census.
+    assert_eq!(s, StatusCode::NO_CONTENT, "follower reacts: {s}");
     let (s, v) = post_json(
         app.clone(),
         "/api/notes/reactions",
