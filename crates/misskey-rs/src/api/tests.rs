@@ -1679,8 +1679,11 @@ async fn social_follow_flow() {
     assert_eq!(body["notify"], json!("none"));
     assert_eq!(body["withReplies"], json!(true));
 
-    // persisted edge + counters (insertFollowingDoc + increments)
-    let (notify, with_replies): (String, bool) = mk_db::sqlx::query_as(
+    // persisted edge + counters (insertFollowingDoc + increments). The port
+    // persists the default notify as NULL (insert_following binds NULL;
+    // get_relation/pack map null → 'none'), so the row read must be nullable —
+    // a concrete String decode panics with UnexpectedNullError.
+    let (notify, with_replies): (Option<String>, bool) = mk_db::sqlx::query_as(
         r#"SELECT "notify", "withReplies" FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
     )
     .bind(a_id)
@@ -1688,7 +1691,7 @@ async fn social_follow_flow() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(notify, "none");
+    assert_eq!(notify.as_deref(), None);
     assert!(with_replies);
     assert_eq!(
         scalar_i64(
