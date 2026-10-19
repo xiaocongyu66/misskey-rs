@@ -1367,6 +1367,35 @@ fn opt_bool(body: &Value, key: &str) -> Result<Option<bool>, Response> {
     }
 }
 
+/// `FOLLOW_APPROVAL_MAX_SECONDS` (i/update.ts L139): `30 * 24 * 60 * 60` —
+/// the follow-approval param range ceiling.
+const FOLLOW_APPROVAL_MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+/// follow-approval param (`{ type: 'integer', nullable: true, minimum: 0,
+/// maximum: FOLLOW_APPROVAL_MAX_SECONDS }`): absent → skip, null → reset to
+/// NULL, non-integer (1.5) / out-of-range (-1, 2592001) → INVALID_PARAM 400
+/// (the follow-approval.ts 不正な期間 legs).
+fn opt_approval_seconds(body: &Value, key: &str) -> Result<Option<Option<i32>>, Response> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Number(n)) => {
+            let secs = match n.as_i64() {
+                Some(s) => s,
+                None => return Err(invalid_param(key, "must be integer")),
+            };
+            if !(0..=FOLLOW_APPROVAL_MAX_SECONDS).contains(&secs) {
+                return Err(invalid_param(
+                    key,
+                    &format!("must be >= 0 and <= {FOLLOW_APPROVAL_MAX_SECONDS}"),
+                ));
+            }
+            Ok(Some(Some(secs as i32)))
+        }
+        Some(_) => Err(invalid_param(key, "must be an integer or null")),
+    }
+}
+
 fn opt_enum(body: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, Response> {
     match body.get(key) {
         None => Ok(None),
@@ -1542,6 +1571,8 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         muted_instances,
         email_notification_types,
         notification_recieve_config,
+        follow_approval_local_seconds: opt_approval_seconds(body, "followApprovalLocalSeconds")?,
+        follow_approval_remote_seconds: opt_approval_seconds(body, "followApprovalRemoteSeconds")?,
     })
 }
 
@@ -1614,6 +1645,15 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
     if let Err(e) = mk_db::user::update_profile_subset(pool, &me_id, &update).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_profile_subset");
         return api_err(ApiError::internal_error());
+    }
+
+    // i/update.ts L556 (鍵垢を解除したとき、期間による承認条件も考慮してフォ
+    // ローリクエストを承認): locking OFF re-checks every pending request to
+    // me through shouldRequireFollowApproval against the UPDATED profile
+    // (the approval-window flip rides the same update) and
+    // autoAcceptFollowed; accepted legs follow, the still-pending ones stay.
+    if row.is_locked && update.is_locked == Some(false) {
+        social::accept_all_follow_requests(pool, &me_id).await;
     }
     if let Err(e) = mk_db::user::update_avatar_banner(pool, &me_id, avatar_op, banner_op).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_avatar_banner");

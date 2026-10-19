@@ -8193,7 +8193,10 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     // alice signs up FIRST → unset meta rootUserId makes her the moderator/admin
     let alice = signup(&app, &uname("ffva")).await;
     let bob = signup(&app, &uname("ffvb")).await;
-    let (a_id, a_token) = (alice["id"].as_str().unwrap(), alice["token"].as_str().unwrap());
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
     let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
 
     // ff-arena 1: both public → any viewer gets 200 arrays with Following
@@ -8249,7 +8252,11 @@ async fn ff_visibility_list_gates_and_ap_collections() {
         json!({ "userId": a_id, "i": a_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "owner sees the followers-visibility list");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "owner sees the followers-visibility list"
+    );
 
     // bob follows alice → the followers gate opens for him (and the pack
     // mirrors the edge + its follower user)
@@ -8286,7 +8293,11 @@ async fn ff_visibility_list_gates_and_ap_collections() {
         json!({ "userId": a_id, "i": b_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "private locks followers out: {v}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "private locks followers out: {v}"
+    );
     assert_eq!(v["error"]["code"], json!("FORBIDDEN"));
     let (s, _) = post_json(
         app.clone(),
@@ -8300,10 +8311,7 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     // admin/update-meta {federation:'all'} (alice is root) + public
     // visibility → 200 OrderedCollection with the activity+json content type;
     // flipping visibility to private → 403 again
-    async fn ap_get(
-        app: axum::Router,
-        path: String,
-    ) -> (StatusCode, Option<String>, Value) {
+    async fn ap_get(app: axum::Router, path: String) -> (StatusCode, Option<String>, Value) {
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -8332,11 +8340,7 @@ async fn ff_visibility_list_gates_and_ap_collections() {
         (status, ct, v)
     }
 
-    let (s, _, v) = ap_get(
-        app.clone(),
-        format!("/users/{a_id}/followers"),
-    )
-    .await;
+    let (s, _, v) = ap_get(app.clone(), format!("/users/{a_id}/followers")).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "federation none: {v}");
     let (s, v) = post_json(
         app.clone(),
@@ -8345,11 +8349,7 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "federation 'all' patch: {v}");
-    let (s, ct, v) = ap_get(
-        app.clone(),
-        format!("/users/{a_id}/followers"),
-    )
-    .await;
+    let (s, ct, v) = ap_get(app.clone(), format!("/users/{a_id}/followers")).await;
     assert_eq!(s, StatusCode::OK, "public AP collection: {v}");
     assert!(
         ct.as_deref()
@@ -8359,11 +8359,7 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     );
     assert_eq!(v["type"], json!("OrderedCollection"));
     assert_eq!(v["totalItems"], json!(1), "bob follows alice: {v}");
-    let (s, _, _) = ap_get(
-        app.clone(),
-        format!("/users/{a_id}/following"),
-    )
-    .await;
+    let (s, _, _) = ap_get(app.clone(), format!("/users/{a_id}/following")).await;
     assert_eq!(s, StatusCode::OK, "AP following public");
     let (s, v) = post_json(
         app.clone(),
@@ -8372,12 +8368,309 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
-    let (s, _, _) = ap_get(
-        app.clone(),
-        format!("/users/{a_id}/following"),
-    )
-    .await;
+    let (s, _, _) = ap_get(app.clone(), format!("/users/{a_id}/following")).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "private AP collection must 403");
 
     let _ = (b_id, pool);
+}
+
+// ===== approval-arena: follow-approval windows (follow-approval.ts) =========
+//
+// followApprovalLocalSeconds/RemoteSeconds are Me-detailed profile settings
+// (i/update.ts paramDef: nullable integer 0..=FOLLOW_APPROVAL_MAX_SECONDS
+// 2592000) that hold a fresh local follower's following/create as a pending
+// request (shouldRequireFollowApproval); flipping isLocked false in i/update
+// re-adjudicates every pending request against the UPDATED settings
+// (UserFollowingService.acceptAllFollowRequests L619) — expired-window and
+// null/0 flips accept, the not-yet-expired ones stay pending unless
+// autoAcceptFollowed covers them.
+
+#[tokio::test]
+async fn approval_arena_i_update_seconds_roundtrip_validation_and_privacy() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapprovset").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("apa")).await;
+    let a_token = alice["token"].as_str().unwrap();
+    let a_id = alice["id"].as_str().unwrap();
+
+    // 初期値は null (follow-approval.ts test 1, first assert)
+    let (s, v) = post_json(app.clone(), "/api/i", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["followApprovalLocalSeconds"], json!(null), "body: {v}");
+    assert_eq!(v["followApprovalRemoteSeconds"], json!(null), "body: {v}");
+
+    // update both, then reset local → remote preserved, response carries both
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "followApprovalLocalSeconds": 43200, "followApprovalRemoteSeconds": 86400, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["followApprovalLocalSeconds"], json!(43200), "body: {v}");
+    assert_eq!(v["followApprovalRemoteSeconds"], json!(86400), "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "followApprovalLocalSeconds": null, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["followApprovalLocalSeconds"], json!(null), "body: {v}");
+    assert_eq!(v["followApprovalRemoteSeconds"], json!(86400), "body: {v}");
+
+    // 不正な期間を拒否する: -1 / 1.5 / 2592001 → 400 (both keys)
+    for seconds in [-1_i64, 2592001] {
+        for key in ["followApprovalLocalSeconds", "followApprovalRemoteSeconds"] {
+            let (s, v) = post_json(
+                app.clone(),
+                "/api/i/update",
+                json!({ key: seconds, "i": a_token }),
+            )
+            .await;
+            assert_eq!(
+                s,
+                StatusCode::BAD_REQUEST,
+                "seconds={seconds} key={key} body: {v}"
+            );
+        }
+    }
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "followApprovalLocalSeconds": 1.5, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "fractional seconds: {v}");
+
+    // 本人以外には公開されない: public users/show pack omits both keys
+    let (s, v) = post_json(app.clone(), "/api/users/show", json!({ "userId": a_id })).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert!(
+        v.get("followApprovalLocalSeconds").is_none(),
+        "must not leak on the public pack: {v}"
+    );
+    assert!(
+        v.get("followApprovalRemoteSeconds").is_none(),
+        "must not leak on the public pack: {v}"
+    );
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn approval_arena_fresh_follower_pends_then_manual_accept_204() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapprovpending").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let receiver = signup(&app, &uname("apr")).await;
+    let follower = signup(&app, &uname("apf")).await;
+    let (r_id, r_token) = (
+        receiver["id"].as_str().unwrap(),
+        receiver["token"].as_str().unwrap(),
+    );
+    let (f_id, f_token) = (
+        follower["id"].as_str().unwrap(),
+        follower["token"].as_str().unwrap(),
+    );
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "followApprovalLocalSeconds": 43200, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // 作成直後のローカルユーザーからのフォローを保留: 200 + pending, no follow
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": r_id, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": r_id, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["isFollowing"], json!(false), "body: {v}");
+    assert_eq!(
+        v["hasPendingFollowRequestFromYou"],
+        json!(true),
+        "body: {v}"
+    );
+
+    // 手動で承認: 204 → following edge + request swept
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/requests/accept",
+        json!({ "userId": f_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": r_id, "i": f_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["isFollowing"], json!(true), "body: {v}");
+    assert_eq!(
+        v["hasPendingFollowRequestFromYou"],
+        json!(false),
+        "body: {v}"
+    );
+    assert!(
+        mk_db::social::following_exists(&pool, f_id, r_id)
+            .await
+            .unwrap(),
+        "follow edge written by the manual accept"
+    );
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn approval_arena_unlock_readjudicates_pending_requests() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapprovunlock").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let receiver = signup(&app, &uname("aur")).await;
+    let bob = signup(&app, &uname("aub")).await;
+    let carol = signup(&app, &uname("auc")).await;
+    let dan = signup(&app, &uname("aud")).await;
+    let (r_id, r_token) = (
+        receiver["id"].as_str().unwrap(),
+        receiver["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+    let (c_id, c_token) = (
+        carol["id"].as_str().unwrap(),
+        carol["token"].as_str().unwrap(),
+    );
+    let d_token = dan["token"].as_str().unwrap();
+    let d_id = dan["id"].as_str().unwrap();
+
+    // leg 1 (指定期間を経過した相手は鍵の解除時に承認される): bob pends under
+    // a 1s window, the window expires, the unlock accepts him.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": true, "followApprovalLocalSeconds": 1, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": r_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    // leg 2 (鍵を解除しても指定期間に達していない相手は保留される): carol pends
+    // under a 30d window — the SAME unlock must leave her pending.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": r_id, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": false, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": r_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        v["isFollowing"],
+        json!(true),
+        "expired window accepted: {v}"
+    );
+    assert_eq!(
+        v["hasPendingFollowRequestFromYou"],
+        json!(false),
+        "body: {v}"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": r_id, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        v["isFollowing"],
+        json!(false),
+        "fresh-window request stays pending: {v}"
+    );
+    assert_eq!(
+        v["hasPendingFollowRequestFromYou"],
+        json!(true),
+        "body: {v}"
+    );
+
+    // leg 3 (鍵の解除と同時に期間を null に変更すると承認される): dan's request
+    // rides an unlock that also clears the window in the SAME i/update.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": r_id, "i": d_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": false, "followApprovalLocalSeconds": null, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/show",
+        json!({ "userId": r_id, "i": d_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["isFollowing"], json!(true), "null flip accepts dan: {v}");
+    assert_eq!(
+        v["hasPendingFollowRequestFromYou"],
+        json!(false),
+        "body: {v}"
+    );
+
+    let _ = pool;
 }
