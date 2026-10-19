@@ -65,12 +65,6 @@ mod ftt;
 // `localTimeline` fanout of the notesStream event (upstream
 // GlobalEventService.publishNotesStream + stream/channels/{home,local}-timeline.ts).
 mod streaming;
-// ff-visibility arena: users/followers + users/following (upstream
-// endpoints/users/{followers,following}.ts per-visibility gates) + the AP
-// /users/:id/{followers,following} collections +
-// admin/update-meta federation persistence (api/ff_vis.rs; db paths in
-// mk-db/src/ff_visibility.rs).
-pub(crate) mod ff_vis;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -164,10 +158,6 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "pinned-users"
         || name == "users/notes"
         || name == "admin/update-meta"
-        // ff-arena: the following/followers list arena (upstream
-        // endpoints/users/{followers,following}.ts per-visibility gates)
-        || name == "users/followers"
-        || name == "users/following"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -266,16 +256,6 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         if name == "notes/polls/vote" || name == "notes/translate" {
             return note_extras::handle(&state, name.as_str(), &body, token).await;
         }
-        // ff-arena: persist meta."federation" on admin/update-meta before the
-        // note/freq lane arms apply their keys (MetaService.update partial
-        // patch; the ff-visibility.ts beforeAll flips it to 'all' and the AP
-        // /users/:id/{followers,following} collections gate on it). Errors
-        // return; success falls through so the other lanes' keys keep landing.
-        if name == "admin/update-meta" && body.get("federation").is_some() {
-            if let Err(resp) = ff_vis::persist_federation(&state, &body, token.as_deref()).await {
-                return *resp;
-            }
-        }
         // note-agent: the sensitiveWords/prohibitedWords patch of update-meta
         // (note.ts census keeps those lists in the meta row via this arm;
         // pinnedUsers and the rest still flow to the freq arm below).
@@ -284,10 +264,6 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "admin/update-meta" {
             return freq::update_meta(&state, &body, token.as_deref()).await;
-        }
-        // ff-arena arms: users/followers + users/following lists
-        if ff_vis::FF_ENDPOINTS.contains(&name.as_str()) {
-            return ff_vis::route(&state, name.as_str(), &body, token.as_deref()).await;
         }
         return users_show(&state, &body, token).await;
     }
