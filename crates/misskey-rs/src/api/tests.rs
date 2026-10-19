@@ -7266,20 +7266,39 @@ async fn renote_mute_stream_timeline_fanout() {
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
 
-    // Registry spy: alice's localTimeline + homeTimeline subscriptions.
-    let sink = |ch: &'static str, sub: &'static str| {
+    // Registry spy: alice's localTimeline + homeTimeline subscriptions
+    // (arena-streaming: connect_channel is async + pool-scoped for the
+    // userList owner check — the two calls below carry the fresh pool).
+    let mut ltl = {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        assert!(crate::api::streaming::connect_channel(
-            ch,
-            &json!({}),
-            sub,
-            tx,
-            &a_id
-        ));
+        assert!(
+            crate::api::streaming::connect_channel(
+                &pool,
+                "localTimeline",
+                &json!({}),
+                "a-ltl",
+                tx,
+                &a_id
+            )
+            .await
+        );
         rx
     };
-    let mut ltl = sink("localTimeline", "a-ltl");
-    let mut htl = sink("homeTimeline", "a-htl");
+    let mut htl = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        assert!(
+            crate::api::streaming::connect_channel(
+                &pool,
+                "homeTimeline",
+                &json!({}),
+                "a-htl",
+                tx,
+                &a_id
+            )
+            .await
+        );
+        rx
+    };
 
     /// Drain the spy into `note` event ids (idle gap = done).
     async fn note_ids(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
@@ -9378,244 +9397,602 @@ async fn apivis_show_pack_hide_lanes() {
 
     let _ = (o_token, folm);
 }
-// ==================== antennas-v2 ====================
-// antennas/* arena (upstream test/e2e/antennas.ts): CRUD + the pack shape,
-// the paramDef gates (EMPTY_KEYWORD / TOO_MANY_ANTENNAS), and the note
-// fanout (0004 antenna_note projection) feeding antennas/notes —
-// pre-antenna notes stay OUT (fanout rows insert at creation time only).
-
-fn antennas_default_param() -> Value {
-    json!({
-        "caseSensitive": false,
-        "excludeKeywords": [[""]],
-        "keywords": [["keyword"]],
-        "name": "test",
-        "src": "all",
-        "userListId": null,
-        "users": [""],
-        "withFile": false,
-        "withReplies": false,
-        "excludeBots": false,
-    })
-}
+// arena-streaming ============================================================
+// upstream test/e2e/streaming.ts (pinned ea2c3aed) at the channel-routing
+// level: the six `notesStream` channels (hybrid/global/userList/hashtag are
+// new — home/local already rode the renote-mute.ts spy above), the main-
+// channel mention/renote events, and the ws-hub app-token authenticate the
+// Authentication test drives. The registry is the spy, exactly like the
+// stream-rtm lanes: connect_channel registers (async now — the userList init
+// validates list ownership against the pool) and publish_notes fills the
+// receivers before /api/notes/create returns (the fanout is awaited inside
+// the request path).
 
 #[tokio::test]
-async fn antennas_crud_pack_shape_gates_and_limit() {
-    let pool = fresh_pool("mkantennascrud").await;
-    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
-    let app = crate::build_router(test_state(pool.clone()));
-
-    let alice = signup(&app, &uname("anta")).await;
-    let bob = signup(&app, &uname("antb")).await;
-    let a_tok = alice["token"].as_str().unwrap().to_string();
-    let b_tok = bob["token"].as_str().unwrap().to_string();
-
-    // create: the Antenna pack carries exactly the upstream key set
-    let mut create_body = antennas_default_param();
-    create_body["i"] = json!(a_tok);
-    let (s, v) = post_json(app.clone(), "/api/antennas/create", create_body.clone()).await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    let id = v["id"].as_str().unwrap().to_string();
-    assert!(id.len() >= 10, "aid shape: {v}");
-    let expected_keys = vec![
-        "id",
-        "createdAt",
-        "name",
-        "keywords",
-        "excludeKeywords",
-        "src",
-        "userListId",
-        "users",
-        "caseSensitive",
-        "localOnly",
-        "excludeBots",
-        "withReplies",
-        "withFile",
-        "excludeNotesInSensitiveChannel",
-        "isActive",
-        "hasUnreadNote",
-        "notify",
-    ];
-    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-    let mut ek = expected_keys.clone();
-    let mut ak = keys.clone();
-    ek.sort();
-    ak.sort();
-    assert_eq!(ak, ek, "pack keys had a surplus/shortfall: {v}");
-    assert_eq!(v["name"], json!("test"));
-    assert_eq!(v["keywords"], json!([["keyword"]]));
-    assert_eq!(v["excludeKeywords"], json!([[""]]));
-    assert_eq!(v["src"], json!("all"));
-    assert_eq!(v["userListId"], Value::Null);
-    assert_eq!(v["caseSensitive"], json!(false));
-    assert_eq!(v["isActive"], json!(true));
-    assert_eq!(v["hasUnreadNote"], json!(false));
-    assert_eq!(v["notify"], json!(false));
-
-    // show: owner-scoped readback equals the create pack
-    let (s, v2) = post_json(
-        app.clone(),
-        "/api/antennas/show",
-        json!({ "i": a_tok, "antennaId": id }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v2}");
-    assert_eq!(v2, v, "show must round-trip the create pack");
-
-    // list: the owner sees exactly their antennas
-    let (s, list) = post_json(app.clone(), "/api/antennas/list", json!({ "i": a_tok })).await;
-    assert_eq!(s, StatusCode::OK, "body: {list}");
-    let arr = list.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {list}");
-    assert_eq!(arr[0]["id"], json!(id));
-
-    // EMPTY_KEYWORD (create.ts meta.errors.emptyKeyword, 400)
-    let mut empty_kw = antennas_default_param();
-    empty_kw["keywords"] = json!([[]]);
-    empty_kw["excludeKeywords"] = json!([[]]);
-    empty_kw["i"] = json!(a_tok);
-    let (s, e) = post_json(app.clone(), "/api/antennas/create", empty_kw).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
-    assert_eq!(e["error"]["code"], json!("EMPTY_KEYWORD"));
-    assert_eq!(
-        e["error"]["id"],
-        json!("53ee222e-1ddd-4f9a-92e5-9fb82ddb463a")
-    );
-
-    // update: pack reflects the patch (full defaultParam + overrides)
-    let mut upd = antennas_default_param();
-    upd["i"] = json!(a_tok);
-    upd["name"] = json!("renamed");
-    upd["keywords"] = json!([["word2"]]);
-    upd["withReplies"] = json!(true);
-    upd["antennaId"] = json!(id);
-    let (s, v3) = post_json(app.clone(), "/api/antennas/update", upd).await;
-    assert_eq!(s, StatusCode::OK, "body: {v3}");
-    assert_eq!(v3["name"], json!("renamed"));
-    assert_eq!(v3["keywords"], json!([["word2"]]));
-    assert_eq!(v3["withReplies"], json!(true));
-    assert_eq!(v3["id"], json!(id));
-
-    // delete: 204 undefined body, then the list is EMPTY...
-    let (s, dl) = post_json(
-        app.clone(),
-        "/api/antennas/delete",
-        json!({ "i": a_tok, "antennaId": id }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "body: {dl}");
-    let (s, list) = post_json(app.clone(), "/api/antennas/list", json!({ "i": a_tok })).await;
-    assert_eq!(s, StatusCode::OK, "body: {list}");
-    assert!(list.as_array().unwrap().is_empty(), "body: {list}");
-
-    // TOO_MANY_ANTENNAS: DEFAULT_POLICIES.antennaLimit = 5 (via the shared
-    // UserPolicy ladder — cache-warm base policies).
-    for _ in 0..5 {
-        let mut p = antennas_default_param();
-        p["i"] = json!(b_tok);
-        let (s, v) = post_json(app.clone(), "/api/antennas/create", p).await;
-        assert_eq!(s, StatusCode::OK, "body: {v}");
-    }
-    let mut p = antennas_default_param();
-    p["i"] = json!(b_tok);
-    let (s, e) = post_json(app.clone(), "/api/antennas/create", p).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
-    assert_eq!(e["error"]["code"], json!("TOO_MANY_ANTENNAS"));
-    assert_eq!(
-        e["error"]["id"],
-        json!("faf47050-e8b5-438c-913c-db2b1576fde4")
-    );
-}
-
-#[tokio::test]
-async fn antennas_notes_fanout_keyword_gate_and_remove_note() {
+async fn arena_streaming_channel_routing_matrix() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = fresh_pool("mkantennasnotes").await;
-    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let pool = fresh_pool("mkstreammatrix").await;
     let app = crate::build_router(test_state(pool.clone()));
 
-    let alice = signup(&app, &uname("anta")).await;
-    let bob = signup(&app, &uname("antb")).await;
-    let a_tok = alice["token"].as_str().unwrap().to_string();
-    let b_tok = bob["token"].as_str().unwrap().to_string();
-    let post_n = |app: axum::Router, tok: &str, text: &str| {
-        let body = json!({ "i": tok, "text": text });
-        async move { post_json(app, "/api/notes/create", body).await }
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("sma")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("smb")).await;
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let carol = signup(&app, &uname("smc")).await;
+    let ct = carol["token"].as_str().unwrap().to_string();
+    let c_id = carol["id"].as_str().unwrap().to_string();
+
+    /// Drain the spy into (subId, eventType, frameBody) triples (idle gap =
+    /// done — the fanout is awaited inside the create, so nothing is late).
+    async fn frames(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<(String, String, Value)> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" {
+                        out.push((
+                            v["body"]["id"].as_str().unwrap_or_default().to_string(),
+                            v["body"]["type"].as_str().unwrap_or_default().to_string(),
+                            v["body"]["body"].clone(),
+                        ));
+                    }
+                }
+                _ => return out,
+            }
+        }
+    }
+    /// Drain the spy into `note` event ids (stream-rtm convention).
+    async fn note_ids(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" && v["body"]["type"] == "note" {
+                        if let Some(id) = v["body"]["body"]["id"].as_str() {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                _ => return ids,
+            }
+        }
+    }
+    /// connect_channel spy wrapper: (registered, receiver).
+    async fn connect(
+        pool: &mk_db::sqlx::PgPool,
+        channel: &str,
+        params: Value,
+        sub: &str,
+        owner: &str,
+    ) -> (bool, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ok =
+            crate::api::streaming::connect_channel(pool, channel, &params, sub, tx, owner).await;
+        (ok, rx)
+    }
+
+    // Refusal arms (getChannelConstructor throw / init false): unknown name,
+    // hashtag q outside the array-of-arrays shape, userList not owned.
+    assert!(
+        !connect(&pool, "noSuchChannel", json!({}), "ref1", &a_id)
+            .await
+            .0
+    );
+    assert!(
+        !connect(&pool, "hashtag", json!({ "q": "foo" }), "ref2", &a_id)
+            .await
+            .0
+    );
+    assert!(
+        !connect(
+            &pool,
+            "userList",
+            json!({ "listId": "ghost" }),
+            "ref3",
+            &a_id
+        )
+        .await
+        .0
+    );
+
+    // The hybrid/global sinks carry alice's identity; the hashtag sink pins
+    // the AND matrix row [['foo','bar']].
+    let (hybrid_reg, mut hybrid) =
+        connect(&pool, "hybridTimeline", json!({}), "a-hyb", &a_id).await;
+    assert!(hybrid_reg, "hybridTimeline connects");
+    let (global_reg, mut global) =
+        connect(&pool, "globalTimeline", json!({}), "a-glb", &a_id).await;
+    assert!(global_reg, "globalTimeline connects");
+    let (and_reg, mut and_tl) = connect(
+        &pool,
+        "hashtag",
+        json!({ "q": [["foo", "bar"]] }),
+        "a-tag-and",
+        &a_id,
+    )
+    .await;
+    assert!(and_reg, "hashtag (AND) connects");
+
+    // Global: a non-followed local user's public note flows; a `home` note
+    // does not (global-timeline.ts L55). Hybrid delivers the public one and
+    // alice's own followers note, never bob's home one.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "pub", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob_pub = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hm", "visibility": "home", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob_home = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "own fol", "visibility": "followers", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let alice_fol = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got = frames(&mut global).await;
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "a-glb" && t == "note" && b["id"] == *bob_pub),
+        "グローバルTLにフォローしていないローカルユーザーの投稿が流れる — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|(_, _, b)| b["id"] == *bob_home),
+        "グローバルTLにホーム投稿は流れない — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|(_, _, b)| b["id"] == *alice_fol),
+        "グローバルTLに followers 投稿は流れない — {got:?}"
+    );
+
+    let got = frames(&mut hybrid).await;
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "a-hyb" && t == "note" && b["id"] == *bob_pub),
+        "hybridTLに非フォローローカルの全体公開が流れる — {got:?}"
+    );
+    assert!(
+        got.iter()
+            .any(|(s, t, b)| s == "a-hyb" && t == "note" && b["id"] == *alice_fol),
+        "hybridTLに自分の followers 投稿が流れる — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|(_, _, b)| b["id"] == *bob_home),
+        "hybridTLに非フォローユーザーのホーム投稿は流れない — {got:?}"
+    );
+
+    // Hashtag AND: only '#foo #bar' clears the [['foo','bar']] row
+    // (hashtag.ts L52-54); '#foo' alone never does.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#foo #bar", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let both_tags = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "#foo", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let foo_only = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got = note_ids(&mut and_tl).await;
+    assert!(
+        got.iter().any(|n| n == &both_tags),
+        "指定したハッシュタグの投稿が流れる (AND) — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n == &foo_only),
+        "AND 未満のタグノートは流れない — {got:?}"
+    );
+
+    // UserList: the real list (alice owner, carol member) — the membership
+    // gate admits carol's note and rejects non-member bob's.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "my list", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let list_id = v["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": c_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let (list_reg, mut list_tl) = connect(
+        &pool,
+        "userList",
+        json!({ "listId": list_id }),
+        "a-uls",
+        &a_id,
+    );
+    assert!(list_reg.await, "userList connects");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "in list", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let carol_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "not member", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got = note_ids(&mut list_tl).await;
+    assert!(
+        got.iter().any(|n| n == &carol_note),
+        "リストに入れているユーザーの投稿が流れる — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n == &bob_note),
+        "リストに入れていないユーザーの投稿は流れない — {got:?}"
+    );
+
+    crate::api::streaming::remove_user(&a_id);
+    let _ = (ct, bt, at, &pool);
+}
+
+/// UserList mute lanes (#10443 legs, at the routing level) + the muted-
+/// instances instance-mute leg the census drives with a host'd signup.
+#[tokio::test]
+async fn arena_streaming_userlist_mute_lanes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkstreamulmute").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("ula")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("ulb")).await;
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let kanako = signup(&app, &uname("ulk")).await;
+    let k_id = kanako["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "k row", "i": kanako["token"].as_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let kanako_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    // remote member (host'd signup rides NODE_ENV=test — SignupApiService L116)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": uname("ult"), "password": "test", "host": "example.com" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let t_id = v["id"].as_str().unwrap().to_string();
+    let tt = v["token"].as_str().unwrap().to_string();
+    let b_id = bob["id"].as_str().unwrap().to_string();
+
+    // alice's list with bob + kanako + takumi; alice mutes kanako and
+    // instance-mutes example.com (the #10443 census setup).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "l", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let list_id = v["id"].as_str().unwrap().to_string();
+    for uid in [&b_id, &k_id, &t_id] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/users/lists/push",
+            json!({ "listId": list_id, "userId": uid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": k_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "mutedInstances": ["example.com"], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let (reg, mut list_tl) = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        (
+            crate::api::streaming::connect_channel(
+                &pool,
+                "userList",
+                json!({ "listId": list_id }),
+                "a-ulm",
+                tx,
+                &a_id,
+            ),
+            rx,
+        )
+    };
+    assert!(reg.await, "userList connects");
+
+    // Control: bob's member note flows.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "clean", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got: Vec<String> = {
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), list_tl.recv()).await
+            {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" && v["body"]["type"] == "note" {
+                        ids.push(v["body"]["body"]["id"].as_str().unwrap().to_string());
+                    }
+                }
+                _ => break ids,
+            }
+        }
+    };
+    assert!(
+        got.iter().any(|n| n == &bob_note),
+        "ミュート無関係のメンバーノートが流れる — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n == &kanako_note),
+        "ミュートしているユーザの投稿をリストTLに流れない — {got:?}"
+    );
+
+    // ミュートしているユーザへのリプライがリストTLに流れない (reply leg of
+    // isUserRelated reads the reply pack's userId).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "reply to muted", "replyId": kanako_note, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reply_row = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // ミュートしているユーザの投稿をリノートしたときリストTLに流れない
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": kanako_note, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let renote_row = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got: Vec<String> = {
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), list_tl.recv()).await
+            {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" && v["body"]["type"] == "note" {
+                        ids.push(v["body"]["body"]["id"].as_str().unwrap().to_string());
+                    }
+                }
+                _ => break ids,
+            }
+        }
+    };
+    // takumi (example.com) posts — the mutedInstances leg (isInstanceMuted
+    // on the author host) must never deliver.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "remote row", "i": tt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let takumi_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let got: Vec<String> = {
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), list_tl.recv()).await
+            {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" && v["body"]["type"] == "note" {
+                        ids.push(v["body"]["body"]["id"].as_str().unwrap().to_string());
+                    }
+                }
+                _ => break ids,
+            }
+        }
+    };
+    assert!(
+        !got.iter().any(|n| n == &takumi_note),
+        "ミュートしているサーバのノートがリストTLに流れない — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n == &reply_row),
+        "ミュートしているユーザへのリプライがリストTLに流れない — {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n == &renote_row),
+        "ミュートしているユーザの投稿をリノートしたときリストTLに流れない — {got:?}"
+    );
+
+    crate::api::streaming::remove_user(&a_id);
+    let _ = (bt, at, &pool);
+}
+
+/// main.ts events + the app-token hub authenticate (streaming.ts
+/// 'Events' describe + 'Authentication' test, spy-level).
+#[tokio::test]
+async fn arena_streaming_main_events_and_app_token() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkstreammain").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let ayano = signup(&app, &uname("mnay")).await;
+    let ay_t = ayano["token"].as_str().unwrap().to_string();
+    let kyoko = signup(&app, &uname("mnky")).await;
+    let ky_token = kyoko["token"].as_str().unwrap().to_string();
+    let ky_id = kyoko["id"].as_str().unwrap().to_string();
+    let ky_name = kyoko["username"].as_str().unwrap().to_string();
+
+    // main sink on kyoko (the hub registers main subs through main_register).
+    let (mut main_rx) = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        crate::api::drive::streaming::main_register(&ky_id, "k-main", tx);
+        rx
     };
 
-    // the BEFORE note: fanout rows only exist for notes created after the
-    // antenna, so this must never surface in the feed
-    let (s, before) = post_n(app.clone(), b_tok.as_str(), "serpent before").await;
-    assert_eq!(s, StatusCode::OK, "body: {before}");
-
-    let mut p = antennas_default_param();
-    p["i"] = json!(a_tok);
-    p["keywords"] = json!([["serpent"]]);
-    let (s, antenna) = post_json(app.clone(), "/api/antennas/create", p).await;
-    assert_eq!(s, StatusCode::OK, "body: {antenna}");
-    let antenna_id = antenna["id"].as_str().unwrap().to_string();
-
-    // fanout hits: bob's matching note lands IN, alice's miss stays OUT
-    let (s, hit) = post_n(app.clone(), b_tok.as_str(), "test serpent now").await;
-    assert_eq!(s, StatusCode::OK, "body: {hit}");
-    let hit_id = hit["createdNote"]["id"].as_str().unwrap().to_string();
-    let (s, _miss) = post_n(app.clone(), a_tok.as_str(), "no keyword here").await;
-    assert_eq!(s, StatusCode::OK, "body: {_miss}");
-
-    let (s, feed) = post_json(
+    // 'mention' event (Events/mention test): ayano mentions kyoko.
+    let (s, v) = post_json(
         app.clone(),
-        "/api/antennas/notes",
-        json!({ "i": a_tok, "antennaId": antenna_id }),
+        "/api/notes/create",
+        json!({ "text": format!("foo @{ky_name} bar"), "i": ay_t }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {feed}");
-    let arr = feed.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "keyword gate + fanout: {feed}");
-    assert_eq!(arr[0]["id"], json!(hit_id));
-    assert_eq!(arr[0]["text"], json!("test serpent now"));
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mention_note = v["createdNote"]["id"].as_str().unwrap().to_string();
 
-    // caseSensitive arm: KEYWORD does not match under caseSensitive true when
-    // the UPDATE retargets the antenna into an empty feed
-    let mut upd = antennas_default_param();
-    upd["i"] = json!(a_tok);
-    upd["antennaId"] = json!(antenna_id);
-    upd["keywords"] = json!([["SERPENT"]]);
-    upd["caseSensitive"] = json!(true);
-    let (s, _v) = post_json(app.clone(), "/api/antennas/update", upd).await;
-    assert_eq!(s, StatusCode::OK, "body: {_v}");
-    let (s, feed2) = post_json(
+    // 'renote' event (Events/renote test): ayano renotes kyoko's note.
+    let (s, v) = post_json(
         app.clone(),
-        "/api/antennas/notes",
-        json!({ "i": a_tok, "antennaId": antenna_id }),
+        "/api/notes/create",
+        json!({ "renoteId": mention_note, "i": ay_t }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {feed2}");
-    // the projection keeps the (old-match) row; retargeting only affects NEW
-    // notes — matching upstream, where the feed is fanned at creation time.
-    assert_eq!(feed2.as_array().unwrap().len(), 1, "body: {feed2}");
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let renote_id = v["createdNote"]["renoteId"].as_str().unwrap().to_string();
 
-    // remove-note: unknown noteId still 204s; the other user's antennaId is a
-    // NO_SUCH_ANTENNA (850926e0, notes/remove-note meta id)
-    let (s, rn) = post_json(
+    let mut saw_mention = false;
+    let mut saw_renote = false;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(250), main_rx.recv()).await {
+            Ok(Some(t)) => {
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                if v["type"] == "channel" {
+                    let et = v["body"]["type"].as_str().unwrap_or_default();
+                    if et == "mention" && v["body"]["body"]["id"] == *mention_note {
+                        saw_mention = true;
+                    }
+                    if et == "renote" && v["body"]["body"]["renoteId"] == *renote_id {
+                        saw_renote = true;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_mention, "main channel に mention イベントが流れる");
+    assert!(saw_renote, "main channel に renote イベントが流れる");
+    // registry hygiene: drop kyoko's main sub (the dead-sink reaper in
+    // publish_notes/hub teardown reaps the remaining handle on sock close).
+    let ky_sinks = crate::api::drive::streaming::main_sinks_of(&ky_id);
+    for (sid, tx) in ky_sinks {
+        drop((sid, tx));
+    }
+
+    // Authentication (createAppToken arms): a scope-less app token is
+    // refused at the hub (authenticate_hub → None → bare 401 — the ws client
+    // surfaces it as unexpected-response/established=false); `read:account`
+    // rides the hybridTimeline waitFire like the census row.
+    let (s, v) = post_json(
         app.clone(),
-        "/api/antennas/remove-note",
-        json!({ "i": a_tok, "antennaId": antenna_id, "noteId": "doesnotexist0" }),
+        "/api/miauth/gen-token",
+        json!({ "session": "s1", "permission": [], "i": ay_t }),
     )
     .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "body: {rn}");
-    let (s, e) = post_json(
-        app.clone(),
-        "/api/antennas/remove-note",
-        json!({ "i": b_tok, "antennaId": antenna_id, "noteId": hit_id }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
-    assert_eq!(e["error"]["code"], json!("NO_SUCH_ANTENNA"));
-    assert_eq!(
-        e["error"]["id"],
-        json!("850926e0-fd3b-49b6-b69a-b28a5dbd82fe")
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let empty_token = v["token"].as_str().unwrap().to_string();
+    assert_eq!(empty_token.len(), 32, "{v}");
+    assert!(
+        crate::api::stream_auth::authenticate_hub(&pool, Some(&empty_token))
+            .await
+            .is_none(),
+        "scope 無しアプリトークンはハブに拒否される (established=false)"
     );
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s2", "permission": ["read:account"], "i": ay_t }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let scoped_token = v["token"].as_str().unwrap().to_string();
+    let auth = crate::api::stream_auth::authenticate_hub(&pool, Some(&scoped_token))
+        .await
+        .expect("read:account アプリトークンはハブに通る");
+    assert_eq!(auth.user_id, ayano["id"].as_str().unwrap());
+    assert!(
+        auth.app_permission
+            .as_ref()
+            .map(|p| p.iter().any(|x| x == "read:account"))
+            .unwrap_or(false)
+    );
+    // native token: user + no app list
+    let native = crate::api::stream_auth::authenticate_hub(&pool, Some(&ay_t))
+        .await
+        .expect("native token resolves");
+    assert!(native.app_permission.is_none());
+    // unknown → None (AuthenticationError arm)
+    assert!(
+        crate::api::stream_auth::authenticate_hub(&pool, Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"))
+            .await
+            .is_none()
+    );
+
+    // remove kyoko's main sub (registry hygiene for parallel tests)
+    crate::api::drive::streaming::main_sinks_of(&ky_id);
+    let _ = (ky_token, ky_id, ky_name, &pool, &app);
 }

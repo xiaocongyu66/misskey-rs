@@ -361,6 +361,24 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     }
     // ==== END delete-account DISPATCH ARM ====
 
+    // ==== arena-streaming DISPATCH ARM (miauth/gen-token) ====
+    // The /streaming hub's app-token lane (streaming.ts Authentication test):
+    // self-contained arm on the roles_lite/delete_account pattern; the module
+    // api::stream_auth owns the endpoint + the ws-hub authenticate.
+    if stream_auth::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return stream_auth::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END arena-streaming DISPATCH ARM ====
+
     // ==== announcements DISPATCH ARM (announcements slice) ====
     // announcements-agent: the announcements family names route into
     // api::announcement on the channels-arm pattern — method check, body
@@ -4390,3 +4408,9 @@ mod tests;
 /// gates with the meta.rootUserId bypass) and every admin handler; mod.rs
 /// only registers the module and the single `admin/*` dispatch arm above.
 mod admin;
+
+/// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
+/// authenticate (streaming.ts Authentication lane; module file
+/// `api/stream_auth.rs` owns both; mod.rs only registers the module and the
+/// single dispatch arm above).
+mod stream_auth;

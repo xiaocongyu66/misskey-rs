@@ -55,15 +55,33 @@ pub(crate) mod streaming {
 
     static MAIN_SINKS: LazyLock<Registry> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    /// `main` channel registration (Connection.connectChannel for `main` —
+    /// requireCredential + kind `read:account`; the hub's app-token gate
+    /// already settled that, see stream_auth::authenticate_hub). reconnect
+    /// with a live id replaces the sink (upstream disconnects the old one).
+    pub fn main_register(user_id: &str, sub_id: &str, tx: UnboundedSender<String>) {
+        let Ok(mut reg) = MAIN_SINKS.lock() else {
+            return;
+        };
+        let entry = reg.entry(user_id.to_string()).or_default();
+        entry.retain(|(sid, _)| sid != sub_id);
+        entry.push((sub_id.to_string(), tx));
+    }
+
+    /// One viewer's live `main` sinks (sub id + socket writer) — the
+    /// streaming.rs mention ladder sends its per-viewer filtered frames
+    /// through these directly.
+    pub fn main_sinks_of(user_id: &str) -> Vec<(String, UnboundedSender<String>)> {
+        MAIN_SINKS
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get(user_id).cloned())
+            .unwrap_or_default()
+    }
+
     /// `GlobalEventService.publishMainStream(userId, type, value)`.
     pub fn publish_main(user_id: &str, event_type: &str, event_body: Value) {
-        let sinks: Vec<(String, UnboundedSender<String>)> = {
-            let Ok(reg) = MAIN_SINKS.lock() else {
-                return;
-            };
-            reg.get(user_id).cloned().unwrap_or_default()
-        };
-        for (sub_id, tx) in sinks {
+        for (sub_id, tx) in main_sinks_of(user_id) {
             let frame = json!({
                 "type": "channel",
                 "body": { "id": sub_id, "type": event_type, "body": event_body },
@@ -99,7 +117,13 @@ pub(crate) mod streaming {
         let Some(pool) = &state.pool else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
-        let Some(user_id) = super::super::resolve_me(pool, token.as_deref()).await else {
+        // arena-streaming: authenticate mirrors StreamingApiServerService L57-78
+        // — native user tokens resolve against user.token; access-token rows
+        // (miauth/gen-token) resolve user + permission, and an app token
+        // without `read:account` is refused exactly like upstream's
+        // AuthenticationError arm (the bare-401 shape below).
+        let auth = crate::api::stream_auth::authenticate_hub(pool, token.as_deref()).await;
+        let Some(auth) = auth else {
             let mut resp = StatusCode::UNAUTHORIZED.into_response();
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
@@ -109,6 +133,7 @@ pub(crate) mod streaming {
             );
             return resp;
         };
+        let user_id = auth.user_id;
         // Suspended users are refused (403) like the upstream upgrade path.
         match mk_db::user::find_user_by_id(pool, &user_id).await {
             Ok(Some(row)) if row.is_suspended => {
@@ -118,10 +143,11 @@ pub(crate) mod streaming {
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
 
-        ws.on_upgrade(move |socket| handle_socket(user_id, socket))
+        let hub_pool = pool.clone();
+        ws.on_upgrade(move |socket| handle_socket(hub_pool, user_id, socket))
     }
 
-    async fn handle_socket(user_id: String, socket: WebSocket) {
+    async fn handle_socket(pool: mk_db::sqlx::PgPool, user_id: String, socket: WebSocket) {
         let (mut sink, mut source) = socket.split();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -178,30 +204,28 @@ pub(crate) mod streaming {
             let Some(sub_id) = body.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            // requireCredential channels need `user != null` (main qualifies;
-            // an unknown channel name throws upstream and connects nothing).
+            // requireCredential channels need `user != null` (the hub itself
+            // is auth-only, so every connection carries one — upstream lets
+            // guests connect to public channels, this port 401s them at the
+            // upgrade). An unknown channel name throws upstream and connects
+            // nothing.
             let registered = if channel == "main" {
-                {
-                    let Ok(mut reg) = MAIN_SINKS.lock() else {
-                        break;
-                    };
-                    let entry = reg.entry(user_id.clone()).or_default();
-                    entry.retain(|(sid, _)| sid != sub_id);
-                    entry.push((sub_id.to_string(), event_tx.clone()));
-                    true
-                }
+                main_register(&user_id, sub_id, event_tx.clone());
+                true
             } else {
                 // stream-rtm: the timeline-channel half (upstream
-                // stream/channels/{home,local}-timeline.ts) — registry +
-                // per-note filters live in api::streaming; unknown channel
-                // names refuse silently like the upstream throw.
+                // stream/channels/*) — registry + per-note filters live in
+                // api::streaming; unknown channel names refuse silently like
+                // the upstream throw.
                 crate::api::streaming::connect_channel(
+                    &pool,
                     channel,
                     &body.get("params").cloned().unwrap_or(Value::Null),
                     sub_id,
                     event_tx.clone(),
                     &user_id,
                 )
+                .await
             };
             if registered && body.get("pong").and_then(Value::as_bool) == Some(true) {
                 let frame = json!({ "type": "connected", "body": { "id": sub_id } });
