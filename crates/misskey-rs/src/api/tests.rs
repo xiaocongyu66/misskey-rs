@@ -8342,6 +8342,17 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     // admin/update-meta {federation:'all'} (alice is root) + public
     // visibility → 200 OrderedCollection with the activity+json content type;
     // flipping visibility to private → 403 again
+    // Reset followersVisibility first: ff-arena 3 left it 'private', and the
+    // AP collection gate reads the SAME setting — the 'none'/federation 403
+    // and the 200 legs only pin what they mean with the visibility back at
+    // the public ff-arena-1 value.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": a_token, "followersVisibility": "public" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "reset followersVisibility: {v}");
     async fn ap_get(app: axum::Router, path: String) -> (StatusCode, Option<String>, Value) {
         let resp = app
             .oneshot(
