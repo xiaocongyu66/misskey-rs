@@ -1240,10 +1240,13 @@ pub async fn verify_authentication(
     };
     let pub_x = get_hex32(-2)?;
     let pub_y = get_hex32(-3)?;
-    // signatureBase = authenticatorData || sha256(clientDataJSON) (L272-275)
+    // signatureBase = authenticatorData || sha256(clientDataJSON) (L272-275:
+    // `toHash(isoBase64URL.toBuffer(clientDataJSON))` — the hash input is the
+    // DECODED client-data JSON bytes, not the base64url wire string)
+    let cd_raw = b64url_decode(cdj).ok_or(VerifyFail::Error)?;
     let mut sig_base = Vec::with_capacity(authenticator_data.len() + 32);
     sig_base.extend_from_slice(&authenticator_data);
-    sig_base.extend_from_slice(&sha256(cdj.as_bytes()));
+    sig_base.extend_from_slice(&sha256(&cd_raw));
     let verified = ecdsa_p256_sha256_verify(&sig_base, &pub_x, &pub_y, &signature);
     if verified {
         touch_key(
