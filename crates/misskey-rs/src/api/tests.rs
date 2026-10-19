@@ -11413,3 +11413,53 @@ async fn twofa_final_register_on_enabled_profile_gate() {
     assert_eq!(s, StatusCode::OK, "body: {b}");
     assert!(b["secret"].as_str().is_some(), "fresh temp secret");
 }
+
+// oauth-final — HTML client-information scan (node-html-parser parity over
+// the pinned h-app documents: link[rel=redirect_uri][href] list, .h-app
+// .p-name name via the client_id URL match, .h-app .u-logo resolution).
+// Pin #1 rides the 'Multiple items in HTML' document (no Link header — the
+// <link> tags are the only redirect source); pin #2 rides the 'With Logo'
+// document (u-url p-name + u-logo sibling, no <link> tags).
+#[test]
+fn oauth_html_client_scan_parity() {
+    let base = url::Url::parse("http://127.0.0.1:3001/").unwrap();
+    let id = url::Url::parse("http://127.0.0.1:3001/").unwrap();
+
+    // 'Multiple items in HTML' + the default beforeEach sender doc
+    let multi = "\
+				<!DOCTYPE html>\n\
+				<link rel=\"redirect_uri\" href=\"/redirect2\" />\n\
+				<link rel=\"redirect_uri\" href=\"/redirect\" />\n\
+				<div class=\"h-app\"><a href=\"/\" class=\"u-url p-name\">Misklient\n";
+    let (uris, name, logo) = crate::api::oauth::parse_client_html(multi, &base, &id);
+    assert_eq!(
+        uris,
+        vec![
+            "http://127.0.0.1:3001/redirect2".to_string(),
+            "http://127.0.0.1:3001/redirect".to_string(),
+        ],
+        "link[rel=redirect_uri][href] pairs resolve against the document URL"
+    );
+    assert_eq!(name.as_deref(), Some("Misklient"), "h-app p-name text");
+    assert_eq!(logo, None);
+
+    // 'With Logo' — sibling u-url p-name anchor + u-logo img, no <link> tags
+    let logo_doc = "\
+				<!DOCTYPE html>\n\
+				<div class=\"h-app\">\n\
+					<a href=\"/\" class=\"u-url p-name\">Misklient</a>\n\
+					<img src=\"/logo.png\" class=\"u-logo\" />\n\
+				</div>\n";
+    let (uris, name, logo) = crate::api::oauth::parse_client_html(logo_doc, &base, &id);
+    assert_eq!(
+        uris,
+        Vec::<String>::new(),
+        "no link[rel=redirect_uri] nodes"
+    );
+    assert_eq!(name.as_deref(), Some("Misklient"));
+    assert_eq!(
+        logo.as_deref(),
+        Some("http://127.0.0.1:3001/logo.png"),
+        "u-logo resolves against the document URL"
+    );
+}
