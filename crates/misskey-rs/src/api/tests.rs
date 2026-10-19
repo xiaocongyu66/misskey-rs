@@ -13011,7 +13011,11 @@ async fn get_accept(
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+    (
+        status,
+        headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 // arena-fetchres: beforeAll seed — signup alice + admin/update-meta
@@ -13115,8 +13119,7 @@ async fn fetchres_html_plane_and_negotiated_pages() {
     let pool = fresh_pool("mkfetchres1").await;
     let app = crate::build_router(test_state(pool.clone()));
 
-    let (alice, a_id, note_id, page_id, flash_id, clip_id, gallery_id) =
-        fetchres_seed(&app).await;
+    let (alice, a_id, note_id, page_id, flash_id, clip_id, gallery_id) = fetchres_seed(&app).await;
     let username = alice["username"].as_str().unwrap();
 
     // --- the status/asset plane ---
@@ -13142,7 +13145,11 @@ async fn fetchres_html_plane_and_negotiated_pages() {
     ] {
         let (s, h, body) = get_accept(&app, path, "*/*").await;
         assert_eq!(s, StatusCode::OK, "{path}: {body}");
-        assert_eq!(hdr(&h, "content-type").map(|c| c.to_lowercase()), Some(ctype.to_string()), "{path}");
+        assert_eq!(
+            hdr(&h, "content-type").map(|c| c.to_lowercase()),
+            Some(ctype.to_string()),
+            "{path}"
+        );
     }
     // the /api.json + /streaming contracts
     let (s, h, body) = get_accept(&app, "/api.json", "*/*").await;
@@ -13181,50 +13188,97 @@ async fn fetchres_html_plane_and_negotiated_pages() {
         ] {
             let (s, h, body) = get_accept(&app, &path, accept).await;
             assert_eq!(s, StatusCode::OK, "{path}: {body}");
-            assert_eq!(hdr(&h, "content-type").as_deref(), Some("text/html; charset=utf-8"), "{path}");
-            assert!(body.contains(&format!("<meta name=\"misskey:user-username\" content=\"{username}\">")), "{path}: {body}");
-            assert!(body.contains(&format!("<meta name=\"misskey:user-id\" content=\"{a_id}\">")), "{path}: {body}");
+            assert_eq!(
+                hdr(&h, "content-type").as_deref(),
+                Some("text/html; charset=utf-8"),
+                "{path}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "<meta name=\"misskey:user-username\" content=\"{username}\">"
+                )),
+                "{path}: {body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "<meta name=\"misskey:user-id\" content=\"{a_id}\">"
+                )),
+                "{path}: {body}"
+            );
         }
     }
     // pages/:page carries the page-id meta; unknown page renders the base page
     let path = format!("/@{username}/pages/1678594845072");
     let (s, _, body) = get_accept(&app, &path, "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert!(body.contains(&format!("<meta name=\"misskey:page-id\" content=\"{page_id}\">")), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<meta name=\"misskey:page-id\" content=\"{page_id}\">"
+        )),
+        "{body}"
+    );
     let (s, _, _) = get_accept(&app, &format!("/@{username}/pages/ghost"), "*/*").await;
     assert_eq!(s, StatusCode::OK);
     // unknown user still answers 200 HTML (renderBase)
     let (s, h, _) = get_accept(&app, "/@ghostxxxxxxxx", "text/html, */*").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(hdr(&h, "content-type").as_deref(), Some("text/html; charset=utf-8"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
 
     // --- item pages ---
     let (s, _, body) = get_accept(&app, &format!("/notes/{note_id}"), "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert!(body.contains(&format!("<meta name=\"misskey:note-id\" content=\"{note_id}\">")), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<meta name=\"misskey:note-id\" content=\"{note_id}\">"
+        )),
+        "{body}"
+    );
     let (s, _, _) = get_accept(&app, "/notes/ghostxxxxxxxxxxxxxxxxx", "*/*").await;
     assert_eq!(s, StatusCode::OK);
     let (s, _, body) = get_accept(&app, &format!("/play/{flash_id}"), "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert!(body.contains(&format!("<meta name=\"misskey:flash-id\" content=\"{flash_id}\">")), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<meta name=\"misskey:flash-id\" content=\"{flash_id}\">"
+        )),
+        "{body}"
+    );
     let (s, _, body) = get_accept(&app, &format!("/clips/{clip_id}"), "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert!(body.contains(&format!("<meta name=\"misskey:clip-id\" content=\"{clip_id}\">")), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<meta name=\"misskey:clip-id\" content=\"{clip_id}\">"
+        )),
+        "{body}"
+    );
     let (s, _, body) = get_accept(&app, &format!("/gallery/{gallery_id}"), "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert!(body.contains("<meta name=\"misskey:user-username\""), "{body}");
+    assert!(
+        body.contains("<meta name=\"misskey:user-username\""),
+        "{body}"
+    );
 
     // --- /users/:id redirect + the POST-only inbox GET-HTML rows ---
     let (s, h, _) = get_accept(&app, &format!("/users/{a_id}"), "*/*").await;
     assert_eq!(s, StatusCode::FOUND, "302 redirect");
-    assert_eq!(hdr(&h, "location").as_deref(), Some(&format!("/@{username}")));
+    assert_eq!(
+        hdr(&h, "location").as_deref(),
+        Some(&format!("/@{username}"))
+    );
     assert_eq!(hdr(&h, "vary").as_deref(), Some("Accept"));
     let (s, _, _) = get_accept(&app, "/users/ghostxxxxxxxx", "*/*").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     for path in ["/inbox", &format!("/users/{a_id}/inbox")] {
         let (s, h, _) = get_accept(&app, path, "*/*").await;
         assert_eq!(s, StatusCode::OK, "{path}");
-        assert_eq!(hdr(&h, "content-type").as_deref(), Some("text/html; charset=utf-8"), "{path}");
+        assert_eq!(
+            hdr(&h, "content-type").as_deref(),
+            Some("text/html; charset=utf-8"),
+            "{path}"
+        );
     }
 
     // --- the user feeds (rss/atom/json) + the MFM-must-not-leak row ---
@@ -13282,16 +13336,24 @@ async fn fetchres_activity_pub_negotiation() {
         fetchres_seed(&app).await;
     let username = _alice["username"].as_str().unwrap();
 
-    for accept in ["application/activity+json", "application/activity+json, */*"] {
+    for accept in [
+        "application/activity+json",
+        "application/activity+json, */*",
+    ] {
         let (s, h, body) = get_accept(&app, &format!("/@{username}"), accept).await;
         assert_eq!(s, StatusCode::OK, "{body}");
-        assert_eq!(hdr(&h, "content-type").as_deref(), Some("application/activity+json; charset=utf-8"));
+        assert_eq!(
+            hdr(&h, "content-type").as_deref(),
+            Some("application/activity+json; charset=utf-8")
+        );
         assert_eq!(hdr(&h, "vary").as_deref(), Some("Accept"));
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["type"], json!("Person"), "{v}");
-        assert_eq!(v["id"], json!(format!("http://127.0.0.1:3000/users/{a_id}")));
-        let (s, _, body) =
-            get_accept(&app, &format!("/users/{a_id}"), accept).await;
+        assert_eq!(
+            v["id"],
+            json!(format!("http://127.0.0.1:3000/users/{a_id}"))
+        );
+        let (s, _, body) = get_accept(&app, &format!("/users/{a_id}"), accept).await;
         assert_eq!(s, StatusCode::OK, "{body}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["type"], json!("Person"), "{v}");
@@ -13304,13 +13366,24 @@ async fn fetchres_activity_pub_negotiation() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(hdr(&h, "content-type").as_deref(), Some("application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"; charset=utf-8"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some(
+            "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"; charset=utf-8"
+        )
+    );
 
     // the 404 legs
     for (path, accept) in [
         (format!("/@ghostxxxxxxxx"), "application/activity+json"),
-        (format!("/users/ghostxxxxxxxx"), "application/activity+json, */*"),
-        (format!("/notes/ghostxxxxxxxxxxxxxxxxx"), "application/activity+json"),
+        (
+            format!("/users/ghostxxxxxxxx"),
+            "application/activity+json, */*",
+        ),
+        (
+            format!("/notes/ghostxxxxxxxxxxxxxxxxx"),
+            "application/activity+json",
+        ),
     ] {
         let (s, _, _) = get_accept(&app, &path, accept).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{path}");
@@ -13319,16 +13392,26 @@ async fn fetchres_activity_pub_negotiation() {
     // outbox — the unconstrained OrderedCollection (default accept)
     let (s, h, body) = get_accept(&app, &format!("/users/{a_id}/outbox"), "*/*").await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(hdr(&h, "content-type").as_deref(), Some("application/activity+json; charset=utf-8"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/activity+json; charset=utf-8")
+    );
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["type"], json!("OrderedCollection"), "{v}");
     assert_eq!(v["totalItems"], json!(1), "{v}");
 
     // the note AP leg rides the pre-existing ap_note body (type Note)
-    let (s, h, body) =
-        get_accept(&app, &format!("/notes/{note_id}"), "application/activity+json, */*").await;
+    let (s, h, body) = get_accept(
+        &app,
+        &format!("/notes/{note_id}"),
+        "application/activity+json, */*",
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(hdr(&h, "content-type").as_deref(), Some("application/activity+json; charset=utf-8"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/activity+json; charset=utf-8")
+    );
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["type"], json!("Note"), "{v}");
 
@@ -13364,23 +13447,26 @@ async fn fetchres_create_fixture_endpoints() {
     // the guest gate answers CREDENTIAL_REQUIRED (auth before paramDef)
     let (s, body) = post_json(app.clone(), "/api/pages/create", json!({ "name": "x" })).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{body}");
-    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"), "{body}");
+    assert_eq!(
+        body["error"]["code"],
+        json!("CREDENTIAL_REQUIRED"),
+        "{body}"
+    );
 
     let (alice, _a_id, _note_id, _page_id, _flash_id, _clip_id, _gallery_id) =
         fetchres_seed(&app).await;
     let _ = alice;
 
     // the page row the fixtures seeded: GET /api/pages/show mirrors the pack
-    let (s, page) = post_json(
-        app.clone(),
-        "/api/endpoints",
-        json!({}),
-    )
-    .await;
+    let (s, page) = post_json(app.clone(), "/api/endpoints", json!({})).await;
     assert_eq!(s, StatusCode::OK);
     assert!(page.as_array().unwrap().contains(&json!("pages/create")));
     assert!(page.as_array().unwrap().contains(&json!("flash/create")));
-    assert!(page.as_array().unwrap().contains(&json!("gallery/posts/create")));
+    assert!(
+        page.as_array()
+            .unwrap()
+            .contains(&json!("gallery/posts/create"))
+    );
 
     let _ = pool;
 }
