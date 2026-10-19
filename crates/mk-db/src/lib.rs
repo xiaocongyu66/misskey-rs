@@ -23,6 +23,10 @@ pub mod channel;
 pub mod clips;
 // delete-account: i/delete-account + admin/delete-account soft-delete flag
 pub mod delete_account;
+// two-factor arena: the TOTP lane (vendored std-only SHA-1/HMAC-SHA1/
+// base32/TOTP + user_profile twoFactor* paths + the used-step burn
+// UserAuthService.validateOtp rides)
+pub mod two_factor;
 // i/update tail wave: drive files (upload), note pinings, personal memos
 pub mod drive;
 // note-agent: drive-file SQL for the note.ts slice (owned by-ids fetch +
