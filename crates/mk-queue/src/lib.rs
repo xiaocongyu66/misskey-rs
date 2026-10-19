@@ -135,7 +135,8 @@ impl QueueHandle {
         .await?;
         sqlx::query_scalar(
             r#"INSERT INTO "mk_queue_jobs" ("kind", "payload", "run_after")
-               VALUES ($1, $2, now() + make_interval(secs => $3))"#,
+               VALUES ($1, $2, now() + make_interval(secs => $3))
+               RETURNING "id""#,
         )
         .bind(kind)
         .bind(payload)
