@@ -689,4 +689,172 @@ mod tests {
         // no secrets leak on the not-me shape
         assert!(no_secrets.get("email").is_none());
     }
+
+    // unit-services — 1:1 port of upstream
+    // test/unit/entities/UserEntityService.ts describe('pack/packMany').
+
+    #[test]
+    fn unit_services_user_lite_omits_detail_fields() {
+        // upstream 'UserLite': memo / birthday / achievements are detail
+        // fields — the lite shape carries none of them.
+        let v = user_lite_value_with_roles(&row(), &ctx(), None);
+        assert!(v.get("memo").is_none());
+        assert!(v.get("birthday").is_none());
+        assert!(v.get("achievements").is_none());
+    }
+
+    #[test]
+    fn unit_services_user_detailed_not_me() {
+        // upstream 'UserDetailedNotMe': birthday from the profile row; memo
+        // stays at the pack default — the viewer's user_memo rides the
+        // endpoint completion (api/mod.rs set_viewers_memo, users/show for
+        // other-person views); achievements are me-view-only.
+        let mut p = profile();
+        p.birthday = Some("2000-01-01".to_string());
+        p.achievements = json!([{ "name": "x", "unlockedAt": 1 }]);
+        let v = pack_inline(&row(), &p, false, None, ctx());
+        assert_eq!(v["birthday"], json!("2000-01-01"));
+        assert_eq!(v["memo"], json!(null));
+        assert!(v.get("achievements").is_none());
+    }
+
+    #[test]
+    fn unit_services_me_detailed() {
+        // upstream 'MeDetailed': achievements surface for isMe && isDetailed.
+        let mut p = profile();
+        p.birthday = Some("2000-01-01".to_string());
+        let ach = json!([{ "name": "iLoveMisskey", "unlockedAt": 1_700_000_000_000i64 }]);
+        p.achievements = ach.clone();
+        let v = pack_inline(&row(), &p, true, None, ctx());
+        assert_eq!(v["memo"], json!(null));
+        assert_eq!(v["birthday"], json!("2000-01-01"));
+        assert_eq!(v["achievements"], ach);
+    }
+
+    #[test]
+    fn unit_services_also_known_as_string_does_not_throw() {
+        // upstream 'alsoKnownAs as string does not throw': a string-typed
+        // column value packs as an array (ids only; unresolvable locals drop
+        // out the same way upstream's fetch failures filter to null).
+        let mut r = row();
+        r.also_known_as = Some("https://remote.example.com/users/alice".to_string());
+        let v = pack_inline(&r, &profile(), false, None, ctx());
+        assert!(v["alsoKnownAs"].is_array());
+    }
+
+    /// The 8 getRelation flags (upstream order) asserted off a packed user.
+    fn expect_flags(out: &serde_json::Value, flags: [bool; 8]) {
+        for (key, want) in [
+            ("isFollowing", flags[0]),
+            ("isFollowed", flags[1]),
+            ("hasPendingFollowRequestFromYou", flags[2]),
+            ("hasPendingFollowRequestToYou", flags[3]),
+            ("isBlocking", flags[4]),
+            ("isBlocked", flags[5]),
+            ("isMuted", flags[6]),
+            ("isRenoteMuted", flags[7]),
+        ] {
+            assert_eq!(out[key], json!(want), "flag {key}");
+        }
+    }
+
+    /// Pack `who` from `me`'s point of view (upstream
+    /// `service.pack(who, me, { schema: 'UserDetailed' })`).
+    async fn rel_pack(pool: &mk_db::sqlx::PgPool, me: &str, who: &str) -> serde_json::Value {
+        let row = mk_db::user::find_user_by_id(pool, who)
+            .await
+            .expect("find target")
+            .expect("target row");
+        let rel = mk_db::relation::get_relation(pool, me, who)
+            .await
+            .expect("relation");
+        let mut p = profile();
+        p.user_id = row.id.clone();
+        pack_inline_with_roles(&row, &p, false, Some(&rel), &ctx(), false, None)
+    }
+
+    /// upstream 'packManyによるpreloadがある時、preloadが無い時とpackの結果
+    /// が同じになるか見たい / no-preload' — the 8-relationship combo matrix
+    /// through getRelation + the pack. (`preload` pins packMany batching,
+    /// which this tree resolves per-row at the endpoint layer.)
+    #[tokio::test]
+    async fn unit_services_relation_matrix_packs_user_detailed() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let pool = mk_db::test_support::fresh_db("mkcore_user_pack_rel").await;
+        mk_db::run_migrations(&pool).await.expect("migrations");
+
+        async fn add_user(pool: &mk_db::sqlx::PgPool, id: &str) {
+            mk_db::sqlx::query(
+                r#"INSERT INTO "user" ("id", "username", "usernameLower")
+                   VALUES ($1, $1, $1)"#,
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("insert user");
+        }
+
+        add_user(&pool, "meU").await;
+        for who in ["tr1", "tr2", "tr3", "tr4", "tr5", "tr6", "tr7", "tr8"] {
+            add_user(&pool, who).await;
+        }
+
+        // me がフォローしてる人たち
+        mk_db::social::insert_following(&pool, "a-tr1", "meU", "tr1", false)
+            .await
+            .expect("follow tr1");
+        let out = rel_pack(&pool, "meU", "tr1").await;
+        expect_flags(&out, [true, false, false, false, false, false, false, false]);
+
+        // me をフォローしてる人たち
+        mk_db::social::insert_following(&pool, "a-tr2", "tr2", "meU", false)
+            .await
+            .expect("follow from tr2");
+        let out = rel_pack(&pool, "meU", "tr2").await;
+        expect_flags(&out, [false, true, false, false, false, false, false, false]);
+
+        // me がフォローリクエストを送った人たち
+        mk_db::social::insert_follow_request(&pool, "a-tr3", "meU", "tr3", false)
+            .await
+            .expect("request tr3");
+        let out = rel_pack(&pool, "meU", "tr3").await;
+        expect_flags(&out, [false, false, true, false, false, false, false, false]);
+
+        // me にフォローリクエストを送った人たち
+        mk_db::social::insert_follow_request(&pool, "a-tr4", "tr4", "meU", false)
+            .await
+            .expect("request from tr4");
+        let out = rel_pack(&pool, "meU", "tr4").await;
+        expect_flags(&out, [false, false, false, true, false, false, false, false]);
+
+        // me がブロックしてる人たち
+        mk_db::social::block(&pool, "a-tr5", "meU", "tr5")
+            .await
+            .expect("block tr5");
+        let out = rel_pack(&pool, "meU", "tr5").await;
+        expect_flags(&out, [false, false, false, false, true, false, false, false]);
+
+        // me をブロックしてる人たち
+        mk_db::social::block(&pool, "a-tr6", "tr6", "meU")
+            .await
+            .expect("block from tr6");
+        let out = rel_pack(&pool, "meU", "tr6").await;
+        expect_flags(&out, [false, false, false, false, false, true, false, false]);
+
+        // me がミュートしてる人たち
+        mk_db::social::insert_muting(&pool, "a-tr7", "meU", "tr7", None)
+            .await
+            .expect("mute tr7");
+        let out = rel_pack(&pool, "meU", "tr7").await;
+        expect_flags(&out, [false, false, false, false, false, false, true, false]);
+
+        // me がリノートミュートしてる人たち
+        mk_db::social::insert_renote_muting(&pool, "a-tr8", "meU", "tr8")
+            .await
+            .expect("renote-mute tr8");
+        let out = rel_pack(&pool, "meU", "tr8").await;
+        expect_flags(&out, [false, false, false, false, false, false, false, true]);
+    }
 }

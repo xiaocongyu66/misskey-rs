@@ -1821,4 +1821,100 @@ mod tests {
             "ファイル 名前.jpg"
         );
     }
+
+    // unit-services — 1:1 port of upstream
+    // test/unit/entities/{DriveFileEntityService,DriveFolderEntityService}.ts
+    // (the pack slices this tree carries). The detail:true matrices (folder
+    // parent chains, foldersCount/filesCount, packNullable missing-null,
+    // packMany dedup) need the DriveFolder detail pack + drive/folders/show —
+    // unmodeled here (the e2e harness pins folderId params only) → SKIPPED,
+    // no dead code.
+
+    /// Upstream createFile fixture riding DriveFileRow::default().
+    fn file_row_fixture() -> mk_db::drive::DriveFileRow {
+        mk_db::drive::DriveFileRow {
+            id: "file0001ab".to_string(),
+            user_id: None,
+            md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            name: "file-file0001ab".to_string(),
+            file_type: "text/plain".to_string(),
+            size: 1,
+            url: "https://example.com/file0001ab".to_string(),
+            properties: json!({}),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drive_file_pack_detail_false_shape() {
+        // upstream DriveFileEntityService 'pack detail: false' — folder /
+        // userId / user stay null on the no-owner fixture, thumbnailUrl null.
+        let packed = pack_drive_file(&file_row_fixture(), true);
+        assert_eq!(packed["id"], json!("file0001ab"));
+        assert_eq!(packed["folderId"], json!(null));
+        assert_eq!(packed["folder"], json!(null));
+        assert_eq!(packed["userId"], json!(null));
+        assert_eq!(packed["user"], json!(null));
+        assert_eq!(packed["name"], json!("file-file0001ab"));
+        assert_eq!(packed["type"], json!("text/plain"));
+        assert_eq!(packed["size"], json!(1));
+        assert_eq!(
+            packed["md5"],
+            json!("d41d8cd98f00b204e9800998ecf8427e")
+        );
+        // self mode keeps the stored url and the untouched property set
+        assert_eq!(packed["url"], json!("https://example.com/file0001ab"));
+        assert_eq!(packed["properties"], json!({}));
+        assert_eq!(packed["thumbnailUrl"], json!(null));
+    }
+
+    #[test]
+    fn drive_file_pack_public_url_and_properties() {
+        // DriveFileEntityService.getPublicUrl / getPublicProperties parity:
+        // non-self packs ride webpublicUrl (stored url as the fallback) and
+        // only the width/height property glyphs survive.
+        let mut row = file_row_fixture();
+        row.webpublic_url = Some("https://cdn.example.com/w/file0001ab".to_string());
+        row.properties = json!({ "width": 640, "height": 480, "angle": 90 });
+        let packed = pack_drive_file(&row, false);
+        assert_eq!(
+            packed["url"],
+            json!("https://cdn.example.com/w/file0001ab")
+        );
+        assert_eq!(
+            packed["properties"],
+            json!({ "width": 640, "height": 480 })
+        );
+
+        // no dimensions → public properties degenerate to {}
+        row.properties = json!({ "angle": 90 });
+        assert_eq!(pack_drive_file(&row, false)["properties"], json!({}));
+
+        // self mode keeps the full property set untouched
+        row.properties = json!({ "width": 640, "height": 480, "angle": 90 });
+        assert_eq!(
+            pack_drive_file(&row, true)["properties"],
+            json!({ "width": 640, "height": 480, "angle": 90 })
+        );
+    }
+
+    #[test]
+    fn drive_folder_pack_detail_false_shape() {
+        // upstream DriveFolderEntityService 'pack detail: false' — id +
+        // parentId ride; parent / foldersCount / filesCount are detail-only
+        // keys and stay ABSENT (undefined upstream; unmodeled here).
+        let row = mk_db::drive::DriveFolderRow {
+            id: "folder-child".to_string(),
+            user_id: "owner0000".to_string(),
+            name: "child".to_string(),
+            parent_id: Some("folder-root".to_string()),
+        };
+        let packed = pack_folder(&row, "folder-child");
+        assert_eq!(packed["id"], json!("folder-child"));
+        assert_eq!(packed["parentId"], json!("folder-root"));
+        assert_eq!(packed["name"], json!("child"));
+        assert!(packed.get("parent").is_none());
+        assert!(packed.get("foldersCount").is_none());
+        assert!(packed.get("filesCount").is_none());
+    }
 }
