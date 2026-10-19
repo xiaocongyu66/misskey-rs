@@ -217,12 +217,22 @@ pub(crate) async fn handle(
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
-    match name {
+    let resp = match name {
         "i/move" => move_route(state, pool, body, token).await,
         "mute/list" => mute_list(state, pool, body, token).await,
         "blocking/list" => blocking_list(state, pool, body, token).await,
-        _ => api_err(ApiError::unknown_endpoint()),
-    }
+        _ => return api_err(ApiError::unknown_endpoint()),
+    };
+    // census instrumentation: the pinned rows assert bare `.status`, so a
+    // 500 with no error-arm line (run rn39323486789 had ZERO dbg_move
+    // lines while i/move answered 500) stays blind — mirror the status.
+    tracing::info!(
+        target: "dbg_move",
+        name,
+        status = resp.status().as_u16(),
+        "handle() reply"
+    );
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +722,7 @@ async fn move_route(
         Err(e) => return db_err("move_route find_me[fresh]", e),
     };
     let Some(row) = row else {
+        tracing::error!(target: "dbg_move", "move_route 500: fresh me row vanished");
         return api_err(ApiError::internal_error());
     };
     let profile = match mk_db::user::find_profile(pool, &row.id).await {

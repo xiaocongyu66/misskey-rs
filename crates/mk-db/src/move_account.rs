@@ -136,13 +136,17 @@ pub async fn mutings_of(
 }
 
 /// copyMutings dedup: `expiresAt: IsNull()` muters who already mute dst.
+/// Census rn39323486791: this raw string carried a stray trailing quote
+/// (`IS NULL""#`) — the SQL reached Postgres as `... IS NULL"` and the
+/// unterminated quoted identifier 500'd i/move mid-postMoveProcess (it used
+/// to be masked because the delayed-unfollow enqueue crashed earlier).
 pub async fn indefinite_muters_of(
     pool: &PgPool,
     mutee_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         r#"SELECT "muterId" FROM "muting"
-           WHERE "muteeId" = $1 AND "expiresAt" IS NULL""#,
+           WHERE "muteeId" = $1 AND "expiresAt" IS NULL"#,
     )
     .bind(mutee_id)
     .fetch_all(pool)
