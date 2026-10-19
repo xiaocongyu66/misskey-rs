@@ -178,6 +178,158 @@ pub async fn find_drive_file(pool: &PgPool, id: &str) -> Result<Option<DriveFile
     .await
 }
 
+// ==== arena-files: drive/files {list,find,find-by-hash,check-existence,
+// show,delete} (upstream endpoints/drive/files/*) — the read/lookup surface
+// e2e-harness/files.ts drives. ==========================================
+
+/// SELECT list shared by the arena-files lookups (identical shape to
+/// `find_drive_file`).
+const FILE_COLS: &str = r#""id", "userId", "md5", "name", ("type"::text) AS "type", "size", "blurhash", "url", "webpublicUrl", "webpublicType", ("properties"::text)::jsonb AS "properties", "comment", "isSensitive", "folderId""#;
+
+/// `drive/files` (endpoints/drive/files.ts): owner-scoped list.
+/// `makePaginationQuery` bounds are exclusive (id = the raw varchar compare);
+/// sinceId-only → oldest-first ASC, otherwise newest-first DESC. folderId:
+/// `if (ps.folderId)` → equal, else IS NULL. type: exact match, or the
+/// `x/*` wildcard → `LIKE 'x/%'` (files.ts type arm). The default sort
+/// (`ps.sort` switch aside) is the pagination id DESC.
+#[allow(clippy::too_many_arguments)]
+pub async fn files_list(
+    pool: &PgPool,
+    user_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    folder_id: Option<&str>,
+    type_exact: Option<&str>,
+    type_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DriveFileRow>, sqlx::Error> {
+    let mut q = sqlx::QueryBuilder::new("SELECT ");
+    q.push(FILE_COLS)
+        .push(r#" FROM "drive_file" WHERE "userId" = "#);
+    q.push_bind(user_id);
+    q.push(r#" AND "folderId""#);
+    match folder_id {
+        Some(fid) => {
+            q.push(" = ").push_bind(fid);
+        }
+        None => {
+            q.push(" IS NULL");
+        }
+    }
+    if let Some(t) = type_exact {
+        q.push(r#" AND "type" = "#).push_bind(t);
+    }
+    if let Some(p) = type_prefix {
+        let pattern = format!("{p}%");
+        q.push(r#" AND "type" LIKE "#).push_bind(pattern);
+    }
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (Some(s), None) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+        }
+        (None, Some(u)) => {
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (None, None) => {}
+    }
+    // makePaginationQuery order: sinceId+untilId → DESC, sinceId-only →
+    // ASC (oldest-first), untilId-only / neither → DESC.
+    if since_id.is_some() && until_id.is_none() {
+        q.push(r#" ORDER BY "id" ASC"#);
+    } else {
+        q.push(r#" ORDER BY "id" DESC"#);
+    }
+    q.push(" LIMIT ").push_bind(limit);
+    q.build_query_as::<DriveFileRow>().fetch_all(pool).await
+}
+
+/// `drive/files/find` (find.ts): name + userId, folderId ?? IsNull. No
+/// explicit order upstream (findBy) — keep the pagination DESC shape for
+/// determinism.
+pub async fn files_find_by_name(
+    pool: &PgPool,
+    user_id: &str,
+    name: &str,
+    folder_id: Option<&str>,
+) -> Result<Vec<DriveFileRow>, sqlx::Error> {
+    let mut q = sqlx::QueryBuilder::new("SELECT ");
+    q.push(FILE_COLS)
+        .push(r#" FROM "drive_file" WHERE "name" = "#)
+        .push_bind(name)
+        .push(r#" AND "userId" = "#)
+        .push_bind(user_id)
+        .push(r#" AND "folderId""#);
+    match folder_id {
+        Some(fid) => {
+            q.push(" = ").push_bind(fid);
+        }
+        None => {
+            q.push(" IS NULL");
+        }
+    }
+    q.build_query_as::<DriveFileRow>().fetch_all(pool).await
+}
+
+/// `drive/files/find-by-hash.ts`: md5 + userId.
+pub async fn files_find_by_md5(
+    pool: &PgPool,
+    user_id: &str,
+    md5: &str,
+) -> Result<Vec<DriveFileRow>, sqlx::Error> {
+    sqlx::query_as::<_, DriveFileRow>(&format!(
+        r#"SELECT {FILE_COLS} FROM "drive_file" WHERE "md5" = $1 AND "userId" = $2 ORDER BY "id" DESC"#
+    ))
+    .bind(md5)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// `drive/files/check-existence.ts`: EXISTS(md5 + userId).
+pub async fn md5_exists(pool: &PgPool, user_id: &str, md5: &str) -> Result<bool, sqlx::Error> {
+    let hit: Option<(bool,)> = sqlx::query_as(
+        r#"SELECT EXISTS(SELECT 1 FROM "drive_file" WHERE "md5" = $1 AND "userId" = $2)"#,
+    )
+    .bind(md5)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(hit.map(|(v,)| v).unwrap_or(false))
+}
+
+/// `drive/files/show.ts` `findOneBy([{ url }, { webpublicUrl },
+/// { thumbnailUrl }])` — TypeORM array → OR, first match wins (stable order
+/// by id).
+pub async fn find_file_by_any_url(
+    pool: &PgPool,
+    url: &str,
+) -> Result<Option<DriveFileRow>, sqlx::Error> {
+    sqlx::query_as::<_, DriveFileRow>(&format!(
+        r#"SELECT {FILE_COLS} FROM "drive_file"
+           WHERE "url" = $1 OR "webpublicUrl" = $1 OR "thumbnailUrl" = $1
+           ORDER BY "id" LIMIT 1"#
+    ))
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `DriveService.deleteFile` → `deletePostProcess`: the row itself (charts
+/// and the object-storage sweep have no server-side counterpart; notes keep
+/// their fileIds exactly like upstream — the packer merely drops the missing
+/// file).
+pub async fn delete_drive_file(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "drive_file" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// `NoteCreateService.create`: the note's files = drive files owned by the
 /// author with the requested ids, ordered by array_position so the pack's
 /// fileIds/files arrays match the request order (upstream L305-315).

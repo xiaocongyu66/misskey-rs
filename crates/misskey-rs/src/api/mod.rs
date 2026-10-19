@@ -541,6 +541,15 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // the /streaming hub routed in main.rs).
     if name == "drive/files/attached-notes"
         || name == "drive/files/upload-from-url"
+        // arena-files: the drive/files read/lookup surface (upstream
+        // endpoints/drive/files/* — list/show/delete/find/find-by-hash/
+        // check-existence)
+        || name == "drive/files"
+        || name == "drive/files/show"
+        || name == "drive/files/delete"
+        || name == "drive/files/find"
+        || name == "drive/files/find-by-hash"
+        || name == "drive/files/check-existence"
         // endpoints-arena: the drive/folders family (upstream
         // endpoints/drive/folders/{create,update}.ts)
         || name == "drive/folders/create"
@@ -2821,7 +2830,8 @@ async fn users_search(state: &AppState, body: &Value, token: Option<String>) -> 
 }
 
 /// Shared note-packing for the M1 slice: user row + profile → UserLite value.
-async fn note_user_lite(
+/// (arena-files: also reads as the `user` pack of drive/files/show.)
+pub(crate) async fn note_user_lite(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     user_id: &str,

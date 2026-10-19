@@ -264,6 +264,14 @@ pub(crate) async fn handle_json(
     match name {
         "drive/files/attached-notes" => attached_notes(state, body, token).await,
         "drive/files/upload-from-url" => files_upload_from_url(state, body, token).await,
+        // arena-files: the drive/files read/lookup surface (upstream
+        // endpoints/drive/files/*)
+        "drive/files" => files_list(state, body, token).await,
+        "drive/files/show" => files_show(state, body, token).await,
+        "drive/files/delete" => files_delete(state, body, token).await,
+        "drive/files/find" => files_find(state, body, token).await,
+        "drive/files/find-by-hash" => files_find_by_hash(state, body, token).await,
+        "drive/files/check-existence" => files_check_existence(state, body, token).await,
         "drive/folders/create" => folders_create(state, body, token).await,
         "drive/folders/update" => folders_update(state, body, token).await,
         _ => api_err(ApiError::unknown_endpoint()),
@@ -660,9 +668,25 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
     // name = ps.name ?? blob basename, run through correctFileName (the
     // drive.ts 'ローカルからアップロードできる' case pins name 'テスト画像' +
     // a jpeg blob → 'テスト画像.jpg').
+    // arena-files: create.ts name ladder — trim → ''→null → 'blob'→null →
+    // validateFileName (200 cap, no '\\' "/" "..") else INVALID_FILE_NAME
+    // (f449b209-0c60-4e51-84d5-29486263bfd4).
     let raw_name = field(&parts, "name")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
+    if let Some(n) = raw_name {
+        let valid_filename =
+            n.chars().count() <= 200 && !n.contains('\\') && !n.contains('/') && !n.contains("..");
+        if !valid_filename {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "INVALID_FILE_NAME",
+                "f449b209-0c60-4e51-84d5-29486263bfd4",
+                "Invalid file name.",
+            ));
+        }
+    }
     let base_name = raw_name
         .unwrap_or(&file.0)
         .rsplit('/')
@@ -1301,6 +1325,380 @@ fn qs_encode(s: &str) -> String {
         }
     }
     out
+}
+
+// ==== arena-files: drive/files {list, show, delete, find, find-by-hash,
+// check-existence} (upstream endpoints/drive/files/*) — the read/lookup
+// surface e2e-harness/files.ts drives (upstream has no test/e2e/files.ts at
+// the pin; drive.ts's 4 green tests own create / upload-from-url /
+// attached-notes). All six names are requireCredential; the owner-or-
+// moderator gate mirrors show.ts/delete.ts/update.ts (`!isModerator(me) &&
+// file.userId !== me.id` → ACCESS_DENIED).
+
+/// Param-reject helper (ajv INVALID_PARAM with the param/reason info shape).
+fn file_param_err(param: &str, reason: &str) -> Response {
+    api_err(ApiError::invalid_param(json!({
+        "param": param,
+        "reason": reason,
+    })))
+}
+
+/// Endpoint-error helper (ApiError meta.errors rows are 400s here).
+fn file_meta_err(code: &'static str, id: &'static str, msg: &'static str) -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        code,
+        id,
+        msg,
+    ))
+}
+
+/// `misc/id` Misskey — `misskey:id` format = base36 aid (alnum, non-empty).
+fn is_aid(s: &str) -> bool {
+    is_alnum_folder_id(s)
+}
+
+/// `drive/files` (endpoints/drive/files.ts). Params: limit 1..100 default
+/// 10; sinceId/untilId exclusive (makePaginationQuery); sinceDate/untilDate
+/// are converted to aid bounds exactly like QueryService
+/// (`idService.gen(ms)` — gen_aid). folderId absent/null → IS NULL,
+/// otherwise equality; type exact or `x/*` wildcard. Response =
+/// packMany(files, { detail: false, self: true }).
+pub(crate) async fn files_list(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 10i64,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=100).contains(&n) => n,
+            _ => {
+                return file_param_err("limit", "must be an integer in 1..=100");
+            }
+        },
+    };
+
+    // makePaginationQuery: id params win over their date twins (the upstream
+    // if/else chain checks sinceId/untilId first). Date values become aid
+    // bounds via gen — QueryService `idService.gen(sinceDate)`.
+    let mut since_id: Option<String> = None;
+    let mut until_id: Option<String> = None;
+    match body.get("sinceId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if is_aid(s) => since_id = Some(s.clone()),
+        Some(_) => return file_param_err("sinceId", "must be an alphanumeric id"),
+    }
+    match body.get("untilId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if is_aid(s) => until_id = Some(s.clone()),
+        Some(_) => return file_param_err("untilId", "must be an alphanumeric id"),
+    }
+    if since_id.is_none() {
+        if let Some(v) = body.get("sinceDate") {
+            let Some(ms) = v.as_i64() else {
+                return file_param_err("sinceDate", "must be an integer");
+            };
+            since_id = Some(mk_types::id::gen_aid(ms));
+        }
+    }
+    if until_id.is_none() {
+        if let Some(v) = body.get("untilDate") {
+            let Some(ms) = v.as_i64() else {
+                return file_param_err("untilDate", "must be an integer");
+            };
+            until_id = Some(mk_types::id::gen_aid(ms));
+        }
+    }
+
+    // `if (ps.folderId)` — a validated folderId filters, null/absent falls to
+    // the IS NULL arm.
+    let folder_id = match body.get("folderId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && is_aid(s) => Some(s.clone()),
+        Some(_) => return file_param_err("folderId", "must be an alphanumeric id or null"),
+    };
+
+    // type pattern /^[a-zA-Z\/\-*]+$/: exact match, or `ends with /*` → the
+    // LIKE prefix arm.
+    let type_exact;
+    let type_prefix;
+    match body.get("type") {
+        None | Some(Value::Null) => {
+            type_exact = None;
+            type_prefix = None;
+        }
+        Some(Value::String(s)) => {
+            let valid_pattern = !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '*' || c == '-');
+            if !valid_pattern {
+                return file_param_err("type", "must match ^[a-zA-Z/\\-*]+$ or null");
+            }
+            if s.ends_with("/*") {
+                type_exact = None;
+                type_prefix = Some(s.replace("/*", "/"));
+            } else {
+                type_exact = Some(s.clone());
+                type_prefix = None;
+            }
+        }
+        Some(_) => return file_param_err("type", "must be a string or null"),
+    }
+
+    let rows = match mk_db::drive::files_list(
+        pool,
+        &me_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        folder_id.as_deref(),
+        type_exact.as_deref(),
+        type_prefix.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive_files", error = %e, "files_list");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let out: Vec<Value> = rows.iter().map(|r| pack_drive_file(r, true)).collect();
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `drive/files/show` (show.ts). anyOf fileId|url — a present fileId key
+/// owns the branch (ajv anyOf objects ignore extra props); the url arm ORs
+/// url / webpublicUrl / thumbnailUrl. Owner or moderator, else ACCESS_DENIED;
+/// pack(file, { detail: true, withUser: true, self: true }).
+pub(crate) async fn files_show(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+
+    let file = if body.get("fileId").is_some() {
+        let Some(file_id) = body
+            .get("fileId")
+            .and_then(Value::as_str)
+            .filter(|s| is_aid(s))
+        else {
+            return file_param_err("fileId", "must be an alphanumeric id");
+        };
+        match mk_db::drive::find_drive_file(pool, file_id).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(target: "dbg_drive_files", error = %e, "files_show find");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    } else if body.get("url").is_some() {
+        let Some(url) = body.get("url").and_then(Value::as_str) else {
+            return file_param_err("url", "must be a string");
+        };
+        match mk_db::drive::find_file_by_any_url(pool, url).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(target: "dbg_drive_files", error = %e, "files_show url");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    } else {
+        return file_param_err("fileId", "required");
+    };
+
+    let Some(file) = file else {
+        return file_meta_err(
+            "NO_SUCH_FILE",
+            "067bc436-2718-4795-b0fb-ecbe43949e31",
+            "No such file.",
+        );
+    };
+    if file.user_id.as_deref() != Some(me_id.as_str())
+        && !super::viewer_is_moderator(pool, Some(&me_id)).await
+    {
+        return file_meta_err(
+            "ACCESS_DENIED",
+            "25b73c73-68b1-41d0-bad1-381cfdf6579f",
+            "Access denied.",
+        );
+    }
+
+    let mut packed = pack_drive_file(&file, true);
+    // detail: true → the packed folder when one is set (DriveFileEntityService
+    // pack L213); withUser: true → the packed owner (L214-215).
+    if let Some(folder_id) = file.folder_id.clone() {
+        match mk_db::drive::find_folder_by_id(pool, &folder_id).await {
+            Ok(Some(frow)) => packed["folder"] = pack_folder(&frow, &folder_id),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_drive_files", error = %e, "files_show folder");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    }
+    if let Some(owner_id) = file.user_id.clone() {
+        match super::note_user_lite(state, pool, &owner_id).await {
+            Ok(u) => packed["user"] = u,
+            Err(_) => {
+                // owner vanished between the row read and the pack — upstream
+                // packs null via the withUser arm only for null userId, but a
+                // dangling owner row must not 500 the read
+            }
+        }
+    }
+    (StatusCode::OK, Json(packed)).into_response()
+}
+
+/// `drive/files/delete` (delete.ts): owner-scoped row → DriveService.
+/// deleteFile → row gone (object-storage/charts legs unported), 204 void.
+pub(crate) async fn files_delete(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let Some(file_id) = body.get("fileId").and_then(Value::as_str) else {
+        return file_param_err("fileId", "required");
+    };
+    if !is_aid(file_id) {
+        return file_param_err("fileId", "must be an alphanumeric id");
+    }
+    let file = match mk_db::drive::find_drive_file(pool, file_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive_files", error = %e, "files_delete find");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let Some(file) = file else {
+        return file_meta_err(
+            "NO_SUCH_FILE",
+            "908939ec-e52b-4458-b395-1025195cea58",
+            "No such file.",
+        );
+    };
+    if file.user_id.as_deref() != Some(me_id.as_str())
+        && !super::viewer_is_moderator(pool, Some(&me_id)).await
+    {
+        return file_meta_err(
+            "ACCESS_DENIED",
+            "5eb8d909-2540-4970-90b8-dd6f86088121",
+            "Access denied.",
+        );
+    }
+    // deletePostProcess also publishes the drive-stream fileDeleted event —
+    // the server's streaming hub has no `drive` channel yet, so nothing to
+    // fan out (the main-channel push lands when a consumer needs it).
+    if let Err(e) = mk_db::drive::delete_drive_file(pool, file_id).await {
+        tracing::error!(target: "dbg_drive_files", error = %e, "files_delete");
+        return api_err(ApiError::internal_error());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `drive/files/find` (find.ts): name (required) + userId, folderId default
+/// IS NULL. packMany(files, { self: true }).
+pub(crate) async fn files_find(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let Some(name) = body.get("name").and_then(Value::as_str) else {
+        return file_param_err("name", "required");
+    };
+    let folder_id = match body.get("folderId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && is_aid(s) => Some(s.clone()),
+        Some(_) => return file_param_err("folderId", "must be an alphanumeric id or null"),
+    };
+    let rows =
+        match mk_db::drive::files_find_by_name(pool, &me_id, name, folder_id.as_deref()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_drive_files", error = %e, "files_find");
+                return api_err(ApiError::internal_error());
+            }
+        };
+    let out: Vec<Value> = rows.iter().map(|r| pack_drive_file(r, true)).collect();
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `drive/files/find-by-hash` (find-by-hash.ts): md5 + userId.
+pub(crate) async fn files_find_by_hash(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let Some(md5) = body.get("md5").and_then(Value::as_str) else {
+        return file_param_err("md5", "required");
+    };
+    let rows = match mk_db::drive::files_find_by_md5(pool, &me_id, md5).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive_files", error = %e, "files_find_by_hash");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let out: Vec<Value> = rows.iter().map(|r| pack_drive_file(r, true)).collect();
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `drive/files/check-existence` (check-existence.ts): owner-scoped EXISTS.
+pub(crate) async fn files_check_existence(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let Some(md5) = body.get("md5").and_then(Value::as_str) else {
+        return file_param_err("md5", "required");
+    };
+    let exist = match mk_db::drive::md5_exists(pool, &me_id, md5).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive_files", error = %e, "files_check_existence");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    (StatusCode::OK, Json(json!(exist))).into_response()
 }
 
 #[cfg(test)]
