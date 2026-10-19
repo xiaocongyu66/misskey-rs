@@ -12897,7 +12897,10 @@ async fn move_final_muting_copy_dedup_prepares_and_filters() {
     let pool = fresh_pool("move_final_muting_dedup").await;
 
     let app = crate::build_router(test_state(pool.clone()));
-    let dst = signup(&app, "bob")["id"].as_str().unwrap().to_string();
+    let dst = signup(&app, "bob").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let carol = signup(&app, "carol").await["id"]
         .as_str()
         .unwrap()
@@ -13101,9 +13104,10 @@ async fn fetchres_seed(
     app: &axum::Router,
 ) -> (Value, String, String, String, String, String, String) {
     let alice = signup(app, "alice").await;
-    // borrows off the signup value (the json! macro only copies the &strs)
-    let a_token = alice["token"].as_str().unwrap();
-    let a_id = alice["id"].as_str().unwrap();
+    // borrows off the signup value (the json! macro only copies the &strs);
+    // owned copies — the tuple hands `alice` to the caller below
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
     let (s, _) = post_json(
         app.clone(),
         "/api/admin/update-meta",
@@ -13169,15 +13173,7 @@ async fn fetchres_seed(
     assert_eq!(s, StatusCode::OK, "gallery/posts/create: {gallery}");
     let gallery_id = gallery["id"].as_str().unwrap().to_string();
 
-    (
-        alice,
-        a_id.to_string(),
-        note_id,
-        page_id,
-        flash_id,
-        clip_id,
-        gallery_id,
-    )
+    (alice, a_id, note_id, page_id, flash_id, clip_id, gallery_id)
 }
 
 // arena-fetchres census leg 1 (the HTML plane): the static/foyer GETs, the
@@ -13340,7 +13336,7 @@ async fn fetchres_html_plane_and_negotiated_pages() {
     assert_eq!(s, StatusCode::FOUND, "302 redirect");
     assert_eq!(
         hdr(&h, "location").as_deref(),
-        Some(&format!("/@{username}"))
+        Some(format!("/@{username}").as_str())
     );
     assert_eq!(hdr(&h, "vary").as_deref(), Some("Accept"));
     let (s, _, _) = get_accept(&app, "/users/ghostxxxxxxxx", "*/*").await;

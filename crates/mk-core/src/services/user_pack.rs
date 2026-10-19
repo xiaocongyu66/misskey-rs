@@ -566,6 +566,8 @@ mod tests {
             notes_count: 3,
             is_bot: false,
             is_cat: false,
+            moved_to_uri: None,
+            also_known_as: None,
         }
     }
 
