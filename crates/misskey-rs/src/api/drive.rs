@@ -636,6 +636,16 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    // arena-move: drive/files/create rides the moved gate in-handler — the
+    // head gate in dispatch cannot probe a multipart body, so the Prohibit
+    // access after moving: /drive/files/create row answers here (upstream
+    // ApiCallService order: moved 403 before any endpoint body).
+    if matches!(
+        mk_db::move_account::get_moved_to_uri(pool, &me_id).await,
+        Ok(Some(_))
+    ) {
+        return super::move_account::moved_forbidden();
+    }
 
     // The `file` part: required (misskey's ajv passes the raw file through;
     // a missing multipart file part fails upstream's file extraction).

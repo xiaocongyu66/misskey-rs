@@ -123,6 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // BullMQ worker lane) — PG-brokered via mk_queue. config.url is
             // the base the exported drive files' /files urls embed.
             api::exports::spawn_export_worker(pool.clone(), config.url.clone());
+            // arena-move: the relationship worker — follow/block copy jobs +
+            // the delayed (test: 10s / prod: 24h) unfollow of the moved
+            // account's own followings (AccountMoveService + queueService).
+            api::move_account::spawn_move_worker(pool.clone());
             tracing::info!("postgres connected, migrations applied");
             Some(pool)
         }

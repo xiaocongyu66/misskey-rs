@@ -110,6 +110,12 @@ mod miauth;
 // drive/files {list,show,delete} (the exports.ts beforeEach / poll loop).
 // pub(crate): main.rs mounts the /files route + spawns the queue worker.
 pub(crate) mod exports;
+// arena-move: account migration (upstream endpoints/i/move.ts +
+// AccountMoveService.ts local slice) + the PROHIBIT_MOVED dispatch gate
+// (ApiCallService.ts L421-430) + the mute/list + blocking/list read lanes
+// the pinned move.ts drives post-move. pub(crate): main.rs spawns the
+// relationship-queue worker.
+pub(crate) mod move_account;
 // arena-oauth: OAuth2 provider flows (upstream server/oauth/* + test/e2e/
 // oauth.ts) — /oauth/{authorize,decision,token} routes + the PKCE grant
 // caches + the access-token bearer resolution the notes/create kind gate
@@ -134,7 +140,7 @@ const M0_ENDPOINTS: &[&str] = &[
     "drive",
 ];
 
-pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
+pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Response {
     let path = req.uri().path().to_string();
     let Some(name) = path.strip_prefix("/api/") else {
         return api_err(ApiError::unknown_endpoint());
@@ -189,6 +195,46 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return (StatusCode::OK, Json(json!({ "success": true }))).into_response();
     }
     // ==== END arena-2fa _test/env ====
+
+    // ==== arena-move PROHIBIT-MOVED GATE (ApiCallService.ts L421-430) ====
+    // Upstream resolves the credential (suspension gate first, then) the
+    // ep.meta.prohibitMoved barrier BEFORE paramDef validation or any
+    // endpoint body, and the per-arm dispatch below answers 404 for names
+    // nothing implements — the moved-account probe rows (`api(endpoint, {},
+    // alice)` with empty params over the 42-name each-matrix + the
+    // antennas/update + drive/files/* + i/move specials) would therefore
+    // 404/400 instead of 403. So: for POSTs hitting a prohibitMoved name,
+    // buffer the body once, probe the credential off it (Bearer header or
+    // the `i` body field), and answer 403 YOUR_ACCOUNT_MOVED when its user
+    // has moved. Unresolvable credentials fall through — the downstream arm
+    // still produces the upstream-ordered 401 shapes. drive/files/create is
+    // multipart (no JSON probe) and gets its in-handler check in
+    // api::drive::files_create.
+    if method == Method::POST && move_account::is_prohibit_moved(&name) {
+        let Some(pool) = &state.pool else {
+            return api_err(ApiError::internal_error());
+        };
+        let (parts, body) = req.into_parts();
+        let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+            Ok(b) => b,
+            Err(_) => {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "",
+                    "reason": "body could not be read",
+                })));
+            }
+        };
+        // Re-wrap the buffered body so every per-arm parse_json_body call
+        // below keeps its by-value Request contract (one body buffer at the
+        // head, N logical re-reads — the same body upstream parses once).
+        req = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+        let probe: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+        let token = extract_token(&probe, req.headers());
+        if let Err(resp) = move_account::moved_gate(pool, token.as_deref()).await {
+            return resp;
+        }
+    }
+    // ==== END arena-move PROHIBIT-MOVED GATE ====
 
     // Registry endpoints that need a JSON body parsed before dispatch.
     if name == "users/show"
@@ -620,6 +666,28 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return drive::handle_json(&state, name.as_str(), &body, token).await;
     }
     // ==== END drive-agent2 DISPATCH ARM ====
+
+    // ==== arena-move DISPATCH ARM (i/move + mute/list + blocking/list) ====
+    // Self-contained block on the exports-arm pattern: method check, body
+    // parsing and token extraction live here; the endpoint bodies + error
+    // tables in api::move_account (the queue legs run on the relationship
+    // worker spawned in main.rs; db paths in mk-db/src/move_account.rs).
+    // None of the 3 names collide with an earlier arm (mute/list and
+    // blocking/list are NOT in social::SOCIAL_ENDPOINTS — that set owns the
+    // create/delete verbs only), so this arm shadows nothing.
+    if move_account::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return move_account::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END arena-move DISPATCH ARM ====
 
     // social-agent dispatch block: follow/mute/block social actions
     // (following/*, mute/*, blocking/*) — requireCredential, JSON body,
@@ -1559,7 +1627,7 @@ async fn viewer_is_moderator(pool: &mk_db::sqlx::PgPool, me_id: Option<&str>) ->
 /// Shared me-id resolution from a token: only native user tokens (length 16,
 /// `misc/token.ts isNativeUserToken`) are matched against `user.token` for
 /// local users; anything else resolves to "not me" (DB errors are logged).
-async fn resolve_me(pool: &mk_db::sqlx::PgPool, token: Option<&str>) -> Option<String> {
+pub(crate) async fn resolve_me(pool: &mk_db::sqlx::PgPool, token: Option<&str>) -> Option<String> {
     let Some(t) = token else {
         return None;
     };
@@ -1731,7 +1799,7 @@ fn js_today() -> String {
 /// Upstream `ApiCallService.#sendAuthenticationError`: 401 with the stable
 /// AUTHENTICATION_FAILED error (plus a WWW-Authenticate header, which the
 /// `api_err` envelope cannot carry yet).
-fn authentication_failed() -> Response {
+pub(crate) fn authentication_failed() -> Response {
     api_err(ApiError::new(
         401,
         mk_types::api_error::ApiErrorKind::Client,
@@ -2025,6 +2093,116 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
         ));
     }
 
+    // ==== arena-move: alsoKnownAs (i/update.ts L451-480) ====
+    // ajv plane first (paramDef `{ type: 'array', maxItems: 10,
+    // uniqueItems: true, items: string }` — schema INVALID_PARAM 3d81ceae,
+    // the endpoint-base id, NOT ApiError::invalid_param's 0b5f1631), then
+    // the handler arm: moved → 403 YOUR_ACCOUNT_MOVED, per-line acct
+    // resolution → NO_SUCH_USER, self → FORBIDDEN_TO_SET_YOURSELF, empty
+    // resolved set → NULL. Sources resolve through
+    // RemoteUserResolveService.resolveUser (local slice: host-free or
+    // configured-host accts only). Like upstream, everything here throws
+    // BEFORE any other field write.
+    let alias_update: Option<Option<String>> = if body.get("alsoKnownAs").is_some() {
+        let Some(arr) = body.get("alsoKnownAs").and_then(|v| v.as_array()) else {
+            return invalid_param("alsoKnownAs", "must be array");
+        };
+        if arr.len() > 10 {
+            return invalid_param("alsoKnownAs", "must NOT have more than 10 items");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for item in arr {
+            let Some(line) = item.as_str() else {
+                return invalid_param("alsoKnownAs", "must be string");
+            };
+            if !seen.insert(line.to_string()) {
+                return move_account::schema_invalid_param(
+                    "alsoKnownAs",
+                    "must NOT have duplicate items (items ## 0 and 1 are identical)",
+                );
+            }
+        }
+        if let Some(uri) = row.moved_to_uri.as_deref() {
+            if !uri.is_empty() {
+                return api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_MOVED",
+                    "56f20ec9-fd06-4fa5-841b-edd6d7d4fa31",
+                    "You have moved your account.",
+                ));
+            }
+        }
+        let mut resolved: Vec<String> = Vec::new();
+        for item in arr {
+            let line = item.as_str().unwrap_or("");
+            if line.is_empty() {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "NO_SUCH_USER",
+                    "fcd2eef9-a9b2-4c4f-8624-038099e90aa5",
+                    "No such user.",
+                ));
+            }
+            let Some((username, host)) = mk_core::services::move_account::parse_acct(line) else {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "NO_SUCH_USER",
+                    "fcd2eef9-a9b2-4c4f-8624-038099e90aa5",
+                    "No such user.",
+                ));
+            };
+            let config_host = state.config.host();
+            let known = match move_account::resolve_acct_user(
+                pool,
+                &username,
+                host.as_deref(),
+                &config_host,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::error!(target: "dbg_i_update", error = %e, "resolve_acct_user");
+                    return api_err(ApiError::internal_error());
+                }
+            };
+            let Some(known) = known else {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "NO_SUCH_USER",
+                    "fcd2eef9-a9b2-4c4f-8624-038099e90aa5",
+                    "No such user.",
+                ));
+            };
+            if known.id == row.id {
+                return api_err(ApiError::new(
+                    400,
+                    mk_types::api_error::ApiErrorKind::Client,
+                    "FORBIDDEN_TO_SET_YOURSELF",
+                    "25c90186-4ab0-49c8-9bba-a1fa6c202ba4",
+                    "You can't set yourself as your own alias.",
+                ));
+            }
+            let to_url =
+                mk_core::services::move_account::local_user_uri(&state.config.url, &known.id);
+            if !resolved.contains(&to_url) {
+                resolved.push(to_url);
+            }
+        }
+        Some(if resolved.is_empty() {
+            None
+        } else {
+            Some(mk_core::services::move_account::marshal_aliases(&resolved))
+        })
+    } else {
+        None
+    };
+    // ==== END arena-move alsoKnownAs ====
+
     // --- paramDef subset ---
     let update = match parse_profile_update(body) {
         Ok(u) => u,
@@ -2047,6 +2225,15 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
     if let Err(e) = mk_db::user::update_profile_subset(pool, &me_id, &update).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_profile_subset");
         return api_err(ApiError::internal_error());
+    }
+
+    // arena-move: the resolved alsoKnownAs (i/update.ts writes every field
+    // in one save; the resolved-set write rides our profile-subset update)
+    if let Some(csv) = &alias_update {
+        if let Err(e) = mk_db::move_account::set_aliases(pool, &me_id, csv.as_deref()).await {
+            tracing::error!(target: "dbg_i_update", error = %e, "set_aliases");
+            return api_err(ApiError::internal_error());
+        }
     }
 
     // i/update.ts L556 (鍵垢を解除したとき、期間による承認条件も考慮してフォ
@@ -2112,7 +2299,7 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
 /// Me-view unread flag injection: `hasUnreadNotification` reflects the
 /// notification table at request time (pack is pure; upstream computes it
 /// in UserEntityService.pack per call).
-async fn apply_me_unread(pool: &mk_db::sqlx::PgPool, packed: &mut Value) {
+pub(crate) async fn apply_me_unread(pool: &mk_db::sqlx::PgPool, packed: &mut Value) {
     match mk_db::notification::has_unread(pool, packed["id"].as_str().unwrap_or("")).await {
         Ok(v) => {
             if let Some(obj) = packed.as_object_mut() {

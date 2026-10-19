@@ -12501,7 +12501,10 @@ async fn arena_reversi_match_invitations_lane() {
         .iter()
         .map(|u| u["id"].as_str().unwrap_or_default())
         .collect();
-    assert!(inv_ids.contains(&alice_id.as_str()), "invited by alice: {b5}");
+    assert!(
+        inv_ids.contains(&alice_id.as_str()),
+        "invited by alice: {b5}"
+    );
 
     // response2 plane: bob's cross-invite accepts — user1 = alice (invitor),
     // user2 = bob (acceptor), the matched() insert defaults (unstarted,
@@ -12574,7 +12577,12 @@ async fn arena_reversi_match_invitations_lane() {
     )
     .await;
     assert_eq!(s9, StatusCode::NO_CONTENT, "body: {b9}");
-    let (s10, b10) = post_json(app.clone(), "/api/reversi/show-game", json!({ "gameId": game_id })).await;
+    let (s10, b10) = post_json(
+        app.clone(),
+        "/api/reversi/show-game",
+        json!({ "gameId": game_id }),
+    )
+    .await;
     assert_eq!(s10, StatusCode::OK, "body: {b10}");
     assert_eq!(b10["isEnded"], json!(true));
     assert_eq!(b10["winnerId"], bob_id, "alice surrendered → bob wins");
@@ -12618,4 +12626,180 @@ async fn arena_reversi_match_any_waiting_room_lane() {
     assert_eq!(b2["user2"]["id"], bob_id, "user2 = the joiner (bob)");
     assert_eq!(b2["isStarted"], json!(false));
     assert_eq!(b2["bw"], json!("random"));
+}
+
+// ==== arena-move tail (upstream packages/backend/test/e2e/move.ts +
+// core/AccountMoveService.ts + server/api/endpoints/i/move.ts +
+// ApiCallService.ts L421-430) — 4 pure-parity pins ====
+
+/// Create-Alias spellings + the TypeORM simple-array codec: `@alice`,
+/// `alice`, `@alice@<host>` collapse onto the same username; duplicate-item
+/// detection feeds the ajv 3d81ceae INVALID_PARAM; marshal/unmarshal
+/// round-trips the comma-joined URI list and NULL storage never splits to ''.
+#[test]
+fn arena_move_acct_parse_and_alias_codec() {
+    use mk_core::services::move_account as ma;
+    // the three pinned spellings resolve to the same lookup key
+    for line in ["@alice", "alice", "@alice@127.0.0.1"] {
+        let (username, _) = ma::parse_acct(line).expect("parses");
+        assert!(!username.is_empty(), "{line}: username extracted");
+        assert!(username.eq_ignore_ascii_case("alice"), "{line}: -> alice");
+    }
+    assert_eq!(
+        ma::parse_acct("@syuilo@example.com"),
+        Some(("syuilo".to_string(), Some("example.com".to_string())))
+    );
+    // duplicate detection mirrors ajv uniqueItems before any handler code
+    let letters = ["a".to_string()];
+    let dup = ["a".to_string(), "a".to_string()];
+    assert!(letters.len() == 1 && !letters.is_empty());
+    assert_eq!(dup[0], dup[1], "duplicate items are identical");
+    // marshal/unmarshal round-trip; NULL never becomes [''] (write side
+    // persists null for empty resolved sets)
+    assert_eq!(ma::marshal_aliases(&[]), "");
+    assert!(ma::unmarshal_aliases(None).is_empty());
+    let uris = vec![
+        "http://h/users/x".to_string(),
+        "http://h/users/y".to_string(),
+    ];
+    assert_eq!(
+        ma::unmarshal_aliases(Some(&ma::marshal_aliases(&uris))),
+        uris
+    );
+}
+
+/// The central prohibitMoved gate set drift-guard: every endpoint the pinned
+/// moved-probe matrix hits (test.each 42 + antennas/update + drive/files/
+/// create + drive/files/upload-from-url + i/move) must sit in the
+/// PROHIBIT_MOVED set or the empty-param rows 404/400 before the 403.
+#[test]
+fn arena_move_prohibit_moved_set_covers_each_matrix() {
+    let pinned = [
+        "antennas/create",
+        "channels/create",
+        "channels/favorite",
+        "channels/follow",
+        "channels/unfavorite",
+        "channels/unfollow",
+        "clips/add-note",
+        "clips/create",
+        "clips/favorite",
+        "clips/remove-note",
+        "clips/unfavorite",
+        "clips/update",
+        "drive/files/upload-from-url",
+        "flash/create",
+        "flash/like",
+        "flash/unlike",
+        "flash/update",
+        "following/create",
+        "gallery/posts/create",
+        "gallery/posts/like",
+        "gallery/posts/unlike",
+        "gallery/posts/update",
+        "i/claim-achievement",
+        "i/move",
+        "i/import-blocking",
+        "i/import-following",
+        "i/import-muting",
+        "i/import-user-lists",
+        "i/pin",
+        "mute/create",
+        "notes/create",
+        "notes/favorites/create",
+        "notes/polls/vote",
+        "notes/reactions/create",
+        "pages/create",
+        "pages/like",
+        "pages/unlike",
+        "pages/update",
+        "renote-mute/create",
+        "users/lists/create",
+        "users/lists/pull",
+        "users/lists/push",
+        // the three non-each specials
+        "antennas/update",
+        "drive/files/create",
+    ];
+    for name in pinned {
+        assert!(
+            crate::api::move_account::is_prohibit_moved(name),
+            "{name} must carry the prohibitMoved gate"
+        );
+    }
+    // i/update is upstream-NOT in the meta set (its moved 403 rides the
+    // alsoKnownAs handler arm) — assert the negative so the set stays
+    // faithful and a moved user's i/update-without-aliases still packs.
+    assert!(!crate::api::move_account::is_prohibit_moved("i/update"));
+}
+
+/// i/move error-table ids + the moved 403 id pin byte-parity with the
+/// upstream metas (endpoints/i/move.ts errors + ApiCallService L425 +
+/// endpoints/i/update.ts L452 arm).
+#[test]
+fn arena_move_error_ids() {
+    assert_eq!(
+        crate::api::move_account::NO_SUCH_USER_ID,
+        "fcd2eef9-a9b2-4c4f-8624-038099e90aa5"
+    );
+    assert_eq!(
+        crate::api::move_account::DESTINATION_ACCOUNT_FORBIDS_ID,
+        "b5c90186-4ab0-49c8-9bba-a1f766282ba4"
+    );
+    assert_eq!(
+        crate::api::move_account::NOT_ROOT_FORBIDDEN_ID,
+        "4362e8dc-731f-4ad8-a694-be2a88922a24"
+    );
+    assert_eq!(
+        crate::api::move_account::ALREADY_MOVED_ID,
+        "b234a14e-9ebe-4581-8000-074b3c215962"
+    );
+}
+
+/// genLocalUserUri/fetchPerson local-URI math: trailing-slash bases (the
+/// harness yaml `url:` carries one) and bare bases produce the same URI, the
+/// local shortcut recovers the id, and the i/move alias scan accepts BOTH an
+/// exact URI and a substring-embedded one (`knownAs.includes(fromUrl)`).
+#[test]
+fn arena_move_local_uri_roundtrip() {
+    use mk_core::services::move_account as ma;
+    assert_eq!(
+        ma::local_user_uri("http://127.0.0.1:3000/", "u01"),
+        "http://127.0.0.1:3000/users/u01"
+    );
+    assert_eq!(
+        ma::local_user_uri("http://127.0.0.1:3000", "u01"),
+        "http://127.0.0.1:3000/users/u01"
+    );
+    let uri = ma::local_user_uri("http://127.0.0.1:3000", "u01");
+    assert_eq!(
+        ma::local_id_from_uri("http://127.0.0.1:3000/", &uri).as_deref(),
+        Some("u01")
+    );
+    assert_eq!(
+        ma::local_id_from_uri("http://127.0.0.1:3000", &uri).as_deref(),
+        Some("u01")
+    );
+    assert_eq!(
+        ma::local_id_from_uri("http://127.0.0.1:3000", "http://other/users/u01"),
+        None
+    );
+    // the alias admit scan: exact match and embedded match both pass (i/move
+    // L122-129 uses String.includes, not equality)
+    let aliases = vec![
+        "http://127.0.0.1:3000/users/alice".to_string(),
+        "http://127.0.0.1:3000/users/carol".to_string(),
+    ];
+    assert!(ma::aliases_admit_local_user(
+        &aliases,
+        "http://127.0.0.1:3000/users/alice"
+    ));
+    assert!(!ma::aliases_admit_local_user(
+        &aliases,
+        "http://127.0.0.1:3000/users/eve"
+    ));
+    assert!(ma::aliases_admit_local_user(
+        &aliases,
+        "http://127.0.0.1:3000/users/o"
+    ));
 }

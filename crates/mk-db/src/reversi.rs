@@ -35,14 +35,7 @@ pub const MATCH_RESTART_WINDOW_MS: i64 = 1000 * 60 * 3;
 /// ReversiService.matched default map (Reversi.maps.eighteight.data, pinned
 /// misskey-reversi/src/maps.ts L75-87).
 pub const EIGHTEIGHT_MAP: &[&str] = &[
-    "--------",
-    "--------",
-    "--------",
-    "---wb---",
-    "---bw---",
-    "--------",
-    "--------",
-    "--------",
+    "--------", "--------", "--------", "---wb---", "---bw---", "--------", "--------", "--------",
 ];
 
 // ==== drop-schema shim ======================================================
@@ -195,7 +188,10 @@ pub struct ReversiGameRow {
 /// — ReversiService.get, id-only branch (the redis game-cache layer is not
 /// modeled; the db row is the same source of truth between lanes).
 pub async fn find_game(pool: &PgPool, id: &str) -> Result<Option<ReversiGameRow>, sqlx::Error> {
-    let sql = format!(r#"SELECT {} FROM "reversi_game" WHERE "id" = $1"#, GAME_COLS);
+    let sql = format!(
+        r#"SELECT {} FROM "reversi_game" WHERE "id" = $1"#,
+        GAME_COLS
+    );
     sqlx::query_as::<_, ReversiGameRow>(&sql)
         .bind(id)
         .fetch_optional(pool)
@@ -342,9 +338,7 @@ pub async fn list_games(
     }
     if let Some(me) = me_id.filter(|_| my_only) {
         let ph = binds.len() + 1;
-        sql.push_str(&format!(
-            r#" AND ("user1Id" = ${ph} OR "user2Id" = ${ph})"#
-        ));
+        sql.push_str(&format!(r#" AND ("user1Id" = ${ph} OR "user2Id" = ${ph})"#));
         binds.push(me.to_string());
     } else {
         sql.push_str(r#" AND "isStarted" = TRUE"#);

@@ -296,6 +296,45 @@ type Profile = mk_db::user::ProfileRow;
 // following/create — endpoints/following/create.ts + UserFollowingService
 // ---------------------------------------------------------------------------
 
+/// arena-move: UserFollowingService L210-220 — a locked account
+/// auto-accepts a follower whose own alsoKnownAs points back at an account
+/// the followee has already accepted (AccountMoveService.validateAlsoKnownAs
+/// with the `instant` follow-existence check). Local slice: the follower's
+/// alias URIs resolve through the server's own /users/ shortcut; the check
+/// passes when the aliased user has moved TO the follower
+/// (`src.movedToUri === dstUri`) and the followee already follows them.
+async fn alias_auto_accept(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    follower_id: &str,
+    followee_id: &str,
+) -> Result<bool, mk_db::sqlx::Error> {
+    let Some(follower) = mk_db::user::find_user_by_id(pool, follower_id).await? else {
+        return Ok(false);
+    };
+    let aliases =
+        mk_core::services::move_account::unmarshal_aliases(follower.also_known_as.as_deref());
+    if aliases.is_empty() {
+        return Ok(false);
+    }
+    let follower_uri = mk_core::services::move_account::local_user_uri(base_url, follower_id);
+    for uri in &aliases {
+        let Some(src_id) = mk_core::services::move_account::local_id_from_uri(base_url, uri) else {
+            continue;
+        };
+        let Some(src) = mk_db::user::find_user_by_id(pool, &src_id).await? else {
+            continue;
+        };
+        if src.moved_to_uri.as_deref() != Some(follower_uri.as_str()) {
+            continue;
+        }
+        if mk_db::social::following_exists(pool, &src_id, followee_id).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 async fn following_create(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
@@ -370,6 +409,13 @@ async fn following_create(
             .await
             .map_err(|e| db_err("following_create isFollowed", e))?
             && followee_profile.auto_accept_followed;
+        // arena-move: the moved-follower carve-out (UserFollowingService
+        // L210-220) rides the same needs_request branch — bob→frank after the
+        // move auto-accepts because frank already accepted bob's old account.
+        let auto_accept = auto_accept
+            || alias_auto_accept(pool, &state.config.url, me_id, user_id)
+                .await
+                .map_err(|e| db_err("following_create alias_auto_accept", e))?;
         if !auto_accept {
             mk_db::social::insert_follow_request(
                 pool,
@@ -399,9 +445,22 @@ async fn following_create(
     )
     .await
     .map_err(|e| db_err("following_create insert_following", e))?;
-    mk_db::social::bump_follow_counts(pool, me_id, user_id, 1)
+    // arena-move: UserFollowingService.incrementFollowing L305-316 — the
+    // counters move only when NEITHER endpoint has moved (the eve→
+    // moved-alice row lands with counters untouched).
+    if !(mk_db::move_account::get_moved_to_uri(pool, me_id)
         .await
-        .map_err(|e| db_err("following_create bump", e))?;
+        .map_err(|e| db_err("following_create moved[me]", e))?
+        .is_some()
+        || mk_db::move_account::get_moved_to_uri(pool, user_id)
+            .await
+            .map_err(|e| db_err("following_create moved[followee]", e))?
+            .is_some())
+    {
+        mk_db::social::bump_follow_counts(pool, me_id, user_id, 1)
+            .await
+            .map_err(|e| db_err("following_create bump", e))?;
+    }
 
     // insertFollowingDoc requestExist leg: a swept pending request (re-follow
     // of a locked target that still held the earlier request) still tells the
@@ -457,9 +516,21 @@ async fn following_delete(
     mk_db::social::delete_following(pool, me_id, user_id)
         .await
         .map_err(|e| db_err("following_delete", e))?;
-    mk_db::social::bump_follow_counts(pool, me_id, user_id, -1)
+    // arena-move: UserFollowingService.decrementFollowing L424-437 — moved
+    // endpoints age out silently (eve's unfollow of the moved alice).
+    if !(mk_db::move_account::get_moved_to_uri(pool, me_id)
         .await
-        .map_err(|e| db_err("following_delete bump", e))?;
+        .map_err(|e| db_err("following_delete moved[me]", e))?
+        .is_some()
+        || mk_db::move_account::get_moved_to_uri(pool, user_id)
+            .await
+            .map_err(|e| db_err("following_delete moved[followee]", e))?
+            .is_some())
+    {
+        mk_db::social::bump_follow_counts(pool, me_id, user_id, -1)
+            .await
+            .map_err(|e| db_err("following_delete bump", e))?;
+    }
 
     Ok(ok_json(pack_target(state, pool, &followee, me_id).await?))
 }
@@ -504,9 +575,21 @@ async fn following_requests_accept(
     )
     .await
     .map_err(|e| db_err("accept insert_following", e))?;
-    mk_db::social::bump_follow_counts(pool, user_id, me_id, 1)
+    // arena-move: the same incrementFollowing moved guard as accept's
+    // insertFollowingDoc path.
+    if !(mk_db::move_account::get_moved_to_uri(pool, user_id)
         .await
-        .map_err(|e| db_err("accept bump", e))?;
+        .map_err(|e| db_err("accept moved[follower]", e))?
+        .is_some()
+        || mk_db::move_account::get_moved_to_uri(pool, me_id)
+            .await
+            .map_err(|e| db_err("accept moved[followee]", e))?
+            .is_some())
+    {
+        mk_db::social::bump_follow_counts(pool, user_id, me_id, 1)
+            .await
+            .map_err(|e| db_err("accept bump", e))?;
+    }
 
     // insertFollowingDoc L281-301: the follower is told their request landed
     // ('followRequestAccepted', notifier = the followee) and the followee is

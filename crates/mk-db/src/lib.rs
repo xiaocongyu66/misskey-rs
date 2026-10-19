@@ -39,6 +39,10 @@ pub mod drive_note;
 pub mod export_blob;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
+// arena-move: account-migration db legs (upstream AccountMoveService.ts) —
+// the movedToUri/alsoKnownAs plane + postMoveProcess scans + the queued
+// relationship (follow/unfollow) legs with the moved count-guard
+pub mod move_account;
 // ff-visibility arena: users/followers + users/following list edges + the
 // meta."federation" patch/read the AP collections gate consumes
 pub mod ff_visibility;

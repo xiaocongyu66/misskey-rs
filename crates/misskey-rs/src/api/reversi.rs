@@ -511,9 +511,8 @@ async fn match_specific(
         }
     }
 
-    let invite_min = mk_types::id::gen_aid(
-        crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS,
-    );
+    let invite_min =
+        mk_types::id::gen_aid(crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS);
     let invitations = match mk_db::reversi::recent_inviters(pool, me_id, &invite_min).await {
         Ok(v) => v,
         Err(e) => {
@@ -573,9 +572,8 @@ async fn match_any(
         }
     }
 
-    let invite_min = mk_types::id::gen_aid(
-        crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS,
-    );
+    let invite_min =
+        mk_types::id::gen_aid(crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS);
     let invitations = match mk_db::reversi::recent_inviters(pool, me_id, &invite_min).await {
         Ok(v) => v,
         Err(e) => {
@@ -597,11 +595,10 @@ async fn match_any(
 
     match match_any_take_for(me_id) {
         Some(entry) => {
-            let game =
-                match matched(state, pool, &entry.user_id, me_id, entry.no_irregular).await {
-                    Ok(g) => g,
-                    Err(resp) => return resp,
-                };
+            let game = match matched(state, pool, &entry.user_id, me_id, entry.no_irregular).await {
+                Ok(g) => g,
+                Err(resp) => return resp,
+            };
             send_game_detail(state, pool, &game).await
         }
         None => {
@@ -644,9 +641,8 @@ async fn invitations(state: &AppState, token: Option<String>) -> Response {
         tracing::error!(target: "dbg_reversi", error = %e, "ensure_matching_table");
         return internal();
     }
-    let invite_min = mk_types::id::gen_aid(
-        crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS,
-    );
+    let invite_min =
+        mk_types::id::gen_aid(crate::api::now_ms() as i64 - mk_db::reversi::INVITATION_TIMEOUT_MS);
     let ids = match mk_db::reversi::recent_inviters(&pool, &me_id, &invite_min).await {
         Ok(v) => v,
         Err(e) => {
@@ -724,7 +720,11 @@ async fn show_game(state: &AppState, body: &Value, token: Option<&str>) -> Respo
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let Some(game_id) = body.get("gameId").and_then(Value::as_str).map(|s| s.to_string()) else {
+    let Some(game_id) = body
+        .get("gameId")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+    else {
         return invalid_param();
     };
     let row = match mk_db::reversi::find_game(&pool, &game_id).await {
@@ -750,7 +750,11 @@ async fn surrender(state: &AppState, body: &Value, token: Option<String>) -> Res
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let Some(game_id) = body.get("gameId").and_then(Value::as_str).map(|s| s.to_string()) else {
+    let Some(game_id) = body
+        .get("gameId")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+    else {
         return invalid_param();
     };
     let row = match mk_db::reversi::find_game(&pool, &game_id).await {
@@ -799,10 +803,18 @@ async fn verify(state: &AppState, body: &Value) -> Response {
         Some(p) => p,
         None => return internal(),
     };
-    let Some(game_id) = body.get("gameId").and_then(Value::as_str).map(|s| s.to_string()) else {
+    let Some(game_id) = body
+        .get("gameId")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+    else {
         return invalid_param();
     };
-    let Some(crc32) = body.get("crc32").and_then(Value::as_str).map(|s| s.to_string()) else {
+    let Some(crc32) = body
+        .get("crc32")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+    else {
         return invalid_param();
     };
     let row = match mk_db::reversi::find_game(&pool, &game_id).await {

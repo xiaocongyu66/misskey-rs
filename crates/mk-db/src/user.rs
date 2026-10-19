@@ -201,9 +201,17 @@ pub struct LocalUserRow {
     pub is_bot: bool,
     #[sqlx(rename = "isCat")]
     pub is_cat: bool,
+    // arena-move: the account-migration plane (upstream AccountMoveService)
+    // fed into the UserDetailed pack's movedTo/alsoKnownAs. alsoKnownAs is
+    // the raw TypeORM `simple-array` text (comma-joined URIs); the CSV codec
+    // lives with the pack/endpoint layer (api::move_account).
+    #[sqlx(rename = "movedToUri")]
+    pub moved_to_uri: Option<String>,
+    #[sqlx(rename = "alsoKnownAs")]
+    pub also_known_as: Option<String>,
 }
 
-pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isDeleted", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat""#;
+pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isDeleted", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat", "movedToUri", "alsoKnownAs""#;
 
 pub async fn find_local_user_by_username(
     pool: &PgPool,

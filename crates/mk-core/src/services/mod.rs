@@ -1,6 +1,11 @@
 //! Services ported from `src/core/`.
 
 pub mod misc;
+// arena-move: account-migration pure helpers — Acct.parse parity, the
+// TypeORM `simple-array` alsoKnownAs codec and local-user-URI math
+// (UserEntityService.genLocalUserUri + ApPersonService.fetchPerson's local
+// shortcut). Shared by the UserDetailed pack and api::move_account.
+pub mod move_account;
 pub mod note_pack;
 pub mod notification_pack;
 pub mod role;

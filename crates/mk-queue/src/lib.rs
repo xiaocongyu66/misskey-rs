@@ -104,6 +104,46 @@ impl QueueHandle {
         .await
     }
 
+    /// arena-move: delayed-enqueue variant — BullMQ's `{ delay }` option
+    /// (QueueService.createDelayedUnfollowJob passes the 24h / test-10s
+    /// delay through). Same idempotent table re-ensure as [`enqueue`]; the
+    /// job simply lands with `run_after = now() + delay` so [`claim_next`]
+    /// skips it until due (the "explicitly delayed" arm of its WHERE).
+    pub async fn enqueue_delayed(
+        &self,
+        kind: &str,
+        payload: &Value,
+        delay: std::time::Duration,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS "mk_queue_jobs" (
+                   "id" bigserial NOT NULL,
+                   "kind" text NOT NULL,
+                   "payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
+                   "attempts" integer DEFAULT 0 NOT NULL,
+                   "run_after" timestamp with time zone DEFAULT now() NOT NULL,
+                   "created_at" timestamp with time zone DEFAULT now() NOT NULL
+               )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS mk_queue_jobs_kind_run_after_idx
+               ON "mk_queue_jobs" USING btree (kind, run_after)"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query_scalar(
+            r#"INSERT INTO "mk_queue_jobs" ("kind", "payload", "run_after")
+               VALUES ($1, $2, now() + make_interval(secs => $3))"#,
+        )
+        .bind(kind)
+        .bind(payload)
+        .bind(delay.as_secs_f64())
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Atomically claims the oldest due job of one of `kinds`, incrementing
     /// its attempt counter. `FOR UPDATE SKIP LOCKED` guarantees concurrent
     /// workers never receive the same row; jobs whose `run_after` is still in

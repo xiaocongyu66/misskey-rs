@@ -209,8 +209,31 @@ fn detailed(
         },
         url: profile.url.clone(),
         uri: None, // local user has no uri
-        moved_to: None,
-        also_known_as: None,
+        // arena-move: pack L530 — `movedTo: user.movedToUri ?
+        // resolvePerson(user.movedToUri).then(user => user.id).catch(() =>
+        // null) : null`. The local-URI shortcut resolves the id off the URI
+        // tail; a remote (non-server) URI has no fetch lane here → null.
+        moved_to: row
+            .moved_to_uri
+            .as_deref()
+            .and_then(|uri| crate::services::move_account::local_id_from_uri(ctx.url, uri)),
+        // arena-move: pack L532-534 — `alsoKnownAs: user.alsoKnownAs ?
+        // Promise.all(toArray(user.alsoKnownAs).map(uri =>
+        // fetchPerson(uri).then(user => user?.id).catch(() => null)))` then
+        // `.then(xs => xs.length === 0 ? null : xs.filter(x => x != null))`.
+        // Non-null storage always maps to the (possibly filtered-empty) id
+        // array; a null column packs null.
+        also_known_as: {
+            let raw =
+                crate::services::move_account::unmarshal_aliases(row.also_known_as.as_deref());
+            (!raw.is_empty()).then(|| {
+                raw.iter()
+                    .filter_map(|uri| {
+                        crate::services::move_account::local_id_from_uri(ctx.url, uri)
+                    })
+                    .collect::<Vec<String>>()
+            })
+        },
         created_at: created_at.unwrap_or_default(),
         updated_at: None,
         last_fetched_at: None,
