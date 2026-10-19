@@ -41,6 +41,9 @@
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
+// mk_db re-exports sqlx (the crate's only dependency surface — the bare
+// `sqlx::` calls below ride this like the mk-db modules).
+use mk_db::sqlx;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
@@ -137,7 +140,14 @@ fn rank_ap(ranges: &[MediaRange]) -> Option<(f32, i32)> {
     let a = rank_provided("application/activity+json", ranges);
     let l = rank_provided("application/ld+json", ranges);
     match (a, l) {
-        (Some(x), Some(y)) => Some(x.max(y)),
+        // (q, spec): f32 is not Ord — compare the pair field-wise
+        (Some(x), Some(y)) => {
+            if y.0 > x.0 || (y.0 == x.0 && y.1 > x.1) {
+                Some(y)
+            } else {
+                Some(x)
+            }
+        }
         (Some(x), None) => Some(x),
         (None, y) => y,
     }
@@ -1380,9 +1390,12 @@ pub(crate) async fn streaming_get(
 /// unmatched GET/HEAD; non-GET stays fastify's 404. This also serves the
 /// POST-only /inbox + /users/:id/inbox GET rows (they fall through upstream).
 pub(crate) async fn fallback(State(state): State<AppState>, req: Request) -> Response {
-    match req.method() {
-        axum::http::Method::GET | axum::http::Method::HEAD => base_page(&state).await,
-        _ => StatusCode::NOT_FOUND.into_response(),
+    let is_get_like =
+        req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD;
+    if is_get_like {
+        base_page(&state).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
