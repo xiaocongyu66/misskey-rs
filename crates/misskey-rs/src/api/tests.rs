@@ -13573,9 +13573,19 @@ fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
     });
     let lite = webhook_user_lite_from_pack(&packed_me);
     for key in [
-        "id", "name", "username", "host", "avatarUrl", "avatarBlurhash",
-        "avatarDecorations", "isBot", "isCat", "instance", "emojis",
-        "onlineStatus", "badgeRoles",
+        "id",
+        "name",
+        "username",
+        "host",
+        "avatarUrl",
+        "avatarBlurhash",
+        "avatarDecorations",
+        "isBot",
+        "isCat",
+        "instance",
+        "emojis",
+        "onlineStatus",
+        "badgeRoles",
     ] {
         assert_eq!(lite.get(key), packed_me.get(key), "{key}: undefined parity");
     }
@@ -13588,7 +13598,10 @@ fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
         12,
         "exactly the UserLite slice the synalio rows field-equal"
     );
-    assert!(lite.get("token").is_none(), "me secrets stay out of the hook body");
+    assert!(
+        lite.get("token").is_none(),
+        "me secrets stay out of the hook body"
+    );
 }
 
 /// The deliver envelope mirrors the pinned processor byte-plan:
@@ -13612,8 +13625,18 @@ fn arena_synalio_webhook_envelope_and_abuse_keys() {
         "reporterId": "b1", "reporter": null, "assigneeId": null,
         "assignee": null, "resolved": false, "comment": "c", "resolvedAs": null,
     }));
-    for key in ["id", "targetUserId", "reporterId", "assigneeId", "resolved", "comment"] {
-        assert!(report.get(key).is_some(), "AbuseReportPayload carries {key}");
+    for key in [
+        "id",
+        "targetUserId",
+        "reporterId",
+        "assigneeId",
+        "resolved",
+        "comment",
+    ] {
+        assert!(
+            report.get(key).is_some(),
+            "AbuseReportPayload carries {key}"
+        );
     }
     assert_eq!(report["id"], "r1");
     assert_eq!(report["resolved"], serde_json::json!(false));

@@ -82,8 +82,8 @@ pub mod reversi;
 // arena-synalio: system_webhook + abuse_report_notification_recipient +
 // abuse_user_report db paths (0001 baseline; the synalio e2e webhook plane —
 // no migration)
-pub mod webhook;
 pub mod user;
+pub mod webhook;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await
