@@ -1355,6 +1355,15 @@ pub(crate) async fn notes_reactions_create(
             }
         }
     }
+    // GetterService.getNote → NO_SUCH_NOTE (reactions/create.ts L71-74):
+    // unknown/malformed ids 400 (endpoints.ts 存在しない投稿/間違ったID legs).
+    if note_row.is_none() {
+        return meta_err(
+            "NO_SUCH_NOTE",
+            "033d0620-5bfe-4027-965d-980b0c85a3ea",
+            "No such note.",
+        );
+    }
     // ReactionService.create L120-123: reactions key the note itself — a pure
     // renote (renoteId set, no text/cw/reply/poll/files; misc/is-renote.ts
     // isRenote && !isQuote) throws IdentifiableError 12c35529, remapped by

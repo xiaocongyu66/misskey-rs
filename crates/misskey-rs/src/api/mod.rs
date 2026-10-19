@@ -96,6 +96,7 @@ const M0_ENDPOINTS: &[&str] = &[
     "server-info",
     "get-online-users-count",
     "emojis",
+    "drive",
 ];
 
 pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
@@ -620,6 +621,11 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         "server-info" => server_info(),
         "get-online-users-count" => json!({ "count": 0 }),
         "emojis" => json!({ "emojis": [] }),
+        // endpoints.ts ドライブ情報 leg: usage 0 (DriveService no files tracked)
+        "drive" => json!({
+            "capacity": 1024 * 1024 * 1024,
+            "usage": 0,
+        }),
         _ => unreachable!("checked above"),
     };
 
@@ -799,6 +805,13 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
         Ok(v) => v,
         Err(r) => return r,
     };
+    if password.is_empty() {
+        // paramDef password minLength: 1
+        return api_err(ApiError::invalid_param(json!({
+            "param": "password",
+            "reason": "expected a string of length 1 or more",
+        })));
+    }
 
     if let Some(pool) = &state.pool {
         let username_lower = username.to_lowercase();
@@ -1472,7 +1485,9 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         Some(v) => Some(match v {
             None => None,
             Some(s) => {
-                let t = s.trim();
+                // JS String.prototype.trim: White_Space + <BOM> U+FEFF,
+                // which char::is_whitespace does NOT cover
+                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
                 if t.is_empty() {
                     None
                 } else {
@@ -2124,9 +2139,6 @@ async fn set_viewers_memo(
     let Some(me_id) = me_id else {
         return; // anonymous viewer → pack's memo: null stands
     };
-    if me_id == target_id {
-        return; // self view → null stands
-    }
     match mk_db::memo::find_user_memo(pool, me_id, target_id).await {
         Ok(memo) => {
             if let Some(obj) = packed.as_object_mut() {
@@ -3472,7 +3484,8 @@ async fn pack_note_for(
     match load_pack_note(state, pool, note_id, me_id, true, 0).await? {
         Some(v) => Ok(v),
         None => Err(Box::new(api_err(ApiError::new(
-            404,
+            // show.ts noSuchNote has NO httpStatusCode → ApiError default 400
+            400,
             mk_types::api_error::ApiErrorKind::Client,
             "NO_SUCH_NOTE",
             "24fcbfc6-2e37-42b6-8388-c29b3861a08d",

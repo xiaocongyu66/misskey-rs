@@ -38,7 +38,7 @@ pub fn drive_file_pack(row: &mk_db::drive_note::NoteDriveFileRow, created_at_iso
                 .then(|| row.webpublic_url.clone().unwrap_or_else(|| row.url.clone()))
         }),
         "comment": row.comment,
-        "folderId": Value::Null,
+        "folderId": row.folder_id,
         "folder": Value::Null,
         "userId": Value::Null,
         "user": Value::Null,
@@ -133,6 +133,17 @@ pub fn note_pack_full(row: &NoteRow, parts: &NotePackParts) -> Value {
         .as_object()
         .map(|m| m.values().filter_map(|v| v.as_i64()).sum::<i64>())
         .unwrap_or(0);
+    // upstream pack drops zeroed reaction keys (deleted/overwritten emojis
+    // must not surface as '🥰': 0 — endpoints.ts 二重上書き deepStrictEqual)
+    let reactions: Value = match reactions.as_object() {
+        Some(m) => Value::Object(
+            m.iter()
+                .filter(|(_, v)| v.as_i64().map(|n| n > 0).unwrap_or(false))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => reactions,
+    };
     o.insert("reactionCount".into(), json!(reaction_count));
     o.insert("reactions".into(), reactions);
     o.insert("reactionEmojis".into(), json!({}));

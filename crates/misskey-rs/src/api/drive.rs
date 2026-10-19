@@ -437,7 +437,21 @@ pub(crate) async fn folders_update(
     };
 
     match body.get("parentId") {
-        None => {}
+        // name-only rename: persist via the same UPDATE (parent held at its
+        // current value — update_folder writes parentId unconditionally)
+        None => {
+            if let Err(e) = mk_db::drive::update_folder(
+                pool,
+                folder_id,
+                new_name.as_deref(),
+                folder.parent_id.as_deref(),
+            )
+            .await
+            {
+                tracing::error!(target: "dbg_drive", error = %e, "update_folder rename");
+                return api_err(ApiError::internal_error());
+            }
+        }
         Some(Value::Null) => {
             if let Err(e) =
                 mk_db::drive::update_folder(pool, folder_id, new_name.as_deref(), None).await
@@ -628,13 +642,44 @@ pub async fn files_create(state: AppState, req: Request) -> Response {
     // note.ts NSFW census (DriveService.addFile): the uploader's merged
     // `alwaysMarkNsfw` role policy forces the flag on (`if (userRoleNSFW)
     // file.isSensitive = true`).
-    let uploader_always_nsfw = match mk_db::role::user_assigned_roles(pool, &me_id).await {
-        Ok(assigned) => mk_core::services::role::UserPolicy::compute(&assigned).always_mark_nsfw,
+    let policies = match mk_db::role::user_assigned_roles(pool, &me_id).await {
+        Ok(assigned) => mk_core::services::role::UserPolicy::compute(&assigned),
         Err(e) => {
             tracing::error!(target: "dbg_drive", error = %e, "user_assigned_roles");
             return api_err(ApiError::internal_error());
         }
     };
+    let uploader_always_nsfw = policies.always_mark_nsfw;
+    // DriveService.addFile L516-542: non-moderator gates on the merged role
+    // policies — uploadableFileTypes against the sniffed/declared mime
+    // (UNALLOWED_FILE_TYPE) and maxFileSizeMb vs the byte size
+    // (MAX_FILE_SIZE_EXCEEDED, httpStatusCode 413).
+    if !super::viewer_is_moderator(pool, Some(&me_id)).await {
+        let allowed = policies.uploadable_file_types.iter().any(|m| {
+            m == "*"
+                || m == "*/*"
+                || (m.ends_with("/*") && mime.starts_with(m.trim_end_matches('*')))
+                || *m == mime
+        });
+        if !allowed {
+            return api_err(ApiError::new(
+                400,
+                mk_types::api_error::ApiErrorKind::Client,
+                "UNALLOWED_FILE_TYPE",
+                "4becd248-7f2c-48c4-a9f0-75edc4f9a1ea",
+                "Cannot upload the file because it is an unallowed file type.",
+            ));
+        }
+        if 1024 * 1024 * policies.max_file_size_mb < file.1.data.len() as i64 {
+            return api_err(ApiError::new(
+                413,
+                mk_types::api_error::ApiErrorKind::Client,
+                "MAX_FILE_SIZE_EXCEEDED",
+                "b9d8c348-33f0-4673-b9a9-5d4da058977a",
+                "Max file size exceeded.",
+            ));
+        }
+    }
     let row = mk_db::drive::DriveFileRow {
         id: id.clone(),
         user_id: Some(me_id.clone()),
@@ -1031,6 +1076,13 @@ fn sniff_mime(data: &[u8]) -> Option<String> {
         Some("image/gif".to_string())
     } else if data.starts_with(b"RIFF") && data.len() > 11 && &data[8..12] == b"WEBP" {
         Some("image/webp".to_string())
+    } else if data.len() > 11 && &data[4..8] == b"ftyp" && &data[8..12] == b"avif" {
+        Some("image/avif".to_string())
+    } else if data.starts_with(b"<?xml")
+        || data.starts_with(b"<svg")
+        || data.starts_with(&[0xEF, 0xBB, 0xBF, b'<', b'?', b'x'])
+    {
+        Some("image/svg+xml".to_string())
     } else {
         None
     }

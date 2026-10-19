@@ -90,6 +90,8 @@ pub struct UserPolicy {
     pub drive_capacity_mb: i64,
     #[serde(rename = "maxFileSizeMb")]
     pub max_file_size_mb: i64,
+    #[serde(rename = "uploadableFileTypes")]
+    pub uploadable_file_types: Vec<String>,
     #[serde(rename = "pinLimit")]
     pub pin_limit: i64,
     #[serde(rename = "antennaLimit")]
@@ -113,6 +115,7 @@ impl UserPolicy {
             mention_limit: 20,
             drive_capacity_mb: 100,
             max_file_size_mb: 30,
+            uploadable_file_types: vec!["*/*".to_string()],
             pin_limit: 5,
             antenna_limit: 5,
             word_mute_limit: 200,
@@ -147,6 +150,12 @@ impl UserPolicy {
         if let Some(v) = obj.get("maxFileSizeMb").and_then(|v| v.as_i64()) {
             base.max_file_size_mb = v;
         }
+        if let Some(arr) = obj.get("uploadableFileTypes").and_then(|v| v.as_array()) {
+            base.uploadable_file_types = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+        }
         if let Some(v) = obj.get("pinLimit").and_then(|v| v.as_i64()) {
             base.pin_limit = v;
         }
@@ -173,6 +182,11 @@ impl UserPolicy {
     /// per-key priority tiers.
     pub fn from_base_and_roles(assigned: &[AssignedRole], base: &Self) -> Self {
         Self {
+            uploadable_file_types: merge_types(
+                assigned,
+                &base.uploadable_file_types,
+                "uploadableFileTypes",
+            ),
             can_public_note: merge_any_true(assigned, base.can_public_note, "canPublicNote"),
             chat_availability: merge_chat(assigned, base.chat_availability, "chatAvailability"),
             mention_limit: merge_max(assigned, base.mention_limit, "mentionLimit"),
@@ -257,6 +271,28 @@ fn entry_value<'a>(e: &'a PolicyEntry<'_>, base: &'a serde_json::Value) -> &'a s
         Some(v) => v,
         None => base,
     }
+}
+
+/// uploadableFileTypes tier pick — array values REPLACE wholesale.
+fn merge_types(assigned: &[AssignedRole], base: &[String], key: &str) -> Vec<String> {
+    if assigned.is_empty() {
+        return base.to_vec();
+    }
+    let base_json = serde_json::Value::Array(
+        base.iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
+    );
+    let mut out = base.to_vec();
+    for e in tier(assigned, key) {
+        if let Some(arr) = entry_value(&e, &base_json).as_array() {
+            out = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+    }
+    out
 }
 
 fn merge_any_true(assigned: &[AssignedRole], base_val: bool, key: &str) -> bool {

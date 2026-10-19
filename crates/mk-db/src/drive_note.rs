@@ -30,11 +30,13 @@ pub struct NoteDriveFileRow {
     pub thumbnail_url: Option<String>,
     #[sqlx(rename = "webpublicUrl")]
     pub webpublic_url: Option<String>,
+    #[sqlx(rename = "folderId")]
+    pub folder_id: Option<String>,
     pub properties: serde_json::Value,
 }
 
 const FILE_COLS: &str = r#""id", ("userId") AS "userId", "name", ("type"::text) AS "type", "md5", "size", "comment",
-    "isSensitive", "blurhash", "url", "thumbnailUrl", "webpublicUrl",
+    "isSensitive", "blurhash", "url", "thumbnailUrl", "webpublicUrl", "folderId",
     ("properties"::text)::jsonb AS "properties""#;
 
 /// Owned fileIds fetch: `userId` + `id IN (...)`; order is applied on the

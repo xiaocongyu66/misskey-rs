@@ -194,8 +194,10 @@ pub async fn search_channels(
         .replace('%', "\\%")
         .replace('_', "\\_");
     let pat = format!("%{escaped}%");
+    // empty patterns keep $4 BOUND (a dangling placeholder with a
+    // positional bind count mismatch 500s the statement)
     let clause = if query.is_empty() {
-        String::new()
+        " AND ($4::varchar IS DISTINCT FROM NULL)".to_string()
     } else if name_only {
         r#" AND "name" ILIKE $4"#.to_string()
     } else {
