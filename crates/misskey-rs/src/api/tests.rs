@@ -13470,3 +13470,70 @@ async fn fetchres_create_fixture_endpoints() {
 
     let _ = pool;
 }
+
+// arena-synalio // — the system-webhook + abuse-report webhook plane upstream
+// test/e2e/synalio/{user-create,abuse-report}.ts drives (SystemWebhookService
+// enqueue gates + the SystemWebhookDeliverProcessorService L42-56 deliver
+// envelope; SQL in mk-db/src/webhook.rs). Pure shape tests — the live
+// delivery matrix rides the e2e-synalio lane.
+
+/// The userCreated content must field-match the signup response the lane
+/// already holds (`alice.<field> toBe body.<field>`): the picker rides the
+/// same packed me JSON and fills the UserLite presence defaults, and NO
+/// me-only keys (token policies securityKeysList …) leak into the payload.
+#[test]
+fn arena_synalio_user_created_lite_pick_matches_signup_fields() {
+    use crate::api::system_webhook::webhook_user_lite_from_pack;
+    let packed_me = serde_json::json!({
+        "id": "a1", "name": null, "username": "alice", "host": null,
+        "avatarUrl": "http://127.0.0.1:3000/avatar.png",
+        "avatarBlurhash": null, "avatarDecorations": [],
+        "isBot": false, "isCat": false, "instance": null,
+        "emojis": {}, "onlineStatus": "unknown", "badgeRoles": [],
+        // me-only tail that must NOT bleed into the UserLite payload
+        "token": "0123456789abcdef", "policies": {}, "securityKeysList": [],
+    });
+    let lite = webhook_user_lite_from_pack(&packed_me);
+    for key in [
+        "id", "name", "username", "host", "avatarUrl", "avatarBlurhash",
+        "avatarDecorations", "isBot", "isCat", "instance", "emojis",
+        "onlineStatus", "badgeRoles",
+    ] {
+        assert!(lite.get(key).is_some(), "userCreated lite missing {key}");
+        assert_eq!(lite.get(key), packed_me.get(key), "{key} rides the pack");
+    }
+    assert_eq!(
+        lite.as_object().unwrap().len(),
+        13,
+        "exactly the UserLite slice the synalio rows field-equal"
+    );
+    assert!(lite.get("token").is_none(), "me secrets stay out of the hook body");
+}
+
+/// The deliver envelope mirrors the pinned processor byte-plan:
+/// {server, hookId, eventId, createdAt, type, body} + the abuse payload keys
+/// the synalio assertions read (id/targetUserId/reporterId/assigneeId/
+/// resolved/comment) keep their values across the report→resolve round trip.
+#[test]
+fn arena_synalio_webhook_envelope_and_abuse_keys() {
+    use crate::api::system_webhook::{abuse_report_payload, webhook_envelope};
+    let content = serde_json::json!({ "probe": true });
+    let envelope = webhook_envelope("hook-1", "http://127.0.0.1:3000/", "abuseReport", content);
+    assert_eq!(envelope["hookId"], "hook-1");
+    assert_eq!(envelope["server"], "http://127.0.0.1:3000/");
+    assert_eq!(envelope["type"], "abuseReport");
+    assert!(envelope.get("eventId").is_some(), "eventId present");
+    assert!(envelope["createdAt"].is_number(), "createdAt ms present");
+    assert_eq!(envelope["body"], serde_json::json!({ "probe": true }));
+
+    let report = abuse_report_payload(serde_json::json!({
+        "id": "r1", "targetUserId": "t1", "targetUser": null,
+        "reporterId": "b1", "reporter": null, "assigneeId": null,
+        "assignee": null, "resolved": false, "comment": "c", "resolvedAs": null,
+    }));
+    for key in ["id", "targetUserId", "reporterId", "assigneeId", "resolved", "comment"] {
+        assert!(report.get(key).is_some(), "AbuseReportPayload carries {key}");
+    }
+    assert_eq!(report["id"], "r1");
+    assert_eq!(report["resolved"], serde_json::json!(false));
+}

@@ -31,6 +31,11 @@ mod roles_lite;
 // assign re-route with expiresAt (api/roles.rs; SQL in mk-db/src/roles.rs,
 // the conditional engine in mk-core services/roles_v2)
 mod roles;
+// arena-synalio: the SystemWebhook + abuse-report webhook plane upstream
+// `test/e2e/synalio/{user-create,abuse-report}.ts` drives (SystemWebhook-
+// Service enqueue gates + the SystemWebhookDeliverProcessor payload; SQL in
+// mk-db/src/webhook.rs — all three tables ship in the 0001 baseline)
+mod system_webhook;
 // delete-account: i/delete-account + admin/delete-account (削除済 census —
 // soft `isDeleted` flag + the me-view pack field); db path in
 // mk-db/src/delete_account.rs
@@ -427,6 +432,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         }
         return users_show(&state, &body, token).await;
     }
+
+    // ==== arena-synalio DISPATCH ARM (admin/system-webhook/* + the abuse
+    // report webhook suite + users/report-abuse) ====
+    // Self-contained on the roles-v2-arm pattern (method check, body parsing
+    // and token extraction live in the arm; the credential/admin gates, the
+    // entity packs and the SystemWebhookDeliverProcessor-shaped delivery in
+    // api::system_webhook — SQL in mk-db/src/webhook.rs).
+    if system_webhook::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return system_webhook::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END arena-synalio DISPATCH ARM ====
 
     // ==== roles-v2 DISPATCH ARM (admin/roles/{show,list,users,assign,update}) ====
     // Noses in ahead of the gate-roles arm: assign re-routes here for the
@@ -916,8 +941,14 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
                 }
             }
         }
-        return fetch_resource::api_create(&state, name.as_str(), &body, token, credential_declared)
-            .await;
+        return fetch_resource::api_create(
+            &state,
+            name.as_str(),
+            &body,
+            token,
+            credential_declared,
+        )
+        .await;
     }
     // ==== END arena-fetchres DISPATCH ARM ====
 
@@ -1236,6 +1267,27 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
     if let Some(obj) = packed.as_object_mut() {
         obj.insert("token".to_string(), json!(outcome.token.clone()));
     }
+
+    // ==== arena-synalio: SignupService L158 — every fresh local signup fires
+    // the userCreated system webhook (UserService.notifySystemWebhook packs
+    // the UserLite and enqueues over every active hook with 'userCreated' in
+    // "on"; no notification-recipient gate on this path). Delivery body rides
+    // the SAME packed JSON the response below carries so the synalio
+    // field-equality rows compare identical values. Fire-and-forget: the
+    // POST goes out on a tokio task, the signup response never waits for it.
+    let lite = system_webhook::webhook_user_lite_from_pack(&packed);
+    if let Some(pool) = state.pool.clone() {
+        let server_url = state.config.url.clone();
+        let hook_host = state.config.host();
+        tokio::spawn(system_webhook::fire(
+            pool,
+            server_url,
+            hook_host,
+            "userCreated",
+            lite,
+        ));
+    }
+    // ==== END arena-synalio userCreated hook ====
 
     (StatusCode::OK, Json(packed)).into_response()
 }

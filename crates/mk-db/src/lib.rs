@@ -75,6 +75,10 @@ pub mod timelines;
 // ship in the 0001 baseline; the matching table models the redis
 // matchSpecific invitation zset on the legacy schema shape — no migration)
 pub mod reversi;
+// arena-synalio: system_webhook + abuse_report_notification_recipient +
+// abuse_user_report db paths (0001 baseline; the synalio e2e webhook plane —
+// no migration)
+pub mod webhook;
 pub mod user;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
