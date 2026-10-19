@@ -40,12 +40,12 @@
 //! the remote-user 301/500 redirect arms of userInfo (local-only databases).
 
 use axum::extract::{FromRequestParts, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 // mk_db re-exports sqlx (the crate's only dependency surface — the bare
 // `sqlx::` calls below ride this like the mk-db modules).
-use mk_db::sqlx;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use mk_db::sqlx;
+use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{ApiError, api_err};
@@ -162,11 +162,7 @@ fn ap_content_type(accept: Option<&str>) -> &'static str {
             a.contains("application/ld+json") && !a.contains("application/activity+json")
         })
         .unwrap_or(false);
-    if ld_preferred {
-        LD_JSON
-    } else {
-        ACTIVITY_JSON
-    }
+    if ld_preferred { LD_JSON } else { ACTIVITY_JSON }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +177,12 @@ fn hdr_str(req: &Request, name: header::HeaderName) -> Option<String> {
 }
 
 /// The ClientServerService onRequest hook + Cache-Control + a status/CT/body.
-fn client_response(status: StatusCode, content_type: &str, body: Vec<u8>, cache: Option<&str>) -> Response {
+fn client_response(
+    status: StatusCode,
+    content_type: &str,
+    body: Vec<u8>,
+    cache: Option<&str>,
+) -> Response {
     let mut res = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -209,13 +210,22 @@ fn client_empty(status: StatusCode, cache: Option<&str>) -> Response {
 /// Cache-Control, stamped over an already-built response body.
 fn stamp_ap_headers(resp: &mut Response, vary: bool, cache: &str) {
     let h = resp.headers_mut();
-    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Accept"));
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Accept"),
+    );
     h.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET, OPTIONS"),
     );
-    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("Vary"));
+    h.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Vary"),
+    );
     if vary {
         h.insert(header::VARY, HeaderValue::from_static("Accept"));
     }
@@ -258,7 +268,10 @@ fn escape_attr(s: &str) -> String {
 /// then `**bold**` folded to `<b>` — the literal `**a**` markers must never
 /// survive into a feed body (fetch-resource MFMを含まない rows).
 fn mfm_lite_html(text: &str) -> String {
-    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let mut out = String::new();
     for (i, part) in escaped.split("**").enumerate() {
         if i % 2 == 1 && !part.is_empty() {
@@ -538,21 +551,27 @@ async fn feed(state: AppState, seg: &str, kind: FeedKind, _accept: Option<String
         return client_empty(StatusCode::NOT_FOUND, None);
     };
     // getFeed — requireSigninToViewContents: false rides the lookup.
-    let row: Option<(String, String, Option<String>, i32, i32, i32, Option<String>)> =
-        sqlx::query_as(
-            r#"SELECT "id", "username", "name", "notesCount", "followingCount", "followersCount",
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        i32,
+        i32,
+        i32,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"SELECT "id", "username", "name", "notesCount", "followingCount", "followersCount",
                       "avatarUrl" FROM "user"
                WHERE "usernameLower" = $1 AND "host" IS NULL AND "isSuspended" = false
                  AND "requireSigninToViewContents" = false
                ORDER BY "id" ASC LIMIT 1"#,
-        )
-        .bind(&feed_username.to_lowercase())
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| db_err("feed user find", e))
-        .unwrap_or(None);
-    let Some((id, username, name, notes_count, following_count, followers_count, avatar_url)) =
-        row
+    )
+    .bind(&feed_username.to_lowercase())
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| db_err("feed user find", e))
+    .unwrap_or(None);
+    let Some((id, username, name, notes_count, following_count, followers_count, avatar_url)) = row
     else {
         return client_empty(StatusCode::NOT_FOUND, None);
     };
@@ -611,10 +630,7 @@ async fn feed(state: AppState, seg: &str, kind: FeedKind, _accept: Option<String
                 "?".to_string()
             },
         ),
-        None => (
-            u.following_count.to_string(),
-            u.followers_count.to_string(),
-        ),
+        None => (u.following_count.to_string(), u.followers_count.to_string()),
     };
     let profile_description = prof.as_ref().and_then(|(d, _, _)| d.clone());
     let description = format!(
@@ -634,9 +650,40 @@ async fn feed(state: AppState, seg: &str, kind: FeedKind, _accept: Option<String
     let updated = notes.first().map(|(id, _, _)| iso_of(id));
 
     let body = match kind {
-        FeedKind::Rss => render_rss(&u, &host_str, origin, &author_name, &author_link, &title_line(&u, &host_str), &description, &image, &notes, updated.as_deref()),
-        FeedKind::Atom => render_atom(&u, &host_str, origin, &author_name, &author_link, &title_line(&u, &host_str), &description, &image, &notes, updated.as_deref()),
-        FeedKind::Json => render_json_feed(&u, origin, &author_name, &author_link, &title_line(&u, &host_str), &description, &image, &notes),
+        FeedKind::Rss => render_rss(
+            &u,
+            &host_str,
+            origin,
+            &author_name,
+            &author_link,
+            &title_line(&u, &host_str),
+            &description,
+            &image,
+            &notes,
+            updated.as_deref(),
+        ),
+        FeedKind::Atom => render_atom(
+            &u,
+            &host_str,
+            origin,
+            &author_name,
+            &author_link,
+            &title_line(&u, &host_str),
+            &description,
+            &image,
+            &notes,
+            updated.as_deref(),
+        ),
+        FeedKind::Json => render_json_feed(
+            &u,
+            origin,
+            &author_name,
+            &author_link,
+            &title_line(&u, &host_str),
+            &description,
+            &image,
+            &notes,
+        ),
     };
     let (ct, body) = body;
     client_response(StatusCode::OK, ct, body.into_bytes(), None)
@@ -979,7 +1026,8 @@ pub(crate) async fn users_get(State(state): State<AppState>, req: Request) -> Re
             let mut res = StatusCode::FOUND.into_response();
             res.headers_mut().insert(
                 header::LOCATION,
-                HeaderValue::from_str(&format!("/@{username}")).unwrap_or(HeaderValue::from_static("/")),
+                HeaderValue::from_str(&format!("/@{username}"))
+                    .unwrap_or(HeaderValue::from_static("/")),
             );
             res.headers_mut()
                 .insert(header::VARY, HeaderValue::from_static("Accept"));
@@ -1014,10 +1062,7 @@ pub(crate) async fn notes_get(
         Err(e) => return db_err("notes_get", e),
     };
     let visible = match &note {
-        Some(n) => {
-            matches!(n.visibility.as_str(), "public" | "home")
-                && n.user_host.is_none()
-        }
+        Some(n) => matches!(n.visibility.as_str(), "public" | "home") && n.user_host.is_none(),
         None => false,
     };
     let author = if visible {
@@ -1034,9 +1079,7 @@ pub(crate) async fn notes_get(
         None
     };
     match (note, author) {
-        (Some(n), Some((user_id, username, _name, require_signin, _host)))
-            if !require_signin =>
-        {
+        (Some(n), Some((user_id, username, _name, require_signin, _host))) if !require_signin => {
             let ugc = meta_ugc(pool).await;
             if !ugc_allows(&ugc, true) {
                 return base_page(&state).await;
@@ -1065,25 +1108,23 @@ pub(crate) async fn play_get(State(state): State<AppState>, req: Request) -> Res
     let Some(pool) = &state.pool else {
         return base_page(&state).await;
     };
-    let row: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT "id", "userId" FROM "flash" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("play_get", e))
-    .unwrap_or(None);
+    let row: Option<(String, String)> =
+        sqlx::query_as(r#"SELECT "id", "userId" FROM "flash" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("play_get", e))
+            .unwrap_or(None);
     let Some((flash_id, user_id)) = row else {
         return base_page(&state).await;
     };
-    let author: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("play_get author", e))
-    .unwrap_or(None);
+    let author: Option<(String, String)> =
+        sqlx::query_as(r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("play_get author", e))
+            .unwrap_or(None);
     match author {
         Some((uid, username)) => resource_page(
             &username,
@@ -1116,14 +1157,13 @@ pub(crate) async fn clips_get(State(state): State<AppState>, req: Request) -> Re
     if !clip.is_public {
         return base_page(&state).await;
     }
-    let author: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&clip.user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("clips_get author", e))
-    .unwrap_or(None);
+    let author: Option<(String, String)> =
+        sqlx::query_as(r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&clip.user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("clips_get author", e))
+            .unwrap_or(None);
     match author {
         Some((uid, username)) => resource_page(
             &username,
@@ -1145,25 +1185,23 @@ pub(crate) async fn gallery_get(State(state): State<AppState>, req: Request) -> 
     let Some(pool) = &state.pool else {
         return base_page(&state).await;
     };
-    let row: Option<String> = sqlx::query_scalar(
-        r#"SELECT "userId" FROM "gallery_post" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&post_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("gallery_get", e))
-    .unwrap_or(None);
+    let row: Option<String> =
+        sqlx::query_scalar(r#"SELECT "userId" FROM "gallery_post" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&post_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("gallery_get", e))
+            .unwrap_or(None);
     let Some(user_id) = row else {
         return base_page(&state).await;
     };
-    let author: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("gallery_get author", e))
-    .unwrap_or(None);
+    let author: Option<(String, String)> =
+        sqlx::query_as(r#"SELECT "id", "username" FROM "user" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("gallery_get author", e))
+            .unwrap_or(None);
     match author {
         Some((uid, username)) => resource_page(
             &username,
@@ -1184,14 +1222,13 @@ pub(crate) async fn channel_get(State(state): State<AppState>, req: Request) -> 
     let Some(pool) = &state.pool else {
         return base_page(&state).await;
     };
-    let found: Option<String> = sqlx::query_scalar(
-        r#"SELECT "id" FROM "channel" WHERE "id" = $1 LIMIT 1"#,
-    )
-    .bind(&channel_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| db_err("channel_get", e))
-    .unwrap_or(None);
+    let found: Option<String> =
+        sqlx::query_scalar(r#"SELECT "id" FROM "channel" WHERE "id" = $1 LIMIT 1"#)
+            .bind(&channel_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| db_err("channel_get", e))
+            .unwrap_or(None);
     match found {
         Some(_) => resource_page("Misskey", &[], "public, max-age=15"),
         None => base_page(&state).await,
@@ -1201,10 +1238,7 @@ pub(crate) async fn channel_get(State(state): State<AppState>, req: Request) -> 
 fn tail_segment(req: &Request, prefix: &str) -> String {
     let path = req.uri().path();
     let rest = path.strip_prefix(prefix).unwrap_or(path);
-    rest.split('/')
-        .next()
-        .unwrap_or(rest)
-        .to_string()
+    rest.split('/').next().unwrap_or(rest).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,7 +1362,12 @@ fn emoji_route(req: Request, ext: &str, content_type: &str, _state: &AppState) -
             Some("max-age=2592000"),
         );
     }
-    let mut res = client_response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", Vec::new(), None);
+    let mut res = client_response(
+        StatusCode::NOT_FOUND,
+        "text/plain; charset=utf-8",
+        Vec::new(),
+        None,
+    );
     res.headers_mut().remove(header::CACHE_CONTROL);
     res
 }
@@ -1440,8 +1479,12 @@ pub(crate) async fn api_create(
         return internal();
     };
     // Auth before paramDef validation (ApiCallService.call order).
-    let me_id = match super::social::require_checked_user(pool, token.as_deref(), credential_declared)
-        .await
+    let me_id = match super::social::require_checked_user(
+        pool,
+        token.as_deref(),
+        credential_declared,
+    )
+    .await
     {
         Ok(me) => me,
         Err(resp) => return resp,
@@ -1471,9 +1514,14 @@ async fn pages_create(
     };
     let id = mk_types::id::gen_aid_now();
     let title = str_param(body, "title").unwrap_or_default();
-    let summary: Option<String> =
-        body.get("summary").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let align_center = body.get("alignCenter").and_then(|v| v.as_bool()).unwrap_or(false);
+    let summary: Option<String> = body
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let align_center = body
+        .get("alignCenter")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let hide_title = body
         .get("hideTitleWhenPinned")
         .and_then(|v| v.as_bool())
@@ -1490,7 +1538,11 @@ async fn pages_create(
     let visible: Vec<String> = body
         .get("visibleUserIds")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     sqlx::query(
         r#"
@@ -1558,7 +1610,11 @@ async fn flash_create(
     let permissions: Vec<String> = body
         .get("permissions")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let id = mk_types::id::gen_aid_now();
     sqlx::query(
@@ -1609,9 +1665,16 @@ async fn gallery_create(
     let file_ids: Vec<String> = body
         .get("fileIds")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let is_sensitive = body.get("isSensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_sensitive = body
+        .get("isSensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let id = mk_types::id::gen_aid_now();
     sqlx::query(
         r#"
