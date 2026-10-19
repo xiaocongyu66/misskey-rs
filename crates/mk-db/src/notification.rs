@@ -237,7 +237,7 @@ async fn has_unread_once(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Err
 
 /// SQLSTATE 42P01 — the fixture (TypeORM dropSchema) dropped the table under
 /// a running server; see the module header.
-fn is_undefined_table(e: &sqlx::Error) -> bool {
+pub(crate) fn is_undefined_table(e: &sqlx::Error) -> bool {
     matches!(
         e,
         sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01")

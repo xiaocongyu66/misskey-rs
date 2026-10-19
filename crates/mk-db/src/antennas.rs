@@ -345,11 +345,87 @@ pub async fn remove_note_from_antenna(
     antenna_id: &str,
     note_id: &str,
 ) -> Result<(), sqlx::Error> {
+    match remove_note_once(pool, antenna_id, note_id).await {
+        Err(e) if crate::notification::is_undefined_table(&e) => {
+            ensure_antenna_note_table(pool).await?;
+            remove_note_once(pool, antenna_id, note_id).await
+        }
+        r => r,
+    }
+}
+
+async fn remove_note_once(
+    pool: &PgPool,
+    antenna_id: &str,
+    note_id: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(r#"DELETE FROM "antenna_note" WHERE "antennaId" = $1 AND "noteId" = $2"#)
         .bind(antenna_id)
         .bind(note_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Idempotent replay of migrations/0004_antennas.sql (ntf-mute idiom): the
+/// harness's per-suite initTestDb dropSchema+synchronize rebuilds the schema
+/// from upstream ENTITIES only — the pinned upstream has no AntennaNote
+/// entity (redis fanout), so the projection table vanishes under a live
+/// server between suite files (SQLSTATE 42P01). Index/constraint re-creates
+/// swallow duplicates; PK/FK lack IF NOT EXISTS, so they ride DO blocks.
+pub async fn ensure_antenna_note_table(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS public.antenna_note (
+            id character varying(32) NOT NULL,
+            "noteId" character varying(32) NOT NULL,
+            "antennaId" character varying(32) NOT NULL,
+            read boolean DEFAULT false NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $do$ BEGIN
+            ALTER TABLE ONLY public.antenna_note
+                ADD CONSTRAINT "PK_antenna_note" PRIMARY KEY (id);
+        EXCEPTION WHEN duplicate_object THEN NULL; END $do$;"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS "IDX_antenna_note_antennaId"
+               ON public.antenna_note USING btree ("antennaId")"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS "IDX_antenna_note_pair"
+               ON public.antenna_note USING btree ("antennaId", "noteId")"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $do$ BEGIN
+            ALTER TABLE ONLY public.antenna_note
+                ADD CONSTRAINT "FK_antenna_note_note"
+                FOREIGN KEY ("noteId") REFERENCES public."note"("id") ON DELETE CASCADE;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $do$;"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $do$ BEGIN
+            ALTER TABLE ONLY public.antenna_note
+                ADD CONSTRAINT "FK_antenna_note_antenna"
+                FOREIGN KEY ("antennaId") REFERENCES public."antenna"("id") ON DELETE CASCADE;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $do$;"#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -583,13 +659,17 @@ async fn following_exists(
 
 /// addNoteToAntennas for a just-created note. The projection row PK is minted
 /// server-side (any unique 32-char string; nothing downstream orders by it —
-/// the feed sorts on the note id). `ON CONFLICT DO NOTHING` keeps the write
-/// idempotent under handler retries. Best-effort by contract — the caller
-/// logs failures and never fails the note creation.
+/// the feed sorts on the note id). `ON CONFLICT ("antennaId", "noteId") DO
+/// NOTHING` keeps the write idempotent under handler retries. Best-effort by
+/// contract — the caller logs failures and never fails the note creation.
+/// (ntf-mute idiom: the harness's per-suite `initTestDb` dropSchema+
+/// synchronize wipes every table without an upstream ENTITY — `antenna_note`
+/// has none in the pinned upstream (redis fanout) — so every touch replays
+/// the idempotent 0004 DDL once on SQLSTATE 42P01 and retries.)
 pub async fn fanout_created_note(pool: &PgPool, note_id: &str) -> Result<(), sqlx::Error> {
     let Some(note) = sqlx::query_as::<_, FanoutNoteRow>(
         r#"SELECT n."id", n."replyId" AS "reply_id", n."text", n."cw",
-                  n."userId" AS "user_id", n."visibility",
+                  n."userId" AS "user_id", n."visibility"::text AS "visibility",
                   n."visibleUserIds" AS "visible_user_ids",
                   n."fileIds" AS "file_ids", n."channelId" AS "channel_id",
                   u."usernameLower" AS "username_lower", u."host" AS "user_host",
@@ -621,17 +701,32 @@ pub async fn fanout_created_note(pool: &PgPool, note_id: &str) -> Result<(), sql
         if !check_hit(pool, a, &note, channel_is_sensitive).await? {
             continue;
         }
-        sqlx::query(
-            r#"
-            INSERT INTO "antenna_note" ("id", "noteId", "antennaId")
-            VALUES (md5(random()::text || clock_timestamp()::text), $1, $2)
-            ON CONFLICT ("antennaId", "noteId") DO NOTHING"#,
-        )
-        .bind(&note.id)
-        .bind(&a.id)
-        .execute(pool)
-        .await?;
+        match insert_projection_row(pool, &note.id, &a.id).await {
+            Err(e) if crate::notification::is_undefined_table(&e) => {
+                ensure_antenna_note_table(pool).await?;
+                insert_projection_row(pool, &note.id, &a.id).await?;
+            }
+            r => r?,
+        }
     }
+    Ok(())
+}
+
+async fn insert_projection_row(
+    pool: &PgPool,
+    note_id: &str,
+    antenna_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO "antenna_note" ("id", "noteId", "antennaId")
+        VALUES (md5(random()::text || clock_timestamp()::text), $1, $2)
+        ON CONFLICT ("antennaId", "noteId") DO NOTHING"#,
+    )
+    .bind(note_id)
+    .bind(antenna_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -691,7 +786,48 @@ pub async fn antenna_notes_page(
     let sql = inner
         .replace("MUTE_SEL", crate::lists::MUTE_SEL)
         .replace("BLOCK_SEL", crate::lists::BLOCK_SEL);
-    sqlx::query_scalar(&sql)
+    match antenna_notes_page_once(
+        pool,
+        &sql,
+        antenna_id,
+        me_id,
+        &me_list,
+        followee_ids,
+        until_id,
+        since_id,
+    )
+    .await
+    {
+        Err(e) if crate::notification::is_undefined_table(&e) => {
+            ensure_antenna_note_table(pool).await?;
+            antenna_notes_page_once(
+                pool,
+                &sql,
+                antenna_id,
+                me_id,
+                &me_list,
+                followee_ids,
+                until_id,
+                since_id,
+            )
+            .await
+        }
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn antenna_notes_page_once(
+    pool: &PgPool,
+    sql: &str,
+    antenna_id: &str,
+    me_id: &str,
+    me_list: &[String],
+    followee_ids: &[String],
+    until_id: Option<&str>,
+    since_id: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(sql)
         .bind(antenna_id)
         .bind(me_id)
         .bind(me_list)
