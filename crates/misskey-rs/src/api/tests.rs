@@ -11718,3 +11718,495 @@ async fn arena_exports_export_clips_queue_plane() {
         "list empties (beforeEach clean)"
     );
 }
+
+// arena-files ================================================================
+// upstream endpoints/drive/files/* (pinned ea2c3aed) — the read/lookup surface
+// e2e-harness/files.ts drives: list (QueryService.makePaginationQuery semantics
+// + folderId/type filters), show (anyOf fileId|url + owner-or-moderator +
+// pack(detail,withUser,self)), delete (DriveService.deleteFile row-death),
+// find / find-by-hash / check-existence (owner-scoped), and the
+// drive/files/create name ladder (validateFileName → INVALID_FILE_NAME).
+
+/// seed variant with name/folder/url under the caller's control
+/// (seed_drive_file pins the drive.ts 192.jpg shape).
+async fn arena_files_seed(
+    pool: &mk_db::sqlx::PgPool,
+    user_id: &str,
+    file_type: &str,
+    name: &str,
+    folder_id: Option<&str>,
+) -> (String, String) {
+    let id = mk_types::id::gen_aid_now();
+    let md5 = format!(
+        "{}{}",
+        mk_types::id::gen_aid_now(),
+        mk_types::id::gen_aid_now()
+    );
+    let row = mk_db::drive::DriveFileRow {
+        id: id.clone(),
+        user_id: Some(user_id.to_string()),
+        md5: md5.clone(),
+        name: name.to_string(),
+        file_type: file_type.to_string(),
+        size: 12_345,
+        url: format!("http://127.0.0.1:3000/files/{id}/{name}"),
+        properties: json!({}),
+        folder_id: folder_id.map(String::from),
+        ..Default::default()
+    };
+    mk_db::drive::insert_drive_file(pool, &row, &format!("ak{id}"))
+        .await
+        .unwrap();
+    (id, md5)
+}
+
+#[tokio::test]
+async fn arena_files_show_and_owner_gates() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_files_show").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let bob = signup(&app, "bob").await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let (fid, md5) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "192.jpg",
+        None,
+    )
+    .await;
+
+    // show by fileId: pack(file, { detail: true, withUser: true, self: true })
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": fid, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["id"], json!(fid));
+    assert_eq!(b["name"], json!("192.jpg"));
+    assert_eq!(b["type"], json!("image/jpeg"));
+    assert_eq!(b["md5"], json!(md5));
+    assert_eq!(b["userId"], alice["id"]);
+    assert_eq!(b["user"]["id"], alice["id"]);
+
+    // show by url (anyOf second arm — url/webpublicUrl/thumbnailUrl OR)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "url": format!("http://127.0.0.1:3000/files/{fid}/192.jpg"), "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["id"], json!(fid));
+
+    // unknown id → NO_SUCH_FILE
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": "z".repeat(24), "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // foreign non-moderator → ACCESS_DENIED
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": fid, "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ACCESS_DENIED"));
+
+    // neither fileName nor url → INVALID_PARAM (ajv anyOf row)
+    let (s, b) = post_json(app.clone(), "/api/drive/files/show", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn arena_files_delete_ladder() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_files_delete").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let bob = signup(&app, "bob").await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let (f1, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "gone.jpg",
+        None,
+    )
+    .await;
+    let (f2, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "kept.jpg",
+        None,
+    )
+    .await;
+
+    // owned delete → 204 void
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/delete",
+        json!({ "fileId": f1, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+
+    // row death: show turns NO_SUCH_FILE
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": f1, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // deleting what is gone → NO_SUCH_FILE (908939ec-…)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/delete",
+        json!({ "fileId": f1, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_FILE"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("908939ec-e52b-4458-b395-1025195cea58")
+    );
+
+    // foreign non-moderator → ACCESS_DENIED (5eb8d909-…)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/delete",
+        json!({ "fileId": f2, "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ACCESS_DENIED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("5eb8d909-2540-4970-90b8-dd6f86088121")
+    );
+
+    // untouched file survives
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/show",
+        json!({ "fileId": f2, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["id"], json!(f2));
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn arena_files_list_pagination_and_filters() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_files_list").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let (f1, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "192.jpg",
+        None,
+    )
+    .await;
+    let (f2, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "192.jpg",
+        None,
+    )
+    .await;
+    let (f3, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "192.jpg",
+        None,
+    )
+    .await;
+
+    // default page: id DESC (makePaginationQuery), oldest-root set exact
+    let (s, b) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![f3.as_str(), f2.as_str(), f1.as_str()]);
+
+    // untilId boundary: exclusive, DESC
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "untilId": f2, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![f1.as_str()]);
+
+    // sinceId boundary: exclusive + ASC flip
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "sinceId": f1, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![f2.as_str(), f3.as_str()]);
+
+    // limit narrows the DESC page; limit 0 is outside 1..100
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "limit": 2, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 2);
+    assert_eq!(b[0]["id"], json!(f3));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "limit": 0, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // folder island: a foldered file vanishes from the root arm and shows
+    // under its folderId
+    let (s, folder) = post_json(
+        app.clone(),
+        "/api/drive/folders/create",
+        json!({ "name": "arena", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {folder}");
+    let folder_id = folder["id"].as_str().unwrap().to_string();
+    let (f4, _) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "fold.jpg",
+        Some(&folder_id),
+    )
+    .await;
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "folderId": folder_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(f4));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "folderId": null, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let root_has_f4 = b.as_array().unwrap().iter().any(|f| f["id"] == json!(f4));
+    assert!(!root_has_f4);
+
+    // type probe: exact miss, exact hit, wildcard hit (files.ts LIKE arm)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "type": "image/png", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 0);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "type": "image/jpeg", "limit": 100, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 3);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "type": "video/*", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 0);
+
+    let _ = pool;
+}
+
+#[tokio::test]
+async fn arena_files_find_hash_existence_and_name_ladder() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_files_find").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let bob = signup(&app, "bob").await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let (f1, md5) = arena_files_seed(
+        &pool,
+        alice["id"].as_str().unwrap(),
+        "image/jpeg",
+        "findme.jpg",
+        None,
+    )
+    .await;
+    let (fb, _md5b) = arena_files_seed(
+        &pool,
+        bob["id"].as_str().unwrap(),
+        "image/jpeg",
+        "findme.jpg",
+        None,
+    )
+    .await;
+
+    // find.ts: name + userId (+ folderId ?? IsNull) — owner-scoped exact match
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/find",
+        json!({ "name": "findme.jpg", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(f1));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/find",
+        json!({ "name": "findme.jpg", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b[0]["id"], json!(fb));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/find",
+        json!({ "name": "findme.jpg", "folderId": "f".repeat(24), "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 0);
+
+    // find-by-hash.ts: md5 + userId
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/find-by-hash",
+        json!({ "md5": md5, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b[0]["id"], json!(f1));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/find-by-hash",
+        json!({ "md5": "0".repeat(32), "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b.as_array().unwrap().len(), 0);
+
+    // check-existence.ts: EXISTS(md5, owner) — same bytes on another
+    // account's drive do not exist for the caller
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/check-existence",
+        json!({ "md5": md5, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!(true));
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/files/check-existence",
+        json!({ "md5": md5, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!(false));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/files/check-existence",
+        json!({ "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // create.ts name ladder: validateFileName failure (no '/' in names)
+    let mut body: Vec<u8> =
+        b"--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"192.jpg\"\r\n\r\n"
+            .to_vec();
+    body.extend_from_slice(b"\xFF\xD8\xFF\xe0jpeg-bytes");
+    body.extend_from_slice(
+        b"\r\n--XX\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nte/st",
+    );
+    body.extend_from_slice(b"\r\n--XX\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n");
+    body.extend_from_slice(at.as_bytes());
+    body.extend_from_slice(b"\r\n--XX--\r\n");
+    let (s, b) = post_multipart(
+        app.clone(),
+        "/api/drive/files/create",
+        "multipart/form-data; boundary=XX",
+        body,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_FILE_NAME"));
+
+    let _ = pool;
+}
