@@ -162,7 +162,7 @@ fn detailed(
     let relation_is_following = relation.as_ref().map(|r| r.is_following).unwrap_or(false);
     // Role engine: badges for the lite block, public roles + merged policy
     // flags for the detailed block (badge_roles_and_policy = the wiring hook).
-    let (badge_roles, public_roles, policy) = match roles {
+    let (badge_roles, public_roles, mut policy) = match roles {
         Some(rp) => {
             let (badges, policy) =
                 crate::services::role::badge_roles_and_policy(rp.assigned, rp.viewer_is_moderator);
@@ -174,6 +174,16 @@ fn detailed(
             crate::services::role::UserPolicy::base(),
         ),
     };
+    // roles-v2: a `{ useDefault: false }` canPublicNote entry is the
+    // authoritative silencing vote (see roles_v2 module deviation note) —
+    // the plain any-true merge keeps a base-true vote from every
+    // default-policies role, masking an explicit silencing role.
+    if let Some(rp) = roles {
+        policy.can_public_note = crate::services::roles_v2::can_public_note_effective(
+            rp.assigned,
+            policy.can_public_note,
+        );
+    }
     // pack L577: `...(isDetailed && (isMe || iAmModerator) ? { twoFactorEnabled,
     // usePasswordLessLogin, securityKeys } : {})` — the not-me block appears
     // only for moderator viewers.

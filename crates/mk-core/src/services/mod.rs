@@ -4,6 +4,9 @@ pub mod misc;
 pub mod note_pack;
 pub mod notification_pack;
 pub mod role;
+// roles-v2: conditional-role engine (evalCond/getUserRoles) + Role-pack
+// policy surface (DEFAULT_POLICIES fill / explicit canPublicNote override)
+pub mod roles_v2;
 pub mod search_bridge;
 pub mod signup;
 pub mod user_pack;

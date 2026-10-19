@@ -58,6 +58,8 @@ pub mod relation;
 pub mod role;
 // gate-roles: minimal admin/roles/create + assign SQL support
 pub mod roles_lite;
+// roles-v2: admin/roles/{show,list,users,update} + assign-expiry SQL support
+pub mod roles;
 // social-agent: social-graph writes (follow/mute/block/renote)
 pub mod social;
 // arena-api: MiAccessToken rows (api.ts miauth/gen-token mint + the app

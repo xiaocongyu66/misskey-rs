@@ -27,6 +27,10 @@ pub(crate) mod drive;
 // gate-roles: minimal admin/roles/create + admin/roles/assign seeding the
 // users.ts role fixtures (Publicなロール/バッヂロール census)
 mod roles_lite;
+// roles-v2: the admin/roles/* arena tail — show/list/users + update + the
+// assign re-route with expiresAt (api/roles.rs; SQL in mk-db/src/roles.rs,
+// the conditional engine in mk-core services/roles_v2)
+mod roles;
 // delete-account: i/delete-account + admin/delete-account (削除済 census —
 // soft `isDeleted` flag + the me-view pack field); db path in
 // mk-db/src/delete_account.rs
@@ -371,6 +375,27 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         return users_show(&state, &body, token).await;
     }
+
+    // ==== roles-v2 DISPATCH ARM (admin/roles/{show,list,users,assign,update}) ====
+    // Noses in ahead of the gate-roles arm: assign re-routes here for the
+    // expiresAt plane (past expiry → silent 204, future → stored + echoed,
+    // dup-live → 500) while create/unassign/delete stay in roles_lite.
+    // Method check, body parsing and token extraction live in the arm; the
+    // moderator/admin gates + the per-endpoint NO_SUCH_ROLE error ids in
+    // api::roles (SQL in mk-db/src/roles.rs).
+    if roles::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return roles::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END roles-v2 DISPATCH ARM ====
 
     // ==== gate-roles DISPATCH ARM (admin/roles/create + assign) ====
     // Noses in ahead of the admin/* arm (roles_lite owns only these two
@@ -1336,10 +1361,15 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
                 Err(resp) => return *resp,
             };
             let packed = {
-                let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+                // roles-v2: the pack sees manual assignments PLUS the
+                // conditional roles whose condFormula matches the target
+                // (RoleService.getUserRoles) — not just assignment rows.
+                let assigned = match mk_core::services::roles_v2::user_effective_roles(pool, &row)
+                    .await
+                {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::error!(target: "dbg_users_show", error = %e, "user_assigned_roles[userIds]");
+                        tracing::error!(target: "dbg_users_show", error = %e, "user_effective_roles[userIds]");
                         continue;
                     }
                 };
@@ -1412,10 +1442,12 @@ async fn users_show(state: &AppState, body: &Value, token: Option<String>) -> Re
     // (UserEntityService.pack reads roleService per user).
     let viewer_mod = viewer_is_moderator(pool, me_id.as_deref()).await;
     let packed = {
-        let assigned = match mk_db::role::user_assigned_roles(pool, &row.id).await {
+        // roles-v2: manual assignments + condFormula-matched conditional
+        // roles (RoleService.getUserRoles) feed badges/roles/policies.
+        let assigned = match mk_core::services::roles_v2::user_effective_roles(pool, &row).await {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!(target: "dbg_users_show", error = %e, "user_assigned_roles");
+                tracing::error!(target: "dbg_users_show", error = %e, "user_effective_roles");
                 return api_err(ApiError::internal_error());
             }
         };

@@ -12210,3 +12210,236 @@ async fn arena_files_find_hash_existence_and_name_ladder() {
 
     let _ = pool;
 }
+
+// ==== roles-v2 (conditional-role engine + Role-pack policy surface) ====
+// DB-free unit plane: evalCond matrix, the DEFAULT-polices pack fill, the
+// getUserRoles merge order, and the explicit canPublicNote override that
+// feeds users/show's isSilenced. Upstream RoleService.ts (pinned ea2c3aed).
+
+// roles-v2: the harness `defaultPolicies()`-equivalent object
+fn roles_v2_default_policies() -> Value {
+    let d = mk_core::services::roles_v2::default_policies_value();
+    d.as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                json!({ "priority": 0, "useDefault": true, "value": v }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>()
+        .into()
+}
+
+#[test]
+fn roles_v2_pack_policies_fills_defaults_and_drops_foreign_keys() {
+    // the utils `role()` helper spreads `Object.entries(...).map(...)` — the
+    // stored policies carry numeric pair-array keys + the boolean override;
+    // the pack must render the 39-key default fill and drop the foreign keys
+    let garbled = json!({
+        "0": ["gtlAvailable", { "priority": 0, "useDefault": true, "value": true }],
+        "1": ["ltlAvailable", { "priority": 0, "useDefault": true, "value": true }],
+        "canPublicNote": { "priority": 0, "useDefault": false, "value": false },
+        "pinLimit": { "priority": 2, "useDefault": false, "value": 9 },
+    });
+    let packed = mk_core::services::roles_v2::pack_policies(&garbled);
+    assert_eq!(
+        packed["pinLimit"],
+        json!({ "priority": 2, "useDefault": false, "value": 9 })
+    );
+    assert_eq!(
+        packed["canPublicNote"],
+        json!({ "priority": 0, "useDefault": false, "value": false })
+    );
+    assert!(packed.get("0").is_none(), "foreign key must drop");
+    // every DEFAULT key present; the untouched ones equal the fill
+    let defaults = roles_v2_default_policies();
+    let dprops = defaults.as_object().unwrap();
+    for k in dprops.keys() {
+        assert!(packed.get(k).is_some(), "missing DEFAULT key {k}");
+    }
+    assert_eq!(packed["gtlAvailable"], dprops["gtlAvailable"]);
+    assert_eq!(packed["uploadableFileTypes"], dprops["uploadableFileTypes"]);
+    // an empty policies object packs to exactly defaultPolicies()
+    assert_eq!(
+        mk_core::services::roles_v2::pack_policies(&json!({})),
+        defaults
+    );
+}
+
+#[test]
+fn roles_v2_eval_cond_matrix() {
+    let now: i64 = 1_700_000_000_000;
+    let mut f = mk_core::services::roles_v2::CondFacts::fixture(now - 1000, now, 0, 0, 1);
+    assert!(f.is_local);
+    let cat = json!({ "type": "isCat" });
+    let local = json!({ "type": "isLocal" });
+    assert!(
+        !mk_core::services::roles_v2::eval_cond(&f, &[], &cat),
+        "fixtures are not cats"
+    );
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &[], &local));
+    // not
+    let bot_not = json!({ "type": "not", "value": cat });
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &[], &bot_not));
+    f.is_cat = true;
+    assert!(!mk_core::services::roles_v2::eval_cond(&f, &[], &bot_not));
+    // and / or / roleAssignedTo
+    let rids = vec!["roleA".to_string()];
+    let and = json!({ "type": "and", "values": [local, cat] });
+    let or = json!({ "type": "or", "values": [json!({ "type": "isSuspended" }), cat] });
+    let assigned = json!({ "type": "roleAssignedTo", "roleId": "roleA" });
+    let assigned_other = json!({ "type": "roleAssignedTo", "roleId": "roleB" });
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &rids, &and));
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &rids, &or));
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &rids, &assigned));
+    assert!(!mk_core::services::roles_v2::eval_cond(
+        &f,
+        &rids,
+        &assigned_other
+    ));
+    // age ladders: young = createdLessThan 10y matches, old = createdMoreThan
+    // 1d does not for a fresh account
+    let young = json!({ "type": "createdLessThan", "sec": 86400 * 3650 });
+    let old = json!({ "type": "createdMoreThan", "sec": 86400 });
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &[], &young));
+    assert!(!mk_core::services::roles_v2::eval_cond(&f, &[], &old));
+    // counters
+    let no_fol = json!({ "type": "followersLessThanOrEq", "value": 0 });
+    let has_fol = json!({ "type": "followersMoreThanOrEq", "value": 1 });
+    let noted = json!({ "type": "notesMoreThanOrEq", "value": 1 });
+    let silent = json!({ "type": "notesLessThanOrEq", "value": 0 });
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &[], &no_fol));
+    assert!(!mk_core::services::roles_v2::eval_cond(&f, &[], &has_fol));
+    assert!(mk_core::services::roles_v2::eval_cond(&f, &[], &noted));
+    assert!(!mk_core::services::roles_v2::eval_cond(&f, &[], &silent));
+    // unknown + malformed types eval false (upstream try/catch default)
+    assert!(!mk_core::services::roles_v2::eval_cond(
+        &f,
+        &[],
+        &json!({ "type": "isAdministrater" })
+    ));
+    assert!(!mk_core::services::roles_v2::eval_cond(
+        &f,
+        &[],
+        &json!("nope")
+    ));
+}
+
+#[test]
+fn roles_v2_effective_roles_merges_conditionals_sorted_desc() {
+    let now: i64 = 1_700_000_000_000;
+    let f = mk_core::services::roles_v2::CondFacts::fixture(now - 1000, now, 1, 0, 1);
+    let r = |id: &str, order: i64, target: &str, formula: Value| mk_db::roles::CondRole {
+        id: id.to_string(),
+        name: format!("role {id}"),
+        is_public: true,
+        is_moderator: false,
+        is_administrator: false,
+        as_badge: false,
+        color: None,
+        icon_url: None,
+        description: String::new(),
+        display_order: order,
+        policies: json!({}),
+        target: target.to_string(),
+        cond_formula: formula,
+    };
+    let manual = mk_db::role::AssignedRole {
+        id: "manualPublic".to_string(),
+        name: "manual".to_string(),
+        is_public: true,
+        is_moderator: false,
+        is_administrator: false,
+        as_badge: false,
+        color: None,
+        icon_url: None,
+        description: String::new(),
+        display_order: 10,
+        policies: json!({}),
+    };
+    let all = vec![
+        r(
+            "notesRole",
+            37,
+            "conditional",
+            json!({ "type": "notesMoreThanOrEq", "value": 1 }),
+        ),
+        r(
+            "followerRole",
+            36,
+            "conditional",
+            json!({ "type": "followersMoreThanOrEq", "value": 1 }),
+        ),
+        r("catRole", 30, "conditional", json!({ "type": "isCat" })),
+        r(
+            "oldRole",
+            34,
+            "conditional",
+            json!({ "type": "createdMoreThan", "sec": 86400 }),
+        ),
+        r("otherManual", 50, "manual", json!({})),
+    ];
+    let out = mk_core::services::roles_v2::effective_roles(&all, &[manual], &f);
+    let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
+    // manual public first by displayOrder, matched conditionals ride along,
+    // non-matching (cat) and never-fresh (old) roles stay out
+    assert_eq!(ids, vec!["notesRole", "followerRole", "manualPublic"]);
+}
+
+#[test]
+fn roles_v2_can_public_note_explicit_override_wins() {
+    let pe = |value: Value, priority: i64, use_default: bool| json!({ "priority": priority, "useDefault": use_default, "value": value });
+    let role = |id: &str, policies: Value| mk_db::role::AssignedRole {
+        id: id.to_string(),
+        name: id.to_string(),
+        is_public: true,
+        is_moderator: false,
+        is_administrator: false,
+        as_badge: false,
+        color: None,
+        icon_url: None,
+        description: String::new(),
+        display_order: 0,
+        policies,
+    };
+    // explicit (useDefault:false) false beats the default-policies fill the
+    // conditional roles send (the roles.ts isSilenced census shape)
+    let explicit = vec![
+        role(
+            "silencer",
+            json!({ "canPublicNote": pe(json!(false), 0, false) }),
+        ),
+        role(
+            "default_policies",
+            json!({ "canPublicNote": pe(json!(true), 0, true) }),
+        ),
+    ];
+    assert!(!mk_core::services::roles_v2::can_public_note_effective(
+        &explicit, true
+    ));
+    // no explicit entries → the plain any-true merge (base flows through)
+    let defaults_only = vec![
+        role("a", json!({})),
+        role("b", json!({ "canPublicNote": pe(json!(true), 0, true) })),
+    ];
+    assert!(mk_core::services::roles_v2::can_public_note_effective(
+        &defaults_only,
+        true
+    ));
+    assert_eq!(
+        mk_core::services::roles_v2::can_public_note_effective(&[], true),
+        true
+    );
+    // explicit TRUE also counts when explicit entries exist
+    let explicit_true = vec![
+        role("x", json!({ "canPublicNote": pe(json!(true), 1, false) })),
+        role("y", json!({ "canPublicNote": pe(json!(false), 0, false) })),
+    ];
+    // priority-1 tier outranks the explicit false at priority 0
+    assert!(mk_core::services::roles_v2::can_public_note_effective(
+        &explicit_true,
+        true
+    ));
+}
