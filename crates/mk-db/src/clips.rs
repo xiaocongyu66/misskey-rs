@@ -36,6 +36,14 @@ const CLIP_COLS: &str = r#""id", "userId" AS "user_id", "name", "description",
                     ELSE (EXTRACT(EPOCH FROM "lastClippedAt") * 1000)::bigint
                END AS "last_clipped_at_ms""#;
 
+/// Same projection, columns qualified for the clip_favorite ⨝ clip join
+/// (clip_favorite also has "id"/"userId" — bare names are ambiguous there).
+const CLIP_COLS_QUALIFIED: &str = r#""clip"."id", "clip"."userId" AS "user_id", "clip"."name", "clip"."description",
+               "clip"."isPublic" AS "is_public",
+               CASE WHEN "clip"."lastClippedAt" IS NULL THEN NULL
+                    ELSE (EXTRACT(EPOCH FROM "clip"."lastClippedAt") * 1000)::bigint
+               END AS "last_clipped_at_ms""#;
+
 /// `ClipsRepository.findOneBy({ id })` — clips/show, clips/favorite,
 /// clips/unfavorite and clips/notes look the clip up WITHOUT an owner scope
 /// (non-owner visibility is decided afterwards from `isPublic`/me).
@@ -209,7 +217,7 @@ pub async fn list_clips(
 /// asserts singletons).
 pub async fn list_favorited_clips(pool: &PgPool, me_id: &str) -> Result<Vec<ClipRow>, sqlx::Error> {
     let sql = format!(
-        r#"SELECT {CLIP_COLS} FROM "clip_favorite" f
+        r#"SELECT {CLIP_COLS_QUALIFIED} FROM "clip_favorite" f
            INNER JOIN "clip" ON "clip"."id" = f."clipId"
            WHERE f."userId" = $1
            ORDER BY f."id""#
