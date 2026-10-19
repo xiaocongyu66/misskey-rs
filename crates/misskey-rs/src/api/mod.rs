@@ -3658,10 +3658,10 @@ async fn mute_lane_me_id(
         )));
     };
     if token.len() != 16 {
-        return authentication_failed();
+        return Err(authentication_failed());
     }
     let Some(me_id) = resolve_me(pool, Some(token)).await else {
-        return authentication_failed();
+        return Err(authentication_failed());
     };
     match mk_db::user::find_user_by_id(pool, &me_id).await {
         Ok(Some(row)) => {
@@ -3675,7 +3675,7 @@ async fn mute_lane_me_id(
                 )));
             }
         }
-        Ok(None) => return authentication_failed(),
+        Ok(None) => return Err(authentication_failed()),
         Err(e) => {
             tracing::error!(target: "dbg_mentions", error = %e, "find_user_by_id");
             return Err(api_err(ApiError::internal_error()));
