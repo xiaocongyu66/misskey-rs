@@ -627,9 +627,22 @@ fn tag_attributes(tag: &str) -> Vec<(String, String)> {
     let mut attrs = Vec::new();
     let bytes = tag.as_bytes();
     let mut i = 0;
+    // node-html-parser attributes: everything AFTER the tag name — the name
+    // itself is NOT an attribute. Skipping it first keeps `rel`/`href` of the
+    // first two pairs intact on `<link rel="…" href="…">` / `<a href="…">`.
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'<') {
+        i += 1;
+    }
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/'
+    {
+        i += 1;
+    }
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'<') {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            break;
         }
         let name_start = i;
         while i < bytes.len()
@@ -639,32 +652,37 @@ fn tag_attributes(tag: &str) -> Vec<(String, String)> {
         {
             i += 1;
         }
-        if name_start == i {
-            i += 1;
-            continue;
-        }
         let name = tag[name_start..i].to_ascii_lowercase();
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'=') {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        let value = if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-            let quote = bytes[i];
+        if i < bytes.len() && bytes[i] == b'=' {
             i += 1;
-            let vstart = i;
-            while i < bytes.len() && bytes[i] != quote {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            let v = tag[vstart..i].to_string();
-            i += 1;
-            v
+            let value = if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let vstart = i;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                let v = tag[vstart..i].to_string();
+                i += 1;
+                v
+            } else {
+                let vstart = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                tag[vstart..i].to_string()
+            };
+            attrs.push((name, value));
         } else {
-            let vstart = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
-                i += 1;
-            }
-            tag[vstart..i].to_string()
-        };
-        attrs.push((name, value));
+            // bare attribute (e.g. the XHTML '/') — no value
+            attrs.push((name, String::new()));
+        }
     }
     attrs
 }
@@ -686,7 +704,8 @@ fn resolve_against(base: &Url, href: &str) -> Option<String> {
 }
 
 /// `parseMicroformats` + `<link rel=redirect_uri>` scan → (uris, name, logo).
-fn parse_client_html(
+/// pub(crate) for the `// oauth-final` census pins (api::tests).
+pub(crate) fn parse_client_html(
     text: &str,
     base: &Url,
     client_id_url: &Url,
