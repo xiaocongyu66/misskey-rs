@@ -108,7 +108,10 @@ pub(crate) fn is_prohibit_moved(name: &str) -> bool {
 /// prohibitMoved gate handles the moved caller); mute/list + blocking/list
 /// are the two list endpoints the pinned suite reads after the move.
 pub(crate) fn handles(name: &str) -> bool {
-    matches!(name, "i/move" | "mute/list" | "blocking/list")
+    matches!(
+        name,
+        "i/move" | "mute/list" | "blocking/list" | "users/lists/list"
+    )
 }
 
 /// `hadRequest`-agnostic list param line shared by mute/list + blocking/list
@@ -221,6 +224,7 @@ pub(crate) async fn handle(
         "i/move" => move_route(state, pool, body, token).await,
         "mute/list" => mute_list(state, pool, body, token).await,
         "blocking/list" => blocking_list(state, pool, body, token).await,
+        "users/lists/list" => users_lists_list(state, pool, body, token).await,
         _ => return api_err(ApiError::unknown_endpoint()),
     };
     // census instrumentation: the pinned rows assert bare `.status`, so a
@@ -808,4 +812,85 @@ pub fn spawn_move_worker(pool: mk_db::sqlx::PgPool) {
             })
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// users/lists/list (endpoints/users/lists/list.ts) — the post-move read lane
+// the pinned suite drives from root/eve inside the migration waitFor
+// ---------------------------------------------------------------------------
+
+/// UserListEntityService.pack: { id, createdAt (from the aid), name,
+/// userIds (membership rows in table order), isPublic }.
+async fn users_lists_list(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    // requireCredential: no credential at all -> CREDENTIAL_REQUIRED; then
+    // the endpoint's own `me === null` fallthrough is INVALID_PARAM (handled
+    // by require_credential_me_id's 401 first, mirroring social lanes).
+    let Some(tok) = token.as_deref().filter(|t| t.len() == 16) else {
+        return super::authentication_failed();
+    };
+    let me_id = match mk_db::user::find_local_user_id_by_token(pool, tok).await {
+        Ok(v) => v,
+        Err(e) => return db_err("users_lists_list find_token", e),
+    };
+    let Some(me_id) = me_id else {
+        return super::authentication_failed();
+    };
+
+    let user_id_param = body.get("userId").and_then(|v| v.as_str());
+    let owner_id = match user_id_param {
+        Some(uid) => {
+            // meta.errors.noSuchUser (this endpoint's own id variant) +
+            // remoteUser: the local slice never has host'd rows
+            let user = match mk_db::user::find_user_by_id(pool, uid).await {
+                Ok(u) => u,
+                Err(e) => return db_err("users_lists_list find_user", e),
+            };
+            let Some(user) = user else {
+                return api_err(ApiError::new(
+                    400,
+                    ApiErrorKind::Client,
+                    "NO_SUCH_USER",
+                    "a8af4a82-0980-4cc4-a6af-8b0ffd54465e",
+                    "No such user.",
+                ));
+            };
+            user.id
+        }
+        None => me_id,
+    };
+
+    let lists = match mk_db::move_account::lists_of_owner(pool, &owner_id).await {
+        Ok(v) => v,
+        Err(e) => return db_err("users_lists_list lists_of_owner", e),
+    };
+    let mut out = Vec::with_capacity(lists.len());
+    for (id, name, is_public) in lists {
+        let member_ids = match mk_db::lists::list_member_ids(pool, &id).await {
+            Ok(v) => v,
+            Err(e) => return db_err("users_lists_list members", e),
+        };
+        let created_iso = mk_types::id::parse_aid_date(&id)
+            .map(mk_core::services::signup::ms_to_iso)
+            .unwrap_or_default();
+        out.push(json!({
+            "id": id,
+            "createdAt": created_iso,
+            "name": name,
+            "userIds": member_ids,
+            "isPublic": is_public,
+        }));
+    }
+    (
+        StatusCode::OK,
+        Json({
+            let _ = &state;
+            out
+        }),
+    )
+        .into_response()
 }
