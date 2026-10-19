@@ -1,3 +1,4 @@
+latest: run 39217007189 — ff-visibility.ts CLEARED 20/20 (users/followers+following per-visibility gates + AP /users/:id/{followers,following} collections + admin/update-meta meta."federation" patch; the persist arm must sit ABOVE the note/freq terminating arms — behind them the flip never landed and the AP public legs 403'd; x2 green: rn 39217007189 20/20 + rn 39218656794 confirm)
 latest: run 39214163100 — well-known.ts CLEARED 5/5 (`.well-known/*` + `/nodeinfo/*` api-scoped cors, owned-extract E0277 Send fix; ×2 green: rn8 39214163100 + rn9 39215008064 — Test Files 1 passed (1) / Tests 5 passed (5))
 latest: run 39179590872 — timelines.ts CLEARED 378/378 (keyPrefix parity)
 # users.ts e2e census — misskey-rs（持续更新）
