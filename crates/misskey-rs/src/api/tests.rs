@@ -7865,3 +7865,142 @@ async fn thread_mute_root_note_thread_key_decodes_null() {
 
     let _ = pool;
 }
+
+// ===== arena-block: upstream test/e2e/block.ts ===============================
+//
+// census: block.ts exercises the blocking plane end-to-end — blocking/create,
+// the two-way following gate, the reaction gate, the reply/renote gate and the
+// LTL exclusion for a viewer-blocking pair.
+
+#[tokio::test]
+async fn block_arena_gates() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkblockarena").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("bla")).await;
+    let bob = signup(&app, &uname("blb")).await;
+    let carol = signup(&app, &uname("blc")).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+    let c_token = carol["token"].as_str().unwrap();
+
+    // 「Block作成」 — alice blocks bob, 200 with the packed target
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "blocking/create: {body}");
+
+    // 「ブロックされているユーザーをフォローできない」 — following/create.ts
+    // meta.errors.youHaveBeenBlocked (c4ab57cc)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "following gate: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("c4ab57cc-4e41-45e9-bfd9-584f61e35ce0"),
+        "following gate error id: {body}"
+    );
+
+    // 「ブロックされているユーザーにリアクションできない」 — ReactionService
+    // e70412a4 remapped to meta.errors.youHaveBeenBlocked (20ef5475)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hello", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "alice note: {body}");
+    let alice_note = body["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": alice_note, "reaction": "👍", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "reaction gate: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("20ef5475-9f38-4e4c-bd33-de6d979498ec"),
+        "reaction gate error id: {body}"
+    );
+
+    // 「ブロックされているユーザーに返信できない」 + 「…のノートをRenoteできな
+    // い」 — both NoteCreateService IdentifiableErrors remap to the notes/create
+    // meta.errors.youHaveBeenBlocked id (b390d7e1)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "replyId": alice_note, "text": "yo", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "reply gate: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("b390d7e1-8a5e-46ed-b625-06271cafd3d3"),
+        "reply gate error id: {body}"
+    );
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": alice_note, "text": "yo", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "renote gate: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("b390d7e1-8a5e-46ed-b625-06271cafd3d3"),
+        "renote gate error id: {body}"
+    );
+
+    // 「タイムライン(LTL)にブロックされているユーザーの投稿が含まれない」 —
+    // generateBaseNoteFilteringQuery BLOCK_SEL drops the blocker's notes
+    let mut ids = Vec::new();
+    for (tok, who) in [(a_token, "a"), (b_token, "b"), (c_token, "c")] {
+        let (s, body) = post_json(
+            app.clone(),
+            "/api/notes/create",
+            json!({ "text": format!("hi {who}"), "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{who} note: {body}");
+        ids.push((who, body["createdNote"]["id"].as_str().unwrap().to_string()));
+    }
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/local-timeline",
+        json!({ "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "LTL: {body}");
+    let tl = body.as_array().expect("LTL array");
+    let has = |id: &str| tl.iter().any(|n| n["id"].as_str() == Some(id));
+    let (_, alice_note2) = &ids[0];
+    let (_, bob_note2) = &ids[1];
+    let (_, carol_note2) = &ids[2];
+    assert!(
+        !has(alice_note2),
+        "blocker's note must not appear: {alice_note2}"
+    );
+    assert!(has(bob_note2), "own note must appear: {bob_note2}");
+    assert!(
+        has(carol_note2),
+        "unblocked user's note must appear: {carol_note2}"
+    );
+
+    let _ = pool;
+}
