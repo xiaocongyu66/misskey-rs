@@ -159,10 +159,19 @@ fn should_hide_note_by_time(hidden_before: Option<i32>, note_created_ms: i64, no
         return false;
     };
     if hb <= 0 {
-        let elapsed_seconds = (now_ms - note_created_ms) / 1000;
-        elapsed_seconds >= hb.unsigned_abs() as i64
+        // upstream keeps the elapsed term in float seconds
+        // (`(Date.now() - createdAtTime) / 1000 >= abs(hiddenBefore)`); the
+        // cross-multiplied integer form is exact for whole-ms inputs and
+        // keeps future-dated notes (negative elapsed) un-hidden the way the
+        // float compare does (an int-truncated `elapsed/1000 >= 0` exposed
+        // them when hb = 0).
+        now_ms - note_created_ms >= (hb.unsigned_abs() as i64) * 1000
     } else {
-        note_created_ms / 1000 <= hb as i64
+        // upstream: float `createdAtTime / 1000 <= hiddenBefore`; the
+        // cross-multiplied integer form matches it exactly below 2^53 ms and
+        // keeps sub-second offsets past the threshold second visible (an
+        // int-truncated `created_ms / 1000 <= hb` reported them hidden).
+        note_created_ms <= (hb as i64) * 1000
     }
 }
 
@@ -372,5 +381,122 @@ pub async fn files_serve(
             tracing::error!(target: "dbg_export", error = %e, "files_serve blob lookup");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+// unit-misc: upstream test/unit/misc/should-hide-note-by-time.ts, 1:1.
+// Fake-clock epoch = Date.UTC(2000, 0, 1); upstream's clock advances, our fn
+// takes `now_ms` explicitly. The ISO-8601-string createdAt overloads fold
+// into the ms cases here (the export parser feeds AID-derived ms directly).
+#[cfg(test)]
+mod unit_misc_should_hide_note_by_time {
+    use super::*;
+
+    const EPOCH: i64 = 946_684_800_000; // Date.UTC(2000, 0, 1)
+    const DAY: i64 = 86_400_000;
+    const HOUR: i64 = 3_600_000;
+    /// Math.floor(epoch / 1000)
+    const EPOCH_SECS: i32 = 946_684_800;
+
+    #[test]
+    fn hidden_before_null_returns_false() {
+        // 'hiddenBefore が null / undefined のときは false を返す'
+        // (Rust folds both JS shapes into Option::None)
+        assert!(!should_hide_note_by_time(None, EPOCH - DAY, EPOCH));
+    }
+
+    #[test]
+    fn relative_mode() {
+        // '閾値内に作成されたノートは false を返す' (1h old, 1-day window)
+        assert!(!should_hide_note_by_time(
+            Some(-86_400),
+            EPOCH - HOUR,
+            EPOCH
+        ));
+        // '閾値を超えて作成されたノートは true を返す' (2 days old)
+        assert!(should_hide_note_by_time(
+            Some(-86_400),
+            EPOCH - 2 * DAY,
+            EPOCH
+        ));
+        // 'ちょうど閾値で作成されたノートは true を返す' (exactly 1 day)
+        assert!(should_hide_note_by_time(Some(-86_400), EPOCH - DAY, EPOCH));
+        // '異なる相対時間値で判定できる' (2h old vs 1h/3h windows)
+        assert!(should_hide_note_by_time(
+            Some(-3_600),
+            EPOCH - 2 * HOUR,
+            EPOCH
+        ));
+        assert!(!should_hide_note_by_time(
+            Some(-10_800),
+            EPOCH - 2 * HOUR,
+            EPOCH
+        ));
+        // 'hiddenBefore が 0 の場合' (1ms old, 0s window → hidden)
+        assert!(should_hide_note_by_time(Some(0), EPOCH - 1, EPOCH));
+    }
+
+    #[test]
+    fn absolute_mode() {
+        // '閾値タイムスタンプより後に作成されたノートは false を返す'
+        assert!(!should_hide_note_by_time(
+            Some(EPOCH_SECS),
+            EPOCH + HOUR,
+            EPOCH
+        ));
+        // '閾値タイムスタンプより前に作成されたノートは true を返す'
+        assert!(should_hide_note_by_time(
+            Some(EPOCH_SECS),
+            EPOCH - HOUR,
+            EPOCH
+        ));
+        // 'ちょうど閾値タイムスタンプで作成されたノートは true を返す'
+        assert!(should_hide_note_by_time(Some(EPOCH_SECS), EPOCH, EPOCH));
+        // '異なる閾値タイムスタンプで判定できる'
+        let threshold = EPOCH_SECS - 86_400;
+        assert!(should_hide_note_by_time(
+            Some(threshold),
+            EPOCH - 2 * DAY,
+            EPOCH
+        ));
+        assert!(!should_hide_note_by_time(
+            Some(threshold),
+            EPOCH - HOUR,
+            EPOCH
+        ));
+    }
+
+    #[test]
+    fn edge_cases() {
+        // '相対時間モードで非常に古いノートに対応できる'
+        assert!(should_hide_note_by_time(Some(-1), EPOCH - 1_000_000, EPOCH));
+        // '相対時間モードで非常に新しいノートに対応できる'
+        assert!(!should_hide_note_by_time(Some(-86_400), EPOCH - 1, EPOCH));
+        // '大きなタイムスタンプ値に対応できる' (future absolute threshold)
+        assert!(should_hide_note_by_time(
+            Some(EPOCH_SECS + 86_400),
+            EPOCH,
+            EPOCH
+        ));
+        // '小さな相対時間値に対応できる' (1s window, 2s old)
+        assert!(should_hide_note_by_time(Some(-1), EPOCH - 2_000, EPOCH));
+    }
+
+    #[test]
+    fn sub_second_offsets_match_upstream_float_compare() {
+        // Divergence checks (implementation fixed, not the test): upstream
+        // compares float seconds — a note half a second INTO the threshold
+        // second stays visible, half a second BEFORE it is hidden. The old
+        // int-truncated `created_ms / 1000 <= hb` reported the first hidden.
+        assert!(!should_hide_note_by_time(
+            Some(EPOCH_SECS),
+            EPOCH + 500,
+            EPOCH
+        ));
+        assert!(should_hide_note_by_time(
+            Some(EPOCH_SECS),
+            EPOCH - 500,
+            EPOCH
+        ));
     }
 }
