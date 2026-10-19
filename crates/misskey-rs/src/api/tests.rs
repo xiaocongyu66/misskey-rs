@@ -7774,3 +7774,94 @@ async fn notifications_insert_if_not_muted_central_gate() {
 
     let _ = pool;
 }
+
+// ===== thread-cap: root-note thread key ======================================
+//
+// thread_key decoded the nullable "threadId" column through an untyped
+// query_scalar (plain String scalar): every ROOT note (threadId IS NULL)
+// errored with `unexpected null`, notes/thread-muting/create 500'd before any
+// mute row landed, and the e2e thread-mute.ts gates (notes/mentions +
+// i/notifications) asserted absence against a gate that never armed (census
+// run 39199419722, both cases red). Root notes must flatten to the note.id
+// fallback path, not Err.
+
+#[tokio::test]
+async fn thread_mute_root_note_thread_key_decodes_null() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkthreadcap").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("tca")).await;
+    let bob = signup(&app, &uname("tcb")).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let b_token = bob["token"].as_str().unwrap();
+    let a_name = alice["username"].as_str().unwrap().to_string();
+
+    // thread-mute.ts fixture: bob roots the thread mentioning alice, alice
+    // replies (the chain's threadId carrier)
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": format!("@{a_name} root note"), "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "child note", "replyId": bob_note, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // thread-cap 1: the ROOT row's threadId is NULL and must flatten to None
+    // (the id fallback), never Err — this is the exact decode trap.
+    let key = mk_db::note::thread_key(&pool, &bob_note).await.unwrap();
+    assert!(
+        key.is_none(),
+        "root note threadId must decode as None, got {key:?}"
+    );
+    // the reply carrier inherits the root id — the key both gates share
+    let alice_reply = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let reply_thread: Option<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "threadId" FROM "note" WHERE "id" = $1"#)
+            .bind(&alice_reply)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        reply_thread.as_deref(),
+        Some(bob_note.as_str()),
+        "reply carries the root thread id: {reply_thread:?}"
+    );
+
+    // thread-cap 2: muting the ROOT note (threadId NULL) lands 204 — pre-fix
+    // this 500'd on the decode error and no row was written
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/thread-muting/create",
+        json!({ "noteId": bob_note, "i": a_token }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NO_CONTENT,
+        "root-note thread mute must not 500: {body}"
+    );
+    assert!(
+        mk_db::note::thread_muted(&pool, a_id, &bob_note)
+            .await
+            .unwrap(),
+        "mute row keyed on the root thread id"
+    );
+
+    let _ = pool;
+}

@@ -3797,16 +3797,9 @@ async fn notes_thread_muting(
             "No such note.",
         ));
     }
-    // mute key = `note.threadId ?? note.id` (create.ts L46/L49: fetched via
-    // the thread_key scalar — NoteRow does not carry the column).
-    let thread_id = match mk_db::note::thread_key(pool, &note.id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => note.id.clone(),
-        Err(e) => {
-            tracing::error!(target: "dbg_mentions", error = %e, "thread_key");
-            return api_err(ApiError::internal_error());
-        }
-    };
+    // mute key = `note.threadId ?? note.id` (create.ts L46/L49) — NoteRow
+    // carries the decoded threadId (root notes → note.id). // thread-cap
+    let thread_id = note.thread_id.clone().unwrap_or_else(|| note.id.clone());
 
     if name == "notes/thread-muting/create" {
         match mk_db::note::thread_muted(pool, &me_id, &thread_id).await {

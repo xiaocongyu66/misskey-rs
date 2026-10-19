@@ -215,10 +215,18 @@ pub async fn find_note_by_id(pool: &PgPool, id: &str) -> Result<Option<NoteRow>,
 /// thread id; the thread-mute insert key and the NotificationService gate
 /// key both derive from the REPLY target's threadId ?? id).
 pub async fn thread_key(pool: &PgPool, note_id: &str) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(r#"SELECT "threadId" FROM "note" WHERE "id" = $1"#)
+    // thread-cap: "threadId" is nullable — the untyped query_scalar type-params
+    // column 0 as plain String, so every ROOT note (threadId IS NULL) died with
+    // `unexpected null` and thread-muting/create 500'd before any mute row
+    // landed (census run 39199419722: both thread-mute.ts cases asserted
+    // absence against a gate that never armed). user_host_of below documents
+    // the same trap. Explicit Option scalar + flatten: None = no row (caller
+    // falls back to note.id), flattened None = NULL threadId (same fallback).
+    sqlx::query_scalar::<_, Option<String>>(r#"SELECT "threadId" FROM "note" WHERE "id" = $1"#)
         .bind(note_id)
         .fetch_optional(pool)
         .await
+        .map(|row| row.flatten())
 }
 
 /// `noteThreadMutingsRepository.exists({ userId, threadId })` — gates mention
