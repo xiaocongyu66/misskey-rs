@@ -490,6 +490,15 @@ pub async fn clip_notes_for_guest(
 mod tests {
     use super::*;
 
+    // unit-services SKIP note — upstream test/unit/ClipService.ts pins the
+    // ClipService.update debounced publishClipStream (3s trailing throttle)
+    // and the ClipChannel "don't leak the internal event body" suppression.
+    // Neither is modeled here (no clip-stream publisher / channel anywhere in
+    // the tree) and no e2e census demands it (upstream e2e clips.ts has zero
+    // stream legs; e2e-harness/files+roles pin the DB-backed endpoints) —
+    // porting would be dead code, so the upstream matrix stays SKIPPED per
+    // the misc-lane rule. The DB persist matrix below pins this file's slice.
+
     /// The fixed bind layout must stay hole-free: the visibility fragments
     /// bind only $4..$6 ($1 is the clipId, $2/$3 the pager bounds).
     #[test]
