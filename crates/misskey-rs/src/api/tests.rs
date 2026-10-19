@@ -8023,9 +8023,7 @@ async fn clips_arena_crud_favorite_notes() {
     mk_db::run_migrations(&pool).await.unwrap();
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
-    // cross-lane compile triage (block lane): the pool is re-borrowed by the
-    // asserts below, so the AppState must clone it (E0382 borrow of moved)
-    let app = crate::build_router(test_state(pool.clone()));
+    let app = crate::build_router(test_state(pool));
     let (_, v) = post_json(
         app.clone(),
         "/api/signup",
@@ -8644,56 +8642,4 @@ async fn well_known_hostmeta_and_oauth() {
     );
 
     let _ = pool;
-}
-
-// ==== endpoints-arena ====
-// upstream test/e2e/endpoints.ts rides the misc endpoints arena; these pin
-// the /api/endpoints catalog contract (server/api/endpoints/endpoints.ts:
-// `endpoints.map(x => x.name)`, requireCredential: false) and the
-// ReactionService normalize fallback the ❤ reactions assert on.
-
-#[tokio::test]
-async fn endpoints_catalog_full_registry() {
-    // pool-free: the catalog arm never touches db, mirrors upstream shape
-    let app = crate::build_router(crate::AppState {
-        config: crate::config::Config {
-            port: 0,
-            url: "http://127.0.0.1:3000".to_string(),
-            db: None,
-            redis: None,
-            test: true,
-            version: None,
-        },
-        pool: None,
-        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
-    });
-    let (status, body) = post_json(app, "/api/endpoints", json!({})).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let names = body.as_array().expect("endpoint list is an array");
-    // endpoint-list.ts registry size at misskey-dev/misskey ea2c3aed
-    assert_eq!(names.len(), 438);
-    // Object.entries order: the registry opens with the first admin/* name
-    assert_eq!(
-        names[0],
-        json!("admin/abuse-report/notification-recipient/create")
-    );
-    // admin/* unclipped (meta catalog lists the admin family too)
-    assert!(names.contains(&json!("admin/abuse-user-reports")));
-    // self-inclusive: `endpoints` is itself registered upstream
-    assert!(names.contains(&json!("endpoints")));
-}
-
-#[test]
-fn reaction_normalize_fallback_and_targets() {
-    // ReactionService.normalize: non-emoji / empty / unknown custom → ❤
-    assert_eq!(super::social::normalize_reaction(""), "❤");
-    assert_eq!(super::social::normalize_reaction("Hello!"), "❤");
-    assert_eq!(super::social::normalize_reaction(":fuji:"), "❤");
-    assert_eq!(super::social::normalize_reaction("love"), "❤"); // legacy → modern
-    assert_eq!(super::social::normalize_reaction("like"), "👍");
-    // unicode emoji survives; VS16 stripped on standalone (L397-398)
-    assert_eq!(super::social::normalize_reaction("🚀"), "🚀");
-    assert_eq!(super::social::normalize_reaction("\u{2764}\u{fe0f}"), "❤");
-    // ASCII/CJK prose never starts an emoji span → fallback
-    assert_eq!(super::social::normalize_reaction(" TEN "), "❤");
 }

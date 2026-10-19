@@ -33,16 +33,23 @@ pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/{*name}", any(api::dispatch))
         .layer(api_cors);
-    Router::new()
-        .merge(api)
-        // well-known arena: /.well-known/* + /nodeinfo/* ride OUTSIDE /api/*
-        // (upstream WellKnownServerService + NodeinfoServerService).
+    // ff-arena compile triage (CI run 39208798436, E0277): the (State, Request)
+    // `any` handler only resolves its `Handler` bound on a chain in the same
+    // shape as the /api dispatcher route (api::dispatch compiles there since
+    // M1) — on the outer pre-state chain rustc 1.93 / axum 0.8.9 fails to
+    // prove the bound for well_known_dispatch. Sibling state-later sub-router,
+    // CORS-free on purpose: the OPTIONS 204 + hook headers are served inside
+    // the dispatcher itself (a permissive layer would answer `*` first).
+    let well_known = Router::new()
         .route(
             "/.well-known/{*rest}",
             any(api::well_known::well_known_dispatch),
         )
         .route("/nodeinfo/2.0", get(api::well_known::nodeinfo_20))
-        .route("/nodeinfo/2.1", get(api::well_known::nodeinfo_21))
+        .route("/nodeinfo/2.1", get(api::well_known::nodeinfo_21));
+    Router::new()
+        .merge(api)
+        .merge(well_known)
         // streaming websocket hub (drive-agent2: publishMainStream /
         // urlUploadFinished — upstream StreamingApiServerService entry).
         .route("/streaming", get(api::drive::streaming::entry))
