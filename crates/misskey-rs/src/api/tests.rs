@@ -7607,3 +7607,170 @@ async fn noise_gate_muter_silence_and_thread_mute() {
 
     let _ = pool;
 }
+
+// ===== ntf-mute: createNotification central gate + table self-heal ==========
+//
+// mk-db::notification::insert_if_not_muted is the ONE muting drop every
+// notify site routes through (NotificationService.createNotification L110
+// self-suppression + L111-114 type-agnostic muting). The ensure_table legs
+// replay migrations/0002_notifications.sql on SQLSTATE 42P01 — the upstream
+// e2e fixture (initTestDb dropSchema) drops the table under a live server
+// between suite files, which 500'd the whole mute.ts Notification cluster.
+
+#[tokio::test]
+async fn notifications_insert_if_not_muted_central_gate() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkntfmute").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("nma")).await;
+    let bob = signup(&app, &uname("nmb")).await;
+    let carol = signup(&app, &uname("nmc")).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
+    let (c_id, c_token) = (
+        carol["id"].as_str().unwrap(),
+        carol["token"].as_str().unwrap(),
+    );
+
+    // Mute: alice ==> carol (mute.ts beforeAll)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": c_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    // gate 1: receiveFollowRequest drop through the centralized path —
+    // locked alice accepts the request flow; muted carol's request stays
+    // silent, bob's lands.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": true, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications",
+        json!({ "markAsRead": false, "includeTypes": ["receiveFollowRequest"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "only bob's follow request lands: {arr:?}");
+    assert_eq!(arr[0]["userId"], json!(b_id), "body: {arr:?}");
+    assert_eq!(
+        arr[0]["type"],
+        json!("receiveFollowRequest"),
+        "body: {arr:?}"
+    );
+
+    // gate 2: reaction drop via the SAME helper call site shape the notify
+    // sites use — muted pair inserts NOTHING, self-pair inserts NOTHING.
+    let note_id = mk_types::id::gen_aid_now();
+    mk_db::notification::insert_if_not_muted(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &mk_types::id::gen_aid_now(),
+            r#type: "reaction",
+            user_id: a_id,
+            notifier_id: Some(c_id),
+            note_id: Some(&note_id),
+            reaction: Some("like"),
+        },
+    )
+    .await
+    .unwrap();
+    mk_db::notification::insert_if_not_muted(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &mk_types::id::gen_aid_now(),
+            r#type: "mention",
+            user_id: b_id,
+            notifier_id: Some(b_id),
+            note_id: Some(&note_id),
+            reaction: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications",
+        json!({ "markAsRead": false, "includeTypes": ["reaction"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert!(
+        v.as_array().unwrap().is_empty(),
+        "muted reaction never reached the store: {v:?}"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/i/notifications",
+        json!({ "markAsRead": false, "includeTypes": ["mention"], "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert!(
+        v.as_array().unwrap().is_empty(),
+        "self-notification suppressed (bob's helper call): {v:?}"
+    );
+
+    // gate 3: unmute → the same helper lane inserts again (the drop is the
+    // live muting state, not a one-way tombstone).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/mute/delete",
+        json!({ "userId": c_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    mk_db::notification::insert_if_not_muted(
+        &pool,
+        &mk_db::notification::NewNotification {
+            id: &mk_types::id::gen_aid_now(),
+            r#type: "reaction",
+            user_id: a_id,
+            notifier_id: Some(c_id),
+            note_id: Some(&note_id),
+            reaction: Some("like"),
+        },
+    )
+    .await
+    .unwrap();
+    let n: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "notification" WHERE "notifieeId" = $1 AND ("type"::text) = 'reaction'"#,
+    )
+    .bind(a_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "unmuted pair inserts once");
+
+    let _ = pool;
+}

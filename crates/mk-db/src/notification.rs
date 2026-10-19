@@ -3,6 +3,15 @@
 //! `core/NotificationService.ts` for create/read semantics (upstream moved the
 //! store to Redis; the local schema keeps the pre-cleanup table — see
 //! migrations/0002_notifications.sql).
+//!
+//! Self-heal: the pinned upstream e2e fixture (`test/utils.ts initTestDb`)
+//! runs TypeORM synchronize+dropSchema against a schema where Notification is
+//! a bare type (no entity), so the migration's `notification` table is
+//! dropped OUT from under a live server between suite files
+//! (`relation "notification" does not exist` / SQLSTATE 42P01 → every
+//! i/notifications read 500'd — the whole mute.ts Notification cluster).
+//! Every public fn therefore retriggers the idempotent 0002 DDL once on 42P01
+//! and retries (ntf-mute).
 
 use sqlx::PgPool;
 
@@ -27,6 +36,19 @@ pub async fn insert_notification(
     pool: &PgPool,
     n: &NewNotification<'_>,
 ) -> Result<(), sqlx::Error> {
+    match insert_notification_once(pool, n).await {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            insert_notification_once(pool, n).await
+        }
+        r => r,
+    }
+}
+
+async fn insert_notification_once(
+    pool: &PgPool,
+    n: &NewNotification<'_>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO "notification"
@@ -43,6 +65,31 @@ pub async fn insert_notification(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// ntf-mute: `NotificationService.createNotification` CentralGate (the two
+/// social notify entry points route through here so every reason shares ONE
+/// muting drop):
+/// - L110: notifiee === notifier → null (self-notification suppression),
+/// - L111-114: the muting check is TYPE-AGNOSTIC and sits BEFORE the
+///   recieveConfig ladder — a muted notifier notifies for NO reason
+///   (mention/reply/renote/quote/reaction AND follow/receiveFollowRequest
+///   alike; mute.ts Notification + Notification (Grouped) read exactly this).
+/// Notifier-less rows (upstream allows them) bypass both gates, mirroring
+/// `if (notifierId) {...}`.
+pub async fn insert_if_not_muted(
+    pool: &PgPool,
+    n: &NewNotification<'_>,
+) -> Result<(), sqlx::Error> {
+    if let Some(notifier_id) = n.notifier_id {
+        if n.user_id == notifier_id {
+            return Ok(());
+        }
+        if crate::social::muting_exists(pool, n.user_id, notifier_id).await? {
+            return Ok(());
+        }
+    }
+    insert_notification(pool, n).await
 }
 
 /// Columns carried by the M2 notification pack (createdAt is packed from the
@@ -65,8 +112,47 @@ pub struct NotificationRow {
 /// upstream; `misc/id.ts` aid ids compare monotonically as strings).
 /// `unreadOnly` filters `isRead`; `include_types` (non-empty) filters
 /// `"type" = ANY(...)`. upstream `following` filter not ported — see TODO in
-/// the handler.
+/// the handler. (Upstream has NO read-side muting filter — the drop is
+/// create-time only — so none here either.)
 pub async fn list_notifications(
+    pool: &PgPool,
+    me_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+    unread_only: bool,
+    include_types: &[String],
+) -> Result<Vec<NotificationRow>, sqlx::Error> {
+    match list_notifications_once(
+        pool,
+        me_id,
+        since_id,
+        until_id,
+        limit,
+        unread_only,
+        include_types,
+    )
+    .await
+    {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            list_notifications_once(
+                pool,
+                me_id,
+                since_id,
+                until_id,
+                limit,
+                unread_only,
+                include_types,
+            )
+            .await
+        }
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_notifications_once(
     pool: &PgPool,
     me_id: &str,
     since_id: Option<&str>,
@@ -108,6 +194,16 @@ pub async fn list_notifications(
 /// `NotificationService.readAllNotification` (DB-era equivalent): marks every
 /// unread notification of the user read.
 pub async fn mark_as_read_all(pool: &PgPool, user_id: &str) -> Result<(), sqlx::Error> {
+    match mark_as_read_all_once(pool, user_id).await {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            mark_as_read_all_once(pool, user_id).await
+        }
+        r => r,
+    }
+}
+
+async fn mark_as_read_all_once(pool: &PgPool, user_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE "notification" SET "isRead" = TRUE WHERE "notifieeId" = $1 AND "isRead" = FALSE"#,
     )
@@ -120,6 +216,16 @@ pub async fn mark_as_read_all(pool: &PgPool, user_id: &str) -> Result<(), sqlx::
 /// `i` endpoint's `hasUnreadNotification` read (user pack wiring is co-owned —
 /// see coordinator notes).
 pub async fn has_unread(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
+    match has_unread_once(pool, user_id).await {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            has_unread_once(pool, user_id).await
+        }
+        r => r,
+    }
+}
+
+async fn has_unread_once(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
     let v: Option<i32> = sqlx::query_scalar(
         r#"SELECT 1 FROM "notification" WHERE "notifieeId" = $1 AND "isRead" = FALSE LIMIT 1"#,
     )
@@ -127,4 +233,64 @@ pub async fn has_unread(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Erro
     .fetch_optional(pool)
     .await?;
     Ok(v.is_some())
+}
+
+/// SQLSTATE 42P01 — the fixture (TypeORM dropSchema) dropped the table under
+/// a running server; see the module header.
+fn is_undefined_table(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01")
+    )
+}
+
+/// Idempotent replay of migrations/0002_notifications.sql (shape = the final
+/// pre-drop upstream table, union of 1000000000000-Init /
+/// 1585385921215-custom-notification / 1674118260469-achievement). The enum
+/// type + PK/FK use swallow-duplicate DO blocks because Postgres lacks
+/// IF NOT EXISTS for them; the second encounter is a no-op by construction.
+pub async fn ensure_table(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        DO $do$ BEGIN
+            CREATE TYPE public.notification_type_enum AS ENUM ('follow', 'mention', 'reply', 'renote', 'quote', 'reaction', 'pollVote', 'pollEnded', 'receiveFollowRequest', 'followRequestAccepted', 'groupInvited', 'achievementEarned', 'app');
+        EXCEPTION WHEN duplicate_object THEN NULL; END $do$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS public.notification (
+            "id" character varying(32) NOT NULL,
+            "createdAt" timestamp with time zone NOT NULL,
+            "notifieeId" character varying(32) NOT NULL,
+            "notifierId" character varying(32),
+            "type" public.notification_type_enum NOT NULL,
+            "isRead" boolean DEFAULT false NOT NULL,
+            "noteId" character varying(32),
+            "reaction" character varying(128),
+            "choice" integer,
+            "achievement" character varying(128),
+            "customBody" character varying(2048),
+            "customHeader" character varying(256),
+            "customIcon" character varying(1024),
+            "appAccessTokenId" character varying(32)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    for stmt in [
+        r#"DO $do$ BEGIN ALTER TABLE ONLY public.notification ADD CONSTRAINT "PK_705b6c7cdf9b2c2ff7ac7872cb7" PRIMARY KEY ("id"); EXCEPTION WHEN duplicate_object THEN NULL; END $do$;"#,
+        r#"CREATE INDEX IF NOT EXISTS "IDX_b11a5e627c41d4dc3170f1d370" ON public.notification ("createdAt")"#,
+        r#"CREATE INDEX IF NOT EXISTS "IDX_3c601b70a1066d2c8b517094cb" ON public.notification ("notifieeId")"#,
+        r#"CREATE INDEX IF NOT EXISTS "IDX_3b4e96eec8d36a8bbb9d02aa71" ON public.notification ("notifierId")"#,
+        r#"CREATE INDEX IF NOT EXISTS "IDX_33f33cc8ef29d805a97ff4628b" ON public.notification ("type")"#,
+        r#"CREATE INDEX IF NOT EXISTS "IDX_080ab397c379af09b9d2169e5b" ON public.notification ("isRead")"#,
+        r#"DO $do$ BEGIN ALTER TABLE ONLY public.notification ADD CONSTRAINT "FK_3b4e96eec8d36a8bbb9d02aa710" FOREIGN KEY ("notifierId") REFERENCES public."user"("id") ON DELETE CASCADE ON UPDATE NO ACTION; EXCEPTION WHEN duplicate_object THEN NULL; END $do$;"#,
+    ] {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+    Ok(())
 }

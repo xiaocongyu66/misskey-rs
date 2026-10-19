@@ -178,18 +178,10 @@ pub(crate) async fn notify_note_event(
     reason: &str,
     note_id: &str,
 ) {
-    if notifiee_id == notifier_id {
-        return;
-    }
-    match mk_db::social::muting_exists(pool, notifiee_id, notifier_id).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            tracing::error!(target: "dbg_social", error = %e, "notify_note_event muting_exists");
-            return;
-        }
-    }
-    if let Err(e) = mk_db::notification::insert_notification(
+    // ntf-mute: gate + insert centralized in mk-db
+    // (notification::insert_if_not_muted) so both notify sites share ONE
+    // type-agnostic muting drop.
+    if let Err(e) = mk_db::notification::insert_if_not_muted(
         pool,
         &mk_db::notification::NewNotification {
             id: &mk_types::id::gen_aid_now(),
@@ -220,18 +212,9 @@ pub(crate) async fn notify_follow_family_event(
     notifier_id: &str,
     reason: &str, // "follow" | "receiveFollowRequest"
 ) {
-    if notifiee_id == notifier_id {
-        return;
-    }
-    match mk_db::social::muting_exists(pool, notifiee_id, notifier_id).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            tracing::error!(target: "dbg_social", error = %e, "notify_follow_family muting_exists");
-            return;
-        }
-    }
-    if let Err(e) = mk_db::notification::insert_notification(
+    // ntf-mute: shared gate/insert helper (self-follow suppression +
+    // type-agnostic muting drop, same lane as notify_note_event).
+    if let Err(e) = mk_db::notification::insert_if_not_muted(
         pool,
         &mk_db::notification::NewNotification {
             id: &mk_types::id::gen_aid_now(),
