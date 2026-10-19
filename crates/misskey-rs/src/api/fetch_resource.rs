@@ -39,7 +39,7 @@
 //! stamp, twitter:creator / <link rel="me"> tags, the flash/canvas embed and
 //! the remote-user 301/500 redirect arms of userInfo (local-only databases).
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 // mk_db re-exports sqlx (the crate's only dependency surface — the bare
 // `sqlx::` calls below ride this like the mk-db modules).
