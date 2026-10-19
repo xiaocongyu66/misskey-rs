@@ -4000,6 +4000,91 @@ pub(crate) async fn url_preview(
         .into_response()
 }
 
+/// `GET /notes/{id}` — the AP Document route the drive/files/create
+/// getWebpublicType probes hit (`simpleGet('notes/{id}',
+/// 'application/activity+json')`): 404 unless the Accept header asks for
+/// activity+json (upstream serves the HTML player otherwise), 404 for
+/// non-public notes. Renders the minimal Note document — the e2e reads
+/// `attachment[0].mediaType` (file.webpublicType ?? file.type).
+pub(crate) async fn ap_note(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let accepts_ap = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/activity+json") || a.contains("application/ld+json"))
+        .unwrap_or(false);
+    if !accepts_ap {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let note = match mk_db::note::find_note_by_id(pool, &id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "ap_note find");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    // AP visibility: anonymous viewer; only public/home notes render.
+    if matches!(note.visibility.as_str(), "followers" | "specified") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let origin = state.config.url.trim_end_matches('/');
+    let created_at = mk_types::id::parse_aid_date(&note.id)
+        .map(mk_core::services::signup::ms_to_iso)
+        .unwrap_or_default();
+    let mut attachment = Vec::new();
+    if let Some(fid) = note.file_ids.first() {
+        match mk_db::drive::find_drive_file(pool, fid).await {
+            Ok(Some(f)) => {
+                attachment.push(json!({
+                    "type": "Document",
+                    "mediaType": f.file_type,
+                    "url": f.url,
+                    "name": f.comment,
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(target: "dbg_drive", error = %e, "ap_note attachment");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    }
+    let body = json!({
+        "@context": [
+            "https://www.w3.org/ns/activitystreams",
+            "https://w3id.org/security/v1",
+        ],
+        "id": format!("{origin}/notes/{}", note.id),
+        "type": "Note",
+        "attributedTo": format!("{origin}/users/{}", note.user_id),
+        "published": created_at,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "cc": [format!("{origin}/users/{}/followers", note.user_id)],
+        "content": note
+            .text
+            .as_deref()
+            .map(|t| format!("<p>{}</p>", t.replace('<', "&lt;").replace('>', "&gt;")))
+            .unwrap_or_default(),
+        "attachment": attachment,
+    });
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/activity+json; charset=utf-8",
+        )],
+        Json(body),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests;
 

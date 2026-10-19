@@ -57,6 +57,9 @@ pub fn build_router(state: AppState) -> Router {
         // (upstream ActivityPubServerService.ts /users/:user/{following,followers}).
         .route("/users/{user}/following", get(api::ff_vis::ap_following))
         .route("/users/{user}/followers", get(api::ff_vis::ap_followers))
+        // endpoints-arena: the AP note Document the drive/files/create
+        // getWebpublicType legs probe (ActivityPubServerService /notes/:id).
+        .route("/notes/{id}", get(api::ap_note))
         // endpoints-arena: the /url preview route (ClientServerService.ts
         // L450 fastify.get '/url' → UrlPreviewService.handle; sits outside
         // /api like the upstream web server).
