@@ -9642,7 +9642,8 @@ async fn arena_streaming_channel_routing_matrix() {
         json!({ "listId": list_id, "userId": c_id, "i": at }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "{v}");
+    // push.ts defines no response body → 204 (the port's ok_empty arm).
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
 
     let (list_reg, mut list_tl) = connect(
         &pool,
