@@ -27,7 +27,9 @@ pub struct NewNote<'a> {
     pub thread_id: Option<&'a str>,
     /// resolved mention user ids (upstream `mentionedUsers.map(u => u.id)`).
     pub mentions: &'a [String],
-    /// hashtags extracted from text (merged into user.tags)
+    /// hashtags extracted from text (insertNote L661 `tags` — merged into
+    /// user.tags by the caller's credit pass; the hashtag streaming channel
+    /// and users/search read the note-row column).
     pub hashtags: &'a [String],
     /// `fileIds` (md-order preserved; upstream also denormalizes
     /// `attachedFileTypes` from the fetched drive rows).
@@ -96,6 +98,9 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     // 含まれない + the Social TL 凍結(リモート) L2204 leg) read this column.
     // Sub-select keeps the author host verbatim from the user row (same
     // value the signup test-mode host legs store).
+    // tags: NOTE_TAGS — insertNote L645-661 writes `tags: tags.map(tag =>
+    // normalizeForSearch(tag))` on the row (the hashtag channel lane and
+    // users/search read it; it previously never left the user-tags merge).
     sqlx::query(
         r#"
         INSERT INTO "note"
@@ -105,7 +110,7 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
            "tags", "hasPoll", "pageCount", "cw", "channelId", "userHost")
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, '{}'::jsonb,
                 $9::note_visibility_enum, $10, $11, $12, $13, '{}'::varchar[],
-                '{}'::varchar[], $14, 0, $15, $16,
+                $14, $15, 0, $16, $17,
                 (SELECT "host" FROM "user" WHERE "id" = $3))
         "#,
     )
@@ -122,6 +127,7 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     .bind(n.attached_file_types)
     .bind(n.visible_user_ids)
     .bind(n.mentions)
+    .bind(n.hashtags) // NOTE_TAGS ($14)
     .bind(n.has_poll)
     .bind(n.cw)
     .bind(n.channel_id) // chan-note2
