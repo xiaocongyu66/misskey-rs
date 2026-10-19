@@ -293,7 +293,11 @@ pub(crate) async fn gate(
 
     if is_root {
         // call(): the meta.rootUserId bypass skips both role gates.
-        return Ok(AdminCtx { me, is_admin: true, token_permission });
+        return Ok(AdminCtx {
+            me,
+            is_admin: true,
+            token_permission,
+        });
     }
 
     let assigned = match mk_db::role::user_assigned_roles(pool, &me.id).await {
