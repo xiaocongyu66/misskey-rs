@@ -12820,6 +12820,159 @@ fn arena_move_local_uri_roundtrip() {
     ));
 }
 
+// ==== move-final (census rn39323486791: 2 failed | 60 passed — both failing
+// rows cascade from ONE i/move 500) ====
+
+/// The copyMutings dedup SQL must PREPARE against the migrated schema and
+/// return only the indefinite muters of dst (upstream copyMutings dedup:
+/// `mutingsRepository.findBy({ muteeId: dst.id, expiresAt: IsNull() })` →
+/// skip those muters). The census 500'd with `unterminated quoted identifier
+/// at or near """` — a stray trailing `"` in the raw string reached Postgres
+/// and aborted postMoveProcess BEFORE the follow-copy enqueue and the
+/// adjustFollowingCounts legs, so 'Relationships have been properly
+/// migrated' (move.status 500 !== 200) and 'Follow and follower counts are
+/// properly adjusted' (followingCount 3 !== 0 /received N) both failed.
+#[tokio::test]
+async fn move_final_muting_copy_dedup_prepares_and_filters() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("move_final_muting_dedup").await;
+
+    let app = crate::build_router(test_state(pool.clone()));
+    let dst = signup(&app, "bob")["id"].as_str().unwrap().to_string();
+    let carol = signup(&app, "carol")["id"].as_str().unwrap().to_string();
+    let eve = signup(&app, "eve")["id"].as_str().unwrap().to_string();
+    let alice = signup(&app, "alice")["id"].as_str().unwrap().to_string();
+
+    // dst's muter set: carol mutes dst indefinitely, eve mutes dst with an
+    // expiry; carol also mutes a DIFFERENT user indefinitely.
+    mk_db::social::insert_muting(&pool, &mk_types::id::gen_aid_now(), &carol, &dst, None)
+        .await
+        .unwrap();
+    mk_db::social::insert_muting(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        &eve,
+        &dst,
+        Some(4102444800000),
+    )
+    .await
+    .unwrap();
+    mk_db::social::insert_muting(&pool, &mk_types::id::gen_aid_now(), &carol, &alice, None)
+        .await
+        .unwrap();
+
+    // the dedup scan: only the indefinite (expiresAt IS NULL) muters of dst —
+    // and the prepare itself is the regression pin (the census 500).
+    let muters = mk_db::move_account::indefinite_muters_of(&pool, &dst)
+        .await
+        .expect("dedup SQL must prepare/execute");
+    assert_eq!(muters, vec![carol.clone()], "indefinite muters of dst only");
+    // src-side copy source keeps the same-or-future expiry rows (upstream
+    // [IsNull, MoreThan(now)] disjunction → both travel with their expiry).
+    let old = mk_db::move_account::mutings_of(&pool, &alice)
+        .await
+        .expect("copy-source SQL must prepare/execute");
+    assert_eq!(
+        old.len(),
+        1,
+        "only carol→alice travels (eve→dst is dst-side)"
+    );
+    assert_eq!(old[0].0, carol, "muter id carried");
+    assert!(old[0].1.is_none(), "indefinite src mute copies indefinite");
+}
+
+/// The adjustFollowingCounts parity legs (upstream 'Follow and follower
+/// counts are properly adjusted', move.ts:385-388): the old account's
+/// following/followers columns zero (usersRepository.update followersCount:0,
+/// followingCount:0), the copied local follower's followingCount decrements
+/// by 1 "instead of unfollowing" (carol ends up following bob INSTEAD of
+/// alice — rows stay [bob, alice], column reads 1), old followees'
+/// followersCount decrement, and the empty batch is a validated no-op.
+#[tokio::test]
+async fn move_final_counts_adjust_legs() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("move_final_counts").await;
+
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, "alice")["id"].as_str().unwrap().to_string();
+    let carol = signup(&app, "carol")["id"].as_str().unwrap().to_string();
+    let eve = signup(&app, "eve")["id"].as_str().unwrap().to_string();
+
+    // pre-move: carol→alice (carol.followingCount 1, alice.followersCount 1),
+    // eve→alice (eve.followingCount 1, alice.followersCount 2), plus the
+    // copied-follow bump on carol (carol→bob) landing on eve's column pair.
+    mk_db::social::bump_follow_counts(&pool, &carol, &alice, 1)
+        .await
+        .unwrap();
+    mk_db::social::bump_follow_counts(&pool, &eve, &alice, 1)
+        .await
+        .unwrap();
+    mk_db::social::bump_follow_counts(&pool, &carol, &eve, 2)
+        .await
+        .unwrap();
+
+    let counts = async |pool: &mk_db::sqlx::PgPool, id: &str| {
+        let (following, followers): (i32, i32) = mk_db::sqlx::query_as(
+            r#"SELECT "followingCount", "followersCount" FROM "user" WHERE "id" = $1"#,
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (following, followers)
+    };
+
+    assert_eq!(counts(&pool, &alice).await, (0, 2), "seeded via bump pair");
+    assert_eq!(counts(&pool, &carol).await, (3, 0));
+    assert_eq!(counts(&pool, &eve).await, (1, 2));
+
+    // zero leg: the OLD account's columns — and only those.
+    mk_db::move_account::zero_move_counts(&pool, &alice)
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool, &alice).await, (0, 0), "old account zeroed");
+    assert_eq!(counts(&pool, &carol).await, (3, 0), "survivor untouched");
+    assert_eq!(counts(&pool, &eve).await, (1, 2), "survivor untouched");
+
+    // follower decrement leg: "Decrease following counts of local followers
+    // by 1" — carol ends up following bob INSTEAD of alice (rows stay, the
+    // column compensates) — and the second decrement past 0 floors (our
+    // GREATEST(-1, 0) guard; TypeORM decrement would go negative).
+    mk_db::move_account::decrement_following_counts(&pool, &[carol.clone(), eve.clone()])
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool, &carol).await, (2, 0));
+    assert_eq!(counts(&pool, &eve).await, (0, 2));
+
+    for _ in 0..4 {
+        mk_db::move_account::decrement_following_counts(&pool, &[carol.clone()])
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        counts(&pool, &carol).await,
+        (0, 0),
+        "GREATEST(2-4, 0) floor"
+    );
+
+    // followee decrement leg: "Decrease follower counts of local followees by
+    // 1" (old alice-followees lose their alice follower) + empty no-op.
+    mk_db::move_account::decrement_followers_counts(&pool, &[eve.clone()])
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool, &eve).await, (0, 1));
+    mk_db::move_account::decrement_followers_counts(&pool, &[])
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool, &eve).await, (0, 1), "empty batch is a no-op");
+}
+
 // ============================================================================
 // // arena-fetchres // — the GET routes OUTSIDE /api/* (upstream pinned
 // test/e2e/fetch-resource.ts — e2e-fetch-resource workflow). Mirrors the
