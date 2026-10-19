@@ -10654,7 +10654,7 @@ async fn arena_streaming_final_poll_quote_and_hashtag() {
     let ok = crate::api::streaming::connect_channel(
         &pool,
         "homeTimeline",
-        json!({ "withRenotes": false }),
+        &json!({ "withRenotes": false }),
         "sf-home",
         tx,
         &a_id,
@@ -10722,7 +10722,7 @@ async fn arena_streaming_final_poll_quote_and_hashtag() {
     let ok = crate::api::streaming::connect_channel(
         &pool,
         "hashtag",
-        json!({ "q": [["foo"]] }),
+        &json!({ "q": [["foo"]] }),
         "sf-tag-single",
         tx,
         &a_id,
@@ -10733,7 +10733,7 @@ async fn arena_streaming_final_poll_quote_and_hashtag() {
     let ok = crate::api::streaming::connect_channel(
         &pool,
         "hashtag",
-        json!({ "q": [["foo", "bar"], ["piyo"]] }),
+        &json!({ "q": [["foo", "bar"], ["piyo"]] }),
         "sf-tag-ador",
         tx,
         &a_id,
