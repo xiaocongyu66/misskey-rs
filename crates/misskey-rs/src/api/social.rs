@@ -1228,6 +1228,37 @@ pub(crate) async fn notes_reactions_create(
             json!({ "param": "reaction", "reason": "required" }),
         ));
     };
+    // note author for the blocking gate below (reused by the notification leg)
+    let note_row = match mk_db::note::find_note_by_id(pool, note_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "reactions_create find_note_by_id");
+            return crate::api::api_err(crate::api::ApiError::internal_error());
+        }
+    };
+    // ReactionService.create L107-113: reacting to a note whose author blocked
+    // me throws IdentifiableError e70412a4; the reactions/create endpoint
+    // catch-arm (reactions/create.ts L73) remaps it to
+    // meta.errors.youHaveBeenBlocked (L34-38). The gate precedes the toggle —
+    // an author-side block also rejects removing an older reaction.
+    if let Some(note) = &note_row {
+        if note.user_id != me_id {
+            match mk_db::social::blocking_exists(pool, &note.user_id, me_id).await {
+                Ok(true) => {
+                    return meta_err(
+                        "YOU_HAVE_BEEN_BLOCKED",
+                        "20ef5475-9f38-4e4c-bd33-de6d979498ec",
+                        "You cannot react this note because you have been blocked by this user.",
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(target: "dbg_notes", error = %e, "reactions_create blocking_exists");
+                    return crate::api::api_err(crate::api::ApiError::internal_error());
+                }
+            }
+        }
+    }
     match mk_db::note::find_note_reaction(pool, note_id, me_id).await {
         Ok(Some(_mine)) => {
             if let Err(e) = mk_db::note::delete_note_reaction(pool, note_id, me_id).await {
@@ -1255,7 +1286,7 @@ pub(crate) async fn notes_reactions_create(
                 tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
             }
             // reaction notification (notifiee = note author, local)
-            if let Ok(Some(note)) = mk_db::note::find_note_by_id(pool, note_id).await {
+            if let Some(note) = &note_row {
                 notify_note_event(pool, &note.user_id, me_id, "reaction", note_id).await;
             }
         }
