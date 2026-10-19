@@ -9741,7 +9741,9 @@ async fn arena_streaming_userlist_mute_lanes() {
             json!({ "listId": list_id, "userId": uid, "i": at }),
         )
         .await;
-        assert_eq!(s, StatusCode::OK, "{v}");
+        // push.ts defines no response body → 204 (the port's ok_empty arm);
+        // a 200 assert broke the serial census at the FIRST loop iteration.
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
     }
     let (s, v) = post_json(
         app.clone(),
