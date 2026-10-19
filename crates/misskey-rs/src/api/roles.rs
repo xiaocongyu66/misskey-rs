@@ -148,11 +148,15 @@ fn no_such_user_assign() -> Response {
 }
 
 fn access_denied_assign() -> Response {
-    meta_err(
+    // census roles.ts:256 — ACCESS_DENIED answers 403 (not the meta-error
+    // idx-default 400).
+    api_err(ApiError::new(
+        403,
+        mk_types::api_error::ApiErrorKind::Permission,
         "ACCESS_DENIED",
         "25b5bc31-dc79-4ebd-9bd2-c84978fd052c",
         "Only administrators can edit members of the role.",
-    )
+    ))
 }
 
 /// `update.ts` meta.errors.noSuchRole

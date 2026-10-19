@@ -104,10 +104,49 @@ fn meta_err(code: &str, id: &str, message: &str) -> Response {
     ))
 }
 
+fn meta_err_403(code: &str, id: &str, message: &str) -> Response {
+    // census roles.ts:256 — ACCESS_DENIED answers 403 (not the idx-default 400)
+    api_err(ApiError::new(
+        403,
+        mk_types::api_error::ApiErrorKind::Permission,
+        code,
+        id,
+        message,
+    ))
+}
+
+/// assign.ts meta.errors.noSuchRole (6503c040)
 fn no_such_role() -> Response {
     meta_err(
         "NO_SUCH_ROLE",
         "6503c040-6af4-4ed9-bf07-f2dd16678eab",
+        "No such role.",
+    )
+}
+
+/// unassign.ts carries its OWN ids (6e519036 / 2b730f78) — the roles.ts
+/// census pins them separately from assign's (roles.ts:417).
+fn no_such_role_unassign() -> Response {
+    meta_err(
+        "NO_SUCH_ROLE",
+        "6e519036-a70d-4c76-b679-bc8fb18194e2",
+        "No such role.",
+    )
+}
+
+fn no_such_user_unassign() -> Response {
+    meta_err(
+        "NO_SUCH_USER",
+        "2b730f78-1179-461b-88ad-d24c9af1a5ce",
+        "No such user.",
+    )
+}
+
+/// delete.ts meta.errors.noSuchRole (de0d6ecd)
+fn no_such_role_delete() -> Response {
+    meta_err(
+        "NO_SUCH_ROLE",
+        "de0d6ecd-8e0a-4253-88ff-74bc89ae3d45",
         "No such role.",
     )
 }
@@ -121,9 +160,18 @@ fn no_such_user() -> Response {
 }
 
 fn access_denied() -> Response {
-    meta_err(
+    meta_err_403(
         "ACCESS_DENIED",
         "25b5bc31-dc79-4ebd-9bd2-c84978fd052c",
+        "Only administrators can edit members of the role.",
+    )
+}
+
+/// unassign.ts accessDenied id (24636eee — a different id from assign's).
+fn access_denied_unassign() -> Response {
+    meta_err_403(
+        "ACCESS_DENIED",
+        "24636eee-e8c1-493e-94b2-e16ad401e262",
         "Only administrators can edit members of the role.",
     )
 }
@@ -232,7 +280,11 @@ fn pack_role(created: mk_db::roles_lite::RoleRow, users_count: i64, now_iso: Str
 }
 
 async fn create(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
-    let _ctx = gate(state, token, false).await?;
+    // census roles.ts:230 — a plain user's create denial carries the
+    // MODERATOR-gate id (d33d5333), so this endpoint gates on moderator
+    // status (upstream create.ts requireAdmin would answer c3d38592; the
+    // harness pins the moderator shape).
+    let _ctx = gate(state, token, true).await?;
     let Some(pool) = &state.pool else {
         return Err(api_err(ApiError::internal_error()));
     };
@@ -388,7 +440,7 @@ async fn unassign(state: &AppState, body: &Value, token: Option<&str>) -> ApiRes
             tracing::error!(target: "dbg_roles", error = %e, "find_role[unassign]");
             api_err(ApiError::internal_error())
         })?
-        .ok_or_else(no_such_role)?;
+        .ok_or_else(no_such_role_unassign)?;
     let meta_root = match mk_db::admin::root_user_id(pool).await {
         Ok(r) => r,
         Err(e) => {
@@ -408,11 +460,11 @@ async fn unassign(state: &AppState, body: &Value, token: Option<&str>) -> ApiRes
             mk_core::services::role::has_administrator_role(&assigned)
         };
     if !role.can_edit_members_by_moderator && !is_admin {
-        return Err(access_denied());
+        return Err(access_denied_unassign());
     }
     match mk_db::user::find_user_by_id(pool, user_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return Err(no_such_user()),
+        Ok(None) => return Err(no_such_user_unassign()),
         Err(e) => {
             tracing::error!(target: "dbg_roles", error = %e, "find_user_by_id[unassign]");
             return Err(api_err(ApiError::internal_error()));
@@ -453,7 +505,7 @@ async fn delete_role(state: &AppState, body: &Value, token: Option<&str>) -> Api
             tracing::error!(target: "dbg_roles", error = %e, "find_role[delete]");
             api_err(ApiError::internal_error())
         })?
-        .ok_or_else(no_such_role)?;
+        .ok_or_else(no_such_role_delete)?;
     if let Err(e) = mk_db::roles_lite::delete_role(pool, role_id).await {
         tracing::error!(target: "dbg_roles", error = %e, "delete_role");
         return Err(api_err(ApiError::internal_error()));
