@@ -739,6 +739,7 @@ pub fn ecdsa_p256_sha256_verify(
     der_sig: &[u8],
 ) -> bool {
     let Some((r, s)) = der_parse_ecdsa_sig(der_sig) else {
+        tracing::info!(target: "dbg_webauthn", der = hex_of(der_sig), "ecdsa early-return: der-parse");
         return false;
     };
     // 1 ≤ r, s < n (subtle rejects out-of-range components)
@@ -747,6 +748,7 @@ pub fn ecdsa_p256_sha256_verify(
         || cmp256(&r, &N_P256) != std::cmp::Ordering::Less
         || cmp256(&s, &N_P256) != std::cmp::Ordering::Less
     {
+        tracing::info!(target: "dbg_webauthn", r_limbs = ?r, s_limbs = ?s, "ecdsa early-return: range");
         return false;
     }
     // e = SHA256(msg) interpreted big-endian; a 256-bit digest needs at most
@@ -769,12 +771,14 @@ pub fn ecdsa_p256_sha256_verify(
     // w = s^-1 mod n; u1 = e*w, u2 = r*w; R = u1*G + u2*Q
     let w = inv_mod(&s, &N_P256);
     if w == ZERO {
+        tracing::info!(target: "dbg_webauthn", "ecdsa early-return: w-zero");
         return false;
     }
     let u1 = mul_mod(&e, &w, &N_P256);
     let u2 = mul_mod(&r, &w, &N_P256);
     let acc = pt_add(&scalar_mult(&u1, &g), &scalar_mult(&u2, &q));
     let Some(x_aff) = affine_x(&acc) else {
+        tracing::info!(target: "dbg_webauthn", u1_limbs = ?u1, u2_limbs = ?u2, "ecdsa early-return: R-infinity");
         return false;
     };
     let v = if cmp256(&x_aff, &N_P256) != std::cmp::Ordering::Less {
