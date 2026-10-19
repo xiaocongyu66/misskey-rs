@@ -1,6 +1,7 @@
 //! Social actions (M2 truthful slice): following/create+delete,
-//! following/requests/accept+cancel, mute/create+delete, blocking/create+
-//! delete, and the notes/create renote path.
+//! following/requests/accept+cancel (+ acceptAllFollowRequests on unlock),
+//! mute/create+delete, blocking/create+delete, and the notes/create renote
+//! path.
 //!
 //! Upstream refs (read-only): endpoints/following/{create,delete}.ts,
 //! endpoints/following/requests/{accept,cancel}.ts, endpoints/mute/*.ts,
@@ -200,9 +201,9 @@ pub(crate) async fn notify_note_event(
 
 /// createNotification legs WITHOUT a bound note (packed shape keeps
 /// id/createdAt/type/userId/user — the follow family):
-/// - 'follow' (UserFollowingService.insertFollowingDoc L357:
-///   `createNotification(followee.id, 'follow', {}, follower.id)`),
-/// - 'receiveFollowRequest' (createFollowRequest L543).
+/// - 'follow' (UserFollowingService.insertFollowingDoc L357),
+/// - 'receiveFollowRequest' (createFollowRequest L543),
+/// - 'followRequestAccepted' (insertFollowingDoc L296, notifier = followee).
 /// Both carry a notifier, so both ride the SAME type-agnostic muting gate
 /// (NotificationService.ts L111-114) — the Mute e2e follow/followRequest
 /// legs read exactly that drop.
@@ -210,7 +211,7 @@ pub(crate) async fn notify_follow_family_event(
     pool: &mk_db::sqlx::PgPool,
     notifiee_id: &str,
     notifier_id: &str,
-    reason: &str, // "follow" | "receiveFollowRequest"
+    reason: &str, // "follow" | "receiveFollowRequest" | "followRequestAccepted"
 ) {
     // ntf-mute: shared gate/insert helper (self-follow suppression +
     // type-agnostic muting drop, same lane as notify_note_event).
@@ -354,7 +355,7 @@ async fn following_create(
     }
 
     // insertFollowingDoc (+ pending-request cleanup inside) + counter bumps
-    mk_db::social::insert_following(
+    let had_request = mk_db::social::insert_following(
         pool,
         &mk_types::id::gen_aid_now(),
         me_id,
@@ -367,6 +368,13 @@ async fn following_create(
         .await
         .map_err(|e| db_err("following_create bump", e))?;
 
+    // insertFollowingDoc requestExist leg: a swept pending request (re-follow
+    // of a locked target that still held the earlier request) still tells the
+    // follower their request was accepted (followRequestAccepted,
+    // muting-gated).
+    if had_request {
+        notify_follow_family_event(pool, me_id, user_id, "followRequestAccepted").await;
+    }
     // UserFollowingService.insertFollowingDoc L357: the followee is notified
     // 'follow' (notifier = the follower; muting-gated — the Mute e2e
     // フォロー通知 leg).
@@ -452,7 +460,7 @@ async fn following_requests_accept(
     };
 
     // acceptFollowRequest → insertFollowingDoc(followee=me, follower=requester)
-    mk_db::social::insert_following(
+    let had_request = mk_db::social::insert_following(
         pool,
         &mk_types::id::gen_aid_now(),
         user_id,
@@ -465,7 +473,13 @@ async fn following_requests_accept(
         .await
         .map_err(|e| db_err("accept bump", e))?;
 
-    // TODO(M2+): 'followRequestAccepted' notification
+    // insertFollowingDoc L281-301: the follower is told their request landed
+    // ('followRequestAccepted', notifier = the followee) and the followee is
+    // notified 'follow' (notifier = the follower) — both muting-gated.
+    if had_request {
+        notify_follow_family_event(pool, user_id, me_id, "followRequestAccepted").await;
+    }
+    notify_follow_family_event(pool, me_id, user_id, "follow").await;
     Ok(ok_empty())
 }
 
@@ -500,6 +514,84 @@ async fn following_requests_cancel(
         .await
         .map_err(|e| db_err("cancel delete", e))?;
     Ok(ok_json(pack_target(state, pool, &followee, me_id).await?))
+}
+
+// ---------------------------------------------------------------------------
+// acceptAllFollowRequests (UserFollowingService.ts L619, called from
+// i/update.ts L556 when a locked account flips isLocked → false)
+// ---------------------------------------------------------------------------
+
+/// Re-adjudicate every pending request to `me_id` after an unlock (or any
+/// spec flip riding the same i/update): each request is accepted only when
+/// shouldRequireFollowApproval against the CURRENT (post-update) profile no
+/// longer requires approval for that follower, or `autoAcceptFollowed` says
+/// the followee already follows the requester (followedIds set). Requests
+/// that still require approval stay pending. Accepted legs mirror
+/// acceptFollowRequest: follow edge + counters + followRequestAccepted
+/// (follower) / follow (followee) notifications.
+pub(crate) async fn accept_all_follow_requests(pool: &mk_db::sqlx::PgPool, me_id: &str) {
+    // upstream re-reads the profile AFTER the update persist (cache refresh
+    // precedes acceptAllFollowRequests) — the spec flip in the same call is
+    // visible here.
+    let profile = match get_profile(pool, me_id).await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let requesters = match mk_db::social::follow_request_follower_ids(pool, me_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(target: "dbg_social", error = %e, "accept_all list");
+            return;
+        }
+    };
+    for follower_id in requesters {
+        // local-only lane (M2): isRemote is always false — the LOCAL seconds
+        // window is the only age gate that can still bind.
+        let still_requires = requires_age_approval(&profile, &follower_id);
+        if still_requires {
+            // followedIds: only when autoAcceptFollowed and me already
+            // follows the requester (L640-648).
+            let followed = matches!(
+                mk_db::social::following_exists(pool, me_id, &follower_id).await,
+                Ok(true)
+            ) && profile.auto_accept_followed;
+            if !followed {
+                continue;
+            }
+        }
+        // acceptFollowRequest: the request row may have vanished mid-loop
+        // (concurrent cancel) — upstream skips the IdentifiableError.
+        let Some(with_replies) =
+            mk_db::social::follow_request_with_replies(pool, me_id, &follower_id)
+                .await
+                .ok()
+                .flatten()
+        else {
+            continue;
+        };
+        let had_request = match mk_db::social::insert_following(
+            pool,
+            &mk_types::id::gen_aid_now(),
+            &follower_id,
+            me_id,
+            with_replies,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(target: "dbg_social", error = %e, "accept_all insert");
+                continue;
+            }
+        };
+        if let Err(e) = mk_db::social::bump_follow_counts(pool, &follower_id, me_id, 1).await {
+            tracing::error!(target: "dbg_social", error = %e, "accept_all bump");
+        }
+        if had_request {
+            notify_follow_family_event(pool, &follower_id, me_id, "followRequestAccepted").await;
+        }
+        notify_follow_family_event(pool, me_id, &follower_id, "follow").await;
+    }
 }
 
 // ---------------------------------------------------------------------------

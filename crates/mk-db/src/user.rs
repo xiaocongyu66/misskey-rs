@@ -338,6 +338,10 @@ pub struct ProfileUpdate {
     pub muted_instances: Option<serde_json::Value>,
     pub email_notification_types: Option<serde_json::Value>,
     pub notification_recieve_config: Option<serde_json::Value>,
+    /// follow-approval windows (i/update.ts paramDef: nullable int, 0..=30d).
+    /// None → untouched; Some(None) → reset to NULL (initial state).
+    pub follow_approval_local_seconds: Option<Option<i32>>,
+    pub follow_approval_remote_seconds: Option<Option<i32>>,
 }
 
 /// One dynamically-built SET assignment value. Text/Json/Bool values become
@@ -347,6 +351,10 @@ pub struct ProfileUpdate {
 enum SetVal {
     Text(Option<String>),
     Bool(bool),
+    /// int4 columns; None binds NULL (nullable-integer params such as
+    /// followApprovalLocalSeconds — absent stays untouched, explicit null
+    /// resets).
+    Int(Option<i32>),
     JsonText(String),
 }
 
@@ -399,7 +407,9 @@ pub async fn update_profile_subset(
             q = match v {
                 SetVal::Text(t) => q.bind(t.as_ref()),
                 SetVal::Bool(b) => q.bind(*b),
-                SetVal::JsonText(_) => unreachable!(),
+                // user-table arm only carries Text/Bool (see the
+                // "user_profile" loop below for Int/JsonText)
+                SetVal::Int(_) | SetVal::JsonText(_) => unreachable!(),
             };
         }
         q.execute(pool).await?;
@@ -444,6 +454,20 @@ pub async fn update_profile_subset(
     }
     if let Some(v) = &u.followed_message {
         push_set!("\"followedMessage\"", bound SetVal::Text(v.clone()));
+    }
+    if let Some(v) = &u.follow_approval_local_seconds {
+        vals.push(SetVal::Int(*v));
+        sets.push(format!(
+            "\"followApprovalLocalSeconds\" = ${}",
+            vals.len() + 1
+        ));
+    }
+    if let Some(v) = &u.follow_approval_remote_seconds {
+        vals.push(SetVal::Int(*v));
+        sets.push(format!(
+            "\"followApprovalRemoteSeconds\" = ${}",
+            vals.len() + 1
+        ));
     }
     for (col, val) in [
         ("mutedWords", &u.muted_words),
@@ -504,6 +528,7 @@ pub async fn update_profile_subset(
             q = match v {
                 SetVal::Text(t) => q.bind(t.as_ref()),
                 SetVal::Bool(b) => q.bind(*b),
+                SetVal::Int(o) => q.bind(*o),
                 SetVal::JsonText(s) => q.bind(s),
             };
         }
