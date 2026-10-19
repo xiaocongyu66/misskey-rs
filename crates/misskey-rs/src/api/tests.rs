@@ -12842,9 +12842,18 @@ async fn move_final_muting_copy_dedup_prepares_and_filters() {
 
     let app = crate::build_router(test_state(pool.clone()));
     let dst = signup(&app, "bob")["id"].as_str().unwrap().to_string();
-    let carol = signup(&app, "carol")["id"].as_str().unwrap().to_string();
-    let eve = signup(&app, "eve")["id"].as_str().unwrap().to_string();
-    let alice = signup(&app, "alice")["id"].as_str().unwrap().to_string();
+    let carol = signup(&app, "carol").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eve = signup(&app, "eve").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let alice = signup(&app, "alice").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // dst's muter set: carol mutes dst indefinitely, eve mutes dst with an
     // expiry; carol also mutes a DIFFERENT user indefinitely.
@@ -12900,9 +12909,18 @@ async fn move_final_counts_adjust_legs() {
     let pool = fresh_pool("move_final_counts").await;
 
     let app = crate::build_router(test_state(pool.clone()));
-    let alice = signup(&app, "alice")["id"].as_str().unwrap().to_string();
-    let carol = signup(&app, "carol")["id"].as_str().unwrap().to_string();
-    let eve = signup(&app, "eve")["id"].as_str().unwrap().to_string();
+    let alice = signup(&app, "alice").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let carol = signup(&app, "carol").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eve = signup(&app, "eve").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // pre-move: carol→alice (carol.followingCount 1, alice.followersCount 1),
     // eve→alice (eve.followingCount 1, alice.followersCount 2), plus the
