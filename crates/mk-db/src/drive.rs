@@ -143,7 +143,7 @@ pub async fn insert_drive_file(
              "accessKey", "isSensitive", "isLink", "blurhash", "maybeSensitive", "maybePorn",
              "folderId")
         VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8::jsonb, FALSE, $9, NULL, NULL,
-                $10, $11, FALSE, $12, FALSE, FALSE, $13, $14)
+                $14, $10, $11, FALSE, $12, FALSE, FALSE, $13)
         "#,
     )
     .bind(&row.id)
