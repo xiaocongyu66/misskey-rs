@@ -2735,10 +2735,12 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
                 ));
             }
             // blocking (blocker = reply target author) — upstream
-            // NoteCreateService.fetchAndCreate L383-391 (the method the
-            // notes/create endpoint calls at L224) rejects the reply with
-            // 'You have been blocked by the user'; the pure-RENOTE direction
-            // is the separate checkBlock path (L530-541).
+            // NoteCreateService.fetchAndCreate L391-401 throws IdentifiableError
+            // b0df6025 and the notes/create endpoint catch-arm (create.ts
+            // L280-282) remaps it to meta.errors.youHaveBeenBlocked; the pure
+            // RENOTE direction is the separate checkBlock path (L338-347,
+            // IdentifiableError 2b4fe776 remapped at create.ts L262-263). Both
+            // surfaces resolve to the same meta id the client sees.
             if reply_row.user_id != me_id {
                 match mk_db::social::blocking_exists(pool, &reply_row.user_id, &me_id).await {
                     Ok(true) => {
@@ -2746,7 +2748,7 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
                             400,
                             mk_types::api_error::ApiErrorKind::Client,
                             "YOU_HAVE_BEEN_BLOCKED",
-                            "b0df6025-f2e8-44b4-a26a-17ad99104612",
+                            "b390d7e1-8a5e-46ed-b625-06271cafd3d3",
                             "You have been blocked by this user.",
                         ));
                     }
