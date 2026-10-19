@@ -9371,3 +9371,244 @@ async fn apivis_show_pack_hide_lanes() {
 
     let _ = (o_token, folm);
 }
+// ==================== antennas-v2 ====================
+// antennas/* arena (upstream test/e2e/antennas.ts): CRUD + the pack shape,
+// the paramDef gates (EMPTY_KEYWORD / TOO_MANY_ANTENNAS), and the note
+// fanout (0004 antenna_note projection) feeding antennas/notes —
+// pre-antenna notes stay OUT (fanout rows insert at creation time only).
+
+fn antennas_default_param() -> Value {
+    json!({
+        "caseSensitive": false,
+        "excludeKeywords": [[""]],
+        "keywords": [["keyword"]],
+        "name": "test",
+        "src": "all",
+        "userListId": null,
+        "users": [""],
+        "withFile": false,
+        "withReplies": false,
+        "excludeBots": false,
+    })
+}
+
+#[tokio::test]
+async fn antennas_crud_pack_shape_gates_and_limit() {
+    let pool = fresh_pool("mkantennascrud").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("anta")).await;
+    let bob = signup(&app, &uname("antb")).await;
+    let a_tok = alice["token"].as_str().unwrap().to_string();
+    let b_tok = bob["token"].as_str().unwrap().to_string();
+
+    // create: the Antenna pack carries exactly the upstream key set
+    let mut create_body = antennas_default_param();
+    create_body["i"] = json!(a_tok);
+    let (s, v) = post_json(app.clone(), "/api/antennas/create", create_body.clone()).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    assert!(id.len() >= 10, "aid shape: {v}");
+    let expected_keys = vec![
+        "id",
+        "createdAt",
+        "name",
+        "keywords",
+        "excludeKeywords",
+        "src",
+        "userListId",
+        "users",
+        "caseSensitive",
+        "localOnly",
+        "excludeBots",
+        "withReplies",
+        "withFile",
+        "excludeNotesInSensitiveChannel",
+        "isActive",
+        "hasUnreadNote",
+        "notify",
+    ];
+    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut ek = expected_keys.clone();
+    let mut ak = keys.clone();
+    ek.sort();
+    ak.sort();
+    assert_eq!(ak, ek, "pack keys had a surplus/shortfall: {v}");
+    assert_eq!(v["name"], json!("test"));
+    assert_eq!(v["keywords"], json!([["keyword"]]));
+    assert_eq!(v["excludeKeywords"], json!([[""]]));
+    assert_eq!(v["src"], json!("all"));
+    assert_eq!(v["userListId"], Value::Null);
+    assert_eq!(v["caseSensitive"], json!(false));
+    assert_eq!(v["isActive"], json!(true));
+    assert_eq!(v["hasUnreadNote"], json!(false));
+    assert_eq!(v["notify"], json!(false));
+
+    // show: owner-scoped readback equals the create pack
+    let (s, v2) = post_json(
+        app.clone(),
+        "/api/antennas/show",
+        json!({ "i": a_tok, "antennaId": id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v2}");
+    assert_eq!(v2, v, "show must round-trip the create pack");
+
+    // list: the owner sees exactly their antennas
+    let (s, list) = post_json(app.clone(), "/api/antennas/list", json!({ "i": a_tok })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {list}");
+    assert_eq!(arr[0]["id"], json!(id));
+
+    // EMPTY_KEYWORD (create.ts meta.errors.emptyKeyword, 400)
+    let mut empty_kw = antennas_default_param();
+    empty_kw["keywords"] = json!([[]]);
+    empty_kw["excludeKeywords"] = json!([[]]);
+    empty_kw["i"] = json!(a_tok);
+    let (s, e) = post_json(app.clone(), "/api/antennas/create", empty_kw).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], json!("EMPTY_KEYWORD"));
+    assert_eq!(
+        e["error"]["id"],
+        json!("53ee222e-1ddd-4f9a-92e5-9fb82ddb463a")
+    );
+
+    // update: pack reflects the patch (full defaultParam + overrides)
+    let mut upd = antennas_default_param();
+    upd["i"] = json!(a_tok);
+    upd["name"] = json!("renamed");
+    upd["keywords"] = json!([["word2"]]);
+    upd["withReplies"] = json!(true);
+    upd["antennaId"] = json!(id);
+    let (s, v3) = post_json(app.clone(), "/api/antennas/update", upd).await;
+    assert_eq!(s, StatusCode::OK, "body: {v3}");
+    assert_eq!(v3["name"], json!("renamed"));
+    assert_eq!(v3["keywords"], json!([["word2"]]));
+    assert_eq!(v3["withReplies"], json!(true));
+    assert_eq!(v3["id"], json!(id));
+
+    // delete: 204 undefined body, then the list is EMPTY...
+    let (s, dl) = post_json(
+        app.clone(),
+        "/api/antennas/delete",
+        json!({ "i": a_tok, "antennaId": id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {dl}");
+    let (s, list) = post_json(app.clone(), "/api/antennas/list", json!({ "i": a_tok })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(list.as_array().unwrap().is_empty(), "body: {list}");
+
+    // TOO_MANY_ANTENNAS: DEFAULT_POLICIES.antennaLimit = 5 (via the shared
+    // UserPolicy ladder — cache-warm base policies).
+    for _ in 0..5 {
+        let mut p = antennas_default_param();
+        p["i"] = json!(b_tok);
+        let (s, v) = post_json(app.clone(), "/api/antennas/create", p).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+    let mut p = antennas_default_param();
+    p["i"] = json!(b_tok);
+    let (s, e) = post_json(app.clone(), "/api/antennas/create", p).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], json!("TOO_MANY_ANTENNAS"));
+    assert_eq!(
+        e["error"]["id"],
+        json!("faf47050-e8b5-438c-913c-db2b1576fde4")
+    );
+}
+
+#[tokio::test]
+async fn antennas_notes_fanout_keyword_gate_and_remove_note() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkantennasnotes").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("anta")).await;
+    let bob = signup(&app, &uname("antb")).await;
+    let a_tok = alice["token"].as_str().unwrap().to_string();
+    let b_tok = bob["token"].as_str().unwrap().to_string();
+    let post_n = |app: axum::Router, tok: &str, text: &str| {
+        let body = json!({ "i": tok, "text": text });
+        async move { post_json(app, "/api/notes/create", body).await }
+    };
+
+    // the BEFORE note: fanout rows only exist for notes created after the
+    // antenna, so this must never surface in the feed
+    let (s, before) = post_n(app.clone(), b_tok.as_str(), "serpent before").await;
+    assert_eq!(s, StatusCode::OK, "body: {before}");
+
+    let mut p = antennas_default_param();
+    p["i"] = json!(a_tok);
+    p["keywords"] = json!([["serpent"]]);
+    let (s, antenna) = post_json(app.clone(), "/api/antennas/create", p).await;
+    assert_eq!(s, StatusCode::OK, "body: {antenna}");
+    let antenna_id = antenna["id"].as_str().unwrap().to_string();
+
+    // fanout hits: bob's matching note lands IN, alice's miss stays OUT
+    let (s, hit) = post_n(app.clone(), b_tok.as_str(), "test serpent now").await;
+    assert_eq!(s, StatusCode::OK, "body: {hit}");
+    let hit_id = hit["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, _miss) = post_n(app.clone(), a_tok.as_str(), "no keyword here").await;
+    assert_eq!(s, StatusCode::OK, "body: {_miss}");
+
+    let (s, feed) = post_json(
+        app.clone(),
+        "/api/antennas/notes",
+        json!({ "i": a_tok, "antennaId": antenna_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {feed}");
+    let arr = feed.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "keyword gate + fanout: {feed}");
+    assert_eq!(arr[0]["id"], json!(hit_id));
+    assert_eq!(arr[0]["text"], json!("test serpent now"));
+
+    // caseSensitive arm: KEYWORD does not match under caseSensitive true when
+    // the UPDATE retargets the antenna into an empty feed
+    let mut upd = antennas_default_param();
+    upd["i"] = json!(a_tok);
+    upd["antennaId"] = json!(antenna_id);
+    upd["keywords"] = json!([["SERPENT"]]);
+    upd["caseSensitive"] = json!(true);
+    let (s, _v) = post_json(app.clone(), "/api/antennas/update", upd).await;
+    assert_eq!(s, StatusCode::OK, "body: {_v}");
+    let (s, feed2) = post_json(
+        app.clone(),
+        "/api/antennas/notes",
+        json!({ "i": a_tok, "antennaId": antenna_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {feed2}");
+    // the projection keeps the (old-match) row; retargeting only affects NEW
+    // notes — matching upstream, where the feed is fanned at creation time.
+    assert_eq!(feed2.as_array().unwrap().len(), 1, "body: {feed2}");
+
+    // remove-note: unknown noteId still 204s; the other user's antennaId is a
+    // NO_SUCH_ANTENNA (850926e0, notes/remove-note meta id)
+    let (s, rn) = post_json(
+        app.clone(),
+        "/api/antennas/remove-note",
+        json!({ "i": a_tok, "antennaId": antenna_id, "noteId": "doesnotexist0" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {rn}");
+    let (s, e) = post_json(
+        app.clone(),
+        "/api/antennas/remove-note",
+        json!({ "i": b_tok, "antennaId": antenna_id, "noteId": hit_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], json!("NO_SUCH_ANTENNA"));
+    assert_eq!(
+        e["error"]["id"],
+        json!("850926e0-fd3b-49b6-b69a-b28a5dbd82fe")
+    );
+}

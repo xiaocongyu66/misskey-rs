@@ -57,6 +57,12 @@ mod drive_note;
 // paths in mk-db/src/lists.rs (user_list / user_list_membership ship in the
 // 0001 baseline).
 mod lists;
+// antennas-v2: antennas/* (upstream endpoints/antennas/{create,delete,list,
+// show,update,notes,remove-note}.ts; requireCredential + owner-scoped
+// NO_SUCH_ANTENNA ids per endpoint) — db paths in mk-db/src/antennas.rs (0001
+// antenna table + the 0004 antenna_note fanout projection); the note-creation
+// fanout hook rides notes_create below.
+mod antennas;
 // ftt2: the FTT Redis push pipeline (NoteCreateService.pushToTl +
 // FanoutTimelineService.push; the timelines.ts `FTT:` probes read
 // `list:homeTimeline:*` Redis lists literally).
@@ -597,6 +603,41 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         return clips::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END clips-agent DISPATCH ARM ====
+
+    // ==== antennas-v2 DISPATCH ARM (antennas/*) ====
+    // Self-contained block on the clips/ul-tl arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live in
+    // this arm; all seven names are requireCredential upstream and the
+    // requireCredential gates + per-endpoint NO_SUCH_ANTENNA ids live in
+    // api::antennas (db paths in mk-db/src/antennas.rs). None of the 7 names
+    // collide with an earlier arm, so this arm shadows nothing.
+    if antennas::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return antennas::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END antennas-v2 DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
@@ -3232,6 +3273,14 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         channel_id.as_deref(),
     )
     .await;
+
+    // antennas-v2: NoteCreateService.postNoteCreated →
+    // antennaService.addNoteToAntennas ({...note, channel}) — match every
+    // ACTIVE antenna against the fresh row and project the hits into
+    // antenna_note (0004). Best-effort: never fails the note creation.
+    if let Err(e) = mk_db::antennas::fanout_created_note(pool, &id).await {
+        tracing::error!(target: "dbg_antennas", error = %e, "fanout_created_note");
+    }
 
     // NoteCreateService non-AP notify branch (create() L845-869 +
     // createMentionedEvents L991-1035): the reply-target author and every
