@@ -27,6 +27,9 @@ pub mod drive;
 pub mod drive_note;
 // freq-agent: users/get-frequently-replied-users + pinned-users db paths
 pub mod freq;
+// ff-visibility arena: users/followers + users/following list edges + the
+// meta."federation" patch/read the AP collections gate consumes
+pub mod ff_visibility;
 // ul-tl-agent: users/lists/* + notes/user-list-timeline domain (user_list /
 // user_list_membership tables ship in the 0001 baseline)
 pub mod lists;

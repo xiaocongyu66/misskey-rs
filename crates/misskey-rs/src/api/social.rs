@@ -1,7 +1,6 @@
 //! Social actions (M2 truthful slice): following/create+delete,
-//! following/requests/accept+cancel (+ acceptAllFollowRequests on unlock),
-//! mute/create+delete, blocking/create+delete, and the notes/create renote
-//! path.
+//! following/requests/accept+cancel, mute/create+delete, blocking/create+
+//! delete, and the notes/create renote path.
 //!
 //! Upstream refs (read-only): endpoints/following/{create,delete}.ts,
 //! endpoints/following/requests/{accept,cancel}.ts, endpoints/mute/*.ts,
@@ -201,9 +200,9 @@ pub(crate) async fn notify_note_event(
 
 /// createNotification legs WITHOUT a bound note (packed shape keeps
 /// id/createdAt/type/userId/user — the follow family):
-/// - 'follow' (UserFollowingService.insertFollowingDoc L357),
-/// - 'receiveFollowRequest' (createFollowRequest L543),
-/// - 'followRequestAccepted' (insertFollowingDoc L296, notifier = followee).
+/// - 'follow' (UserFollowingService.insertFollowingDoc L357:
+///   `createNotification(followee.id, 'follow', {}, follower.id)`),
+/// - 'receiveFollowRequest' (createFollowRequest L543).
 /// Both carry a notifier, so both ride the SAME type-agnostic muting gate
 /// (NotificationService.ts L111-114) — the Mute e2e follow/followRequest
 /// legs read exactly that drop.
@@ -211,7 +210,7 @@ pub(crate) async fn notify_follow_family_event(
     pool: &mk_db::sqlx::PgPool,
     notifiee_id: &str,
     notifier_id: &str,
-    reason: &str, // "follow" | "receiveFollowRequest" | "followRequestAccepted"
+    reason: &str, // "follow" | "receiveFollowRequest"
 ) {
     // ntf-mute: shared gate/insert helper (self-follow suppression +
     // type-agnostic muting drop, same lane as notify_note_event).
@@ -355,7 +354,7 @@ async fn following_create(
     }
 
     // insertFollowingDoc (+ pending-request cleanup inside) + counter bumps
-    let had_request = mk_db::social::insert_following(
+    mk_db::social::insert_following(
         pool,
         &mk_types::id::gen_aid_now(),
         me_id,
@@ -368,13 +367,6 @@ async fn following_create(
         .await
         .map_err(|e| db_err("following_create bump", e))?;
 
-    // insertFollowingDoc requestExist leg: a swept pending request (re-follow
-    // of a locked target that still held the earlier request) still tells the
-    // follower their request was accepted (followRequestAccepted,
-    // muting-gated).
-    if had_request {
-        notify_follow_family_event(pool, me_id, user_id, "followRequestAccepted").await;
-    }
     // UserFollowingService.insertFollowingDoc L357: the followee is notified
     // 'follow' (notifier = the follower; muting-gated — the Mute e2e
     // フォロー通知 leg).
@@ -460,7 +452,7 @@ async fn following_requests_accept(
     };
 
     // acceptFollowRequest → insertFollowingDoc(followee=me, follower=requester)
-    let had_request = mk_db::social::insert_following(
+    mk_db::social::insert_following(
         pool,
         &mk_types::id::gen_aid_now(),
         user_id,
@@ -473,13 +465,7 @@ async fn following_requests_accept(
         .await
         .map_err(|e| db_err("accept bump", e))?;
 
-    // insertFollowingDoc L281-301: the follower is told their request landed
-    // ('followRequestAccepted', notifier = the followee) and the followee is
-    // notified 'follow' (notifier = the follower) — both muting-gated.
-    if had_request {
-        notify_follow_family_event(pool, user_id, me_id, "followRequestAccepted").await;
-    }
-    notify_follow_family_event(pool, me_id, user_id, "follow").await;
+    // TODO(M2+): 'followRequestAccepted' notification
     Ok(ok_empty())
 }
 
@@ -514,84 +500,6 @@ async fn following_requests_cancel(
         .await
         .map_err(|e| db_err("cancel delete", e))?;
     Ok(ok_json(pack_target(state, pool, &followee, me_id).await?))
-}
-
-// ---------------------------------------------------------------------------
-// acceptAllFollowRequests (UserFollowingService.ts L619, called from
-// i/update.ts L556 when a locked account flips isLocked → false)
-// ---------------------------------------------------------------------------
-
-/// Re-adjudicate every pending request to `me_id` after an unlock (or any
-/// spec flip riding the same i/update): each request is accepted only when
-/// shouldRequireFollowApproval against the CURRENT (post-update) profile no
-/// longer requires approval for that follower, or `autoAcceptFollowed` says
-/// the followee already follows the requester (followedIds set). Requests
-/// that still require approval stay pending. Accepted legs mirror
-/// acceptFollowRequest: follow edge + counters + followRequestAccepted
-/// (follower) / follow (followee) notifications.
-pub(crate) async fn accept_all_follow_requests(pool: &mk_db::sqlx::PgPool, me_id: &str) {
-    // upstream re-reads the profile AFTER the update persist (cache refresh
-    // precedes acceptAllFollowRequests) — the spec flip in the same call is
-    // visible here.
-    let profile = match get_profile(pool, me_id).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let requesters = match mk_db::social::follow_request_follower_ids(pool, me_id).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(target: "dbg_social", error = %e, "accept_all list");
-            return;
-        }
-    };
-    for follower_id in requesters {
-        // local-only lane (M2): isRemote is always false — the LOCAL seconds
-        // window is the only age gate that can still bind.
-        let still_requires = requires_age_approval(&profile, &follower_id);
-        if still_requires {
-            // followedIds: only when autoAcceptFollowed and me already
-            // follows the requester (L640-648).
-            let followed = matches!(
-                mk_db::social::following_exists(pool, me_id, &follower_id).await,
-                Ok(true)
-            ) && profile.auto_accept_followed;
-            if !followed {
-                continue;
-            }
-        }
-        // acceptFollowRequest: the request row may have vanished mid-loop
-        // (concurrent cancel) — upstream skips the IdentifiableError.
-        let Some(with_replies) =
-            mk_db::social::follow_request_with_replies(pool, me_id, &follower_id)
-                .await
-                .ok()
-                .flatten()
-        else {
-            continue;
-        };
-        let had_request = match mk_db::social::insert_following(
-            pool,
-            &mk_types::id::gen_aid_now(),
-            &follower_id,
-            me_id,
-            with_replies,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(target: "dbg_social", error = %e, "accept_all insert");
-                continue;
-            }
-        };
-        if let Err(e) = mk_db::social::bump_follow_counts(pool, &follower_id, me_id, 1).await {
-            tracing::error!(target: "dbg_social", error = %e, "accept_all bump");
-        }
-        if had_request {
-            notify_follow_family_event(pool, &follower_id, me_id, "followRequestAccepted").await;
-        }
-        notify_follow_family_event(pool, me_id, &follower_id, "follow").await;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,6 +1208,96 @@ pub(crate) async fn notes_reactions(state: &crate::api::AppState, body: &Value) 
     }
 }
 
+/// ReactionService normalization (FALLBACK '\u2764', L34) — the Rust port of
+/// `ReactionService.normalize` L385-402 in upstream order: legacy names →
+/// mapped emoji, emojiRegex first-char (ZWJ sequences kept whole, otherwise
+/// \ufe0f stripped), everything else (empty string, ASCII text, unknown
+/// custom emoji) → FALLBACK. Custom ':name:' L130-163 hits the local emoji
+/// registry, empty in this server → FALLBACK.
+pub(crate) fn normalize_reaction(reaction: &str) -> String {
+    const FALLBACK: &str = "\u{2764}"; // no VS16 — the storage/canonical form
+    const LEGACIES: &[(&str, &str)] = &[
+        ("like", "👍"),
+        ("love", "\u{2764}"),
+        ("laugh", "😆"),
+        ("hmm", "🤔"),
+        ("surprise", "😮"),
+        ("congrats", "🎉"),
+        ("angry", "💢"),
+        ("confused", "😥"),
+        ("rip", "😇"),
+        ("pudding", "🍮"),
+        ("star", "⭐"),
+    ];
+    if let Some((_, modern)) = LEGACIES.iter().find(|(name, _)| *name == reaction) {
+        return (*modern).to_string();
+    }
+    match first_emoji_span(reaction) {
+        // 合字を含む1つの絵文字: ZWJ sequences keep visibility selectors,
+        // standalone chars strip \ufe0f (upstream L397-398).
+        Some(span) => {
+            let matched = &reaction[span.start..span.end];
+            if matched.contains('\u{200d}') {
+                matched.to_string()
+            } else {
+                matched.replace("\u{fe0f}", "")
+            }
+        }
+        None => FALLBACK.to_string(),
+    }
+}
+
+/// Find the byte span of the leading emoji sequence — an approximation of the
+/// emoji-regex scan used by ReactionService.normalize (first emoji char + its
+/// trailing modifiers: VS16, skin tones, keycap, tags, and ZWJ continuations).
+fn first_emoji_span(s: &str) -> Option<std::ops::Range<usize>> {
+    // emoji-start property (rounded from Unicode 15 emoji-data; supersets the
+    // e2e's 🚀/🥰/❤ class, excludes ASCII/CJK/kana)
+    fn emoji_start(c: char) -> bool {
+        matches!(c as u32,
+            0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139
+            | 0x2194..=0x2199 | 0x21A9..=0x21AA
+            | 0x231A..=0x231B | 0x2328 | 0x23CF | 0x23E9..=0x23FA
+            | 0x24C2 | 0x25AA..=0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE
+            | 0x2600..=0x27BF | 0x2934..=0x2935
+            | 0x2B05..=0x2B07 | 0x2B1B..=0x2B1C | 0x2B50 | 0x2B55
+            | 0x3030 | 0x303D | 0x3297 | 0x3299
+            | 0x1F004 | 0x1F0CF | 0x1F170..=0x1F251
+            | 0x1F1E6..=0x1F1FF
+            | 0x1F300..=0x1FAFF
+            | 0x1FC00..=0x1FFFD
+        )
+    }
+    // continuation chars that belong to the sequence once started
+    fn emoji_continue(c: char) -> bool {
+        matches!(c as u32,
+            0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F
+        )
+    }
+    let start = s
+        .char_indices()
+        .find(|(_, c)| emoji_start(*c))
+        .map(|(i, _)| i)?;
+    // first emoji char begins the match; swallow continuation chars and
+    // ZWJ-joined emoji chars after it
+    let mut end = start + s[start..].chars().next().unwrap().len_utf8();
+    let mut zwj_seen = false;
+    for (i, c) in s.char_indices() {
+        if i < end {
+            continue;
+        }
+        if c == '\u{200d}' {
+            zwj_seen = true;
+            end = i + c.len_utf8();
+        } else if emoji_continue(c) || (zwj_seen && emoji_start(c)) {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(start..end)
+}
+
 /// `POST /api/notes/reactions/create` — toggle-my-reaction semantics
 /// (NoteReactionService: existing mine → delete, else create; jsonb map bump).
 pub(crate) async fn notes_reactions_create(
@@ -1320,6 +1318,12 @@ pub(crate) async fn notes_reactions_create(
             json!({ "param": "reaction", "reason": "required" }),
         ));
     };
+    // ReactionService.create L125-166 normalization: legacy names → modern
+    // emoji, unicode emoji → first emoji char (\ufe0f stripped unless the
+    // sequence contains \u200d), custom ':name:' → local emoji lookup (the
+    // emoji registry is empty in this server → FALLBACK), everything else →
+    // FALLBACK '\u2764' (endpoints.ts ❤フォールバック asserts).
+    let reaction = normalize_reaction(reaction);
     // note author for the blocking gate below (reused by the notification leg)
     let note_row = match mk_db::note::find_note_by_id(pool, note_id).await {
         Ok(n) => n,
@@ -1351,13 +1355,33 @@ pub(crate) async fn notes_reactions_create(
             }
         }
     }
+    // ReactionService.create L120-123: reactions key the note itself — a pure
+    // renote (renoteId set, no text/cw/reply/poll/files; misc/is-renote.ts
+    // isRenote && !isQuote) throws IdentifiableError 12c35529, remapped by
+    // reactions/create.ts meta.errors.cannotReactToRenote (endpoints.ts
+    // CANNOT_REACT_TO_RENOTE assert; quotes stay reactable).
+    if let Some(note) = &note_row {
+        if note.renote_id.is_some()
+            && note.text.is_none()
+            && note.cw.is_none()
+            && note.reply_id.is_none()
+            && !note.has_poll
+            && note.file_ids.is_empty()
+        {
+            return meta_err(
+                "CANNOT_REACT_TO_RENOTE",
+                "eaccdc08-ddef-43fe-908f-d108faad57f5",
+                "You cannot react to Renote.",
+            );
+        }
+    }
     match mk_db::note::find_note_reaction(pool, note_id, me_id).await {
         Ok(Some(_mine)) => {
             if let Err(e) = mk_db::note::delete_note_reaction(pool, note_id, me_id).await {
                 tracing::error!(target: "dbg_notes", error = %e, "delete_note_reaction");
                 return crate::api::api_err(crate::api::ApiError::internal_error());
             }
-            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, reaction, -1).await {
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, &reaction, -1).await {
                 tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
             }
         }
@@ -1367,14 +1391,14 @@ pub(crate) async fn notes_reactions_create(
                 &mk_types::id::gen_aid_now(),
                 me_id,
                 note_id,
-                reaction,
+                &reaction,
             )
             .await
             {
                 tracing::error!(target: "dbg_notes", error = %e, "insert_note_reaction");
                 return crate::api::api_err(crate::api::ApiError::internal_error());
             }
-            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, reaction, 1).await {
+            if let Err(e) = mk_db::note::bump_reactions_map(pool, note_id, &reaction, 1).await {
                 tracing::error!(target: "dbg_notes", error = %e, "bump_reactions_map");
             }
             // reaction notification (notifiee = note author, local)

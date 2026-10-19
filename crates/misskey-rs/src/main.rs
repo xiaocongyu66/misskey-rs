@@ -25,14 +25,36 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::permissive();
-    Router::new()
+    // CORS is scoped to /api only: the well-known webfinger OPTIONS preflight
+    // (upstream fastify.options(allPath) → 204 with `Access-Control-Allow-
+    // Headers: Accept`) must reach the WellKnownServerService dispatcher — a
+    // router-wide permissive layer would answer it first with `*`.
+    let api_cors = CorsLayer::permissive();
+    let api = Router::new()
         .route("/api/{*name}", any(api::dispatch))
+        .layer(api_cors);
+    Router::new()
+        .merge(api)
+        // well-known arena: /.well-known/* + /nodeinfo/* ride OUTSIDE /api/*
+        // (upstream WellKnownServerService + NodeinfoServerService).
+        .route(
+            "/.well-known/{*rest}",
+            any(api::well_known::well_known_dispatch),
+        )
+        .route("/nodeinfo/2.0", get(api::well_known::nodeinfo_20))
+        .route("/nodeinfo/2.1", get(api::well_known::nodeinfo_21))
         // streaming websocket hub (drive-agent2: publishMainStream /
         // urlUploadFinished — upstream StreamingApiServerService entry).
         .route("/streaming", get(api::drive::streaming::entry))
+        // ff-arena: the AP collections the ff-visibility.ts AP probes hit
+        // (upstream ActivityPubServerService.ts /users/:user/{following,followers}).
+        .route("/users/{user}/following", get(api::ff_vis::ap_following))
+        .route("/users/{user}/followers", get(api::ff_vis::ap_followers))
+        // endpoints-arena: the /url preview route (ClientServerService.ts
+        // L450 fastify.get '/url' → UrlPreviewService.handle; sits outside
+        // /api like the upstream web server).
+        .route("/url", get(api::url_preview))
         .route("/healthz", get(healthz))
-        .layer(cors)
         .layer(middleware::from_fn(json_utf8_charset))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)

@@ -14,6 +14,12 @@ pub struct Config {
     /// Enables the `POST /_test/reset` hook (e2e harness only).
     #[serde(default)]
     pub test: bool,
+    /// server version — upstream config.version resolves from built/meta.json
+    /// (config.ts L267-275; the e2e harness writes it from the pinned
+    /// package.json). Mirrored for the nodeinfo software.version field;
+    /// load() fills it from env/built/meta.json when the yaml omits it.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -98,6 +104,21 @@ impl Config {
 
 pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
-    let config = serde_yaml::from_str(&raw)?;
+    let mut config: Config = serde_yaml::from_str(&raw)?;
+    // upstream config.ts version resolution chain: yaml `version:` →
+    // built/meta.json (resolve(cwd, 'built/meta.json')) — the harness spawn
+    // runs with cwd = upstream/packages/backend, mirroring projectBuiltDir.
+    if config.version.is_none() {
+        config.version = std::env::var("MISSKEY_RS_VERSION").ok().or_else(|| {
+            std::fs::read_to_string("built/meta.json")
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|meta| {
+                    meta.get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+        });
+    }
     Ok(config)
 }

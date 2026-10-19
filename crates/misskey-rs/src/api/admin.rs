@@ -163,13 +163,16 @@ fn handler_internal_error() -> Response {
 // --- auth gate ---
 
 /// Authenticated admin-context user: row + privilege flag.
-struct AdminCtx {
+// ff-arena: pub(crate) so api/ff_vis.rs can run the shared requireAdmin gate
+// for its admin/update-meta federation persistence arm.
+pub(crate) struct AdminCtx {
     me: mk_db::user::LocalUserRow,
     /// RoleService.isAdministrator(me) — used by show-user's admin-view gate.
     is_admin: bool,
 }
 
-enum Gate {
+#[derive(Clone, Copy)]
+pub(crate) enum Gate {
     /// requireModerator metas: root or moderator/administrator role.
     Moderator,
     /// requireAdmin metas: root or administrator role.
@@ -222,7 +225,12 @@ async fn root_uid(pool: &mk_db::sqlx::PgPool) -> Result<Option<String>, Response
 
 /// ApiCallService.call gate sequence for the requireCredential (+
 /// requireModerator/requireAdmin) admin metas.
-async fn gate(state: &AppState, token: Option<&str>, g: Gate) -> Result<AdminCtx, Response> {
+// ff-arena: pub(crate) — shared with api/ff_vis.rs (federation side-patch).
+pub(crate) async fn gate(
+    state: &AppState,
+    token: Option<&str>,
+    g: Gate,
+) -> Result<AdminCtx, Response> {
     let Some(pool) = &state.pool else {
         return Err(api_err(ApiError::internal_error()));
     };

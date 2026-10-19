@@ -61,10 +61,25 @@ mod lists;
 // FanoutTimelineService.push; the timelines.ts `FTT:` probes read
 // `list:homeTimeline:*` Redis lists literally).
 mod ftt;
+// endpoints-arena: the /api/endpoints name catalog — mirrors upstream
+// server/api/endpoint-list.ts source order exactly (438 names, admin/*
+// included; upstream Endpoints endpoint returns `endpoints.map(x => x.name)`).
+mod endpoints_catalog;
 // stream-rtm: the /streaming timeline-channel half — `homeTimeline` +
 // `localTimeline` fanout of the notesStream event (upstream
 // GlobalEventService.publishNotesStream + stream/channels/{home,local}-timeline.ts).
 mod streaming;
+// well-known arena: /.well-known/* + /nodeinfo/* routes that ride OUTSIDE
+// /api/* (upstream WellKnownServerService.ts + NodeinfoServerService.ts +
+// OAuth2ProviderService.generateRFC8414). pub(crate): main.rs mounts the
+// dispatcher directly on the top-level router.
+pub(crate) mod well_known;
+// ff-visibility arena: users/followers + users/following (upstream
+// endpoints/users/{followers,following}.ts per-visibility gates) + the AP
+// /users/:id/{followers,following} collections +
+// admin/update-meta federation persistence (api/ff_vis.rs; db paths in
+// mk-db/src/ff_visibility.rs).
+pub(crate) mod ff_vis;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -113,6 +128,9 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // Registry endpoints that need a JSON body parsed before dispatch.
     if name == "users/show"
         || name == "signin"
+        // endpoints-arena: SigninApiService.signin also serves the
+        // /signin-flow fastify route (ApiServerService.ts L135 — same body).
+        || name == "signin-flow"
         || name == "i"
         || name == "i/update"
         || name == "notes/create"
@@ -158,6 +176,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         || name == "pinned-users"
         || name == "users/notes"
         || name == "admin/update-meta"
+        // ff-arena: the following/followers list arena (upstream
+        // endpoints/users/{followers,following}.ts per-visibility gates)
+        || name == "users/followers"
+        || name == "users/following"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -168,7 +190,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             Err(resp) => return resp,
         };
         let token = extract_token(&body, &headers);
-        if name == "signin" {
+        if name == "signin" || name == "signin-flow" {
             let _ = token;
             return signin_route(&state, &body).await;
         }
@@ -264,6 +286,20 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
         if name == "admin/update-meta" {
             return freq::update_meta(&state, &body, token.as_deref()).await;
+        }
+        // ff-arena: persist meta."federation" on admin/update-meta before the
+        // note/freq lane arms apply their keys (MetaService.update partial
+        // patch; the ff-visibility.ts beforeAll flips it to 'all' and the AP
+        // /users/:id/{followers,following} collections gate on it). Errors
+        // return; success falls through so the other lanes' keys keep landing.
+        if name == "admin/update-meta" && body.get("federation").is_some() {
+            if let Err(resp) = ff_vis::persist_federation(&state, &body, token.as_deref()).await {
+                return resp;
+            }
+        }
+        // ff-arena arms: users/followers + users/following lists
+        if ff_vis::FF_ENDPOINTS.contains(&name.as_str()) {
+            return ff_vis::route(&state, name.as_str(), &body, token.as_deref()).await;
         }
         return users_show(&state, &body, token).await;
     }
@@ -569,7 +605,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     let result: Value = match name.as_str() {
         "ping" => json!({ "pong": now_ms() }),
         "meta" => meta(&state),
-        "endpoints" => json!(M0_ENDPOINTS),
+        // endpoints-arena: upstream Endpoints endpoint (endpoints/endpoints.ts)
+        // returns `endpoints.map(x => x.name)` — the FULL registry in
+        // endpoint-list.ts order, requireCredential: false, admin/* included.
+        "endpoints" => json!(endpoints_catalog::ENDPOINT_CATALOG),
         "stats" => stats(&state).await,
         "server-info" => server_info(),
         "get-online-users-count" => json!({ "count": 0 }),
@@ -911,19 +950,27 @@ async fn signin_route(state: &AppState, body: &Value) -> Response {
         }
     };
 
-    // password flow: SigninFlowResponse { finished } variants
-    let Some(password) = body.get("password").and_then(|v| v.as_str()) else {
-        return (
-            StatusCode::OK,
-            Json(json!({ "finished": false, "next": "captcha" })),
-        )
-            .into_response();
+    // password flow: SigninFlowResponse { finished } variants. A present
+    // non-string password (endpoints.ts クエリをインジェクションできない —
+    // `password: { $gt: '' }`) is a 400 with an EMPTY body
+    // (SigninApiService.ts L162-165 `typeof password !== 'string'`), not the
+    // next-step 200 — the e2e signin-flow injection assert depends on it.
+    let password = match body.get("password") {
+        None | Some(Value::Null) => {
+            return (
+                StatusCode::OK,
+                Json(json!({ "finished": false, "next": "captcha" })),
+            )
+                .into_response();
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     let same = profile
         .password
         .as_deref()
-        .map(|h| mk_core::services::verify_password(password, h).unwrap_or(false))
+        .map(|h| mk_core::services::verify_password(&password, h).unwrap_or(false))
         .unwrap_or(false);
 
     if !same {
@@ -1367,35 +1414,6 @@ fn opt_bool(body: &Value, key: &str) -> Result<Option<bool>, Response> {
     }
 }
 
-/// `FOLLOW_APPROVAL_MAX_SECONDS` (i/update.ts L139): `30 * 24 * 60 * 60` —
-/// the follow-approval param range ceiling.
-const FOLLOW_APPROVAL_MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
-
-/// follow-approval param (`{ type: 'integer', nullable: true, minimum: 0,
-/// maximum: FOLLOW_APPROVAL_MAX_SECONDS }`): absent → skip, null → reset to
-/// NULL, non-integer (1.5) / out-of-range (-1, 2592001) → INVALID_PARAM 400
-/// (the follow-approval.ts 不正な期間 legs).
-fn opt_approval_seconds(body: &Value, key: &str) -> Result<Option<Option<i32>>, Response> {
-    match body.get(key) {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(Value::Number(n)) => {
-            let secs = match n.as_i64() {
-                Some(s) => s,
-                None => return Err(invalid_param(key, "must be integer")),
-            };
-            if !(0..=FOLLOW_APPROVAL_MAX_SECONDS).contains(&secs) {
-                return Err(invalid_param(
-                    key,
-                    &format!("must be >= 0 and <= {FOLLOW_APPROVAL_MAX_SECONDS}"),
-                ));
-            }
-            Ok(Some(Some(secs as i32)))
-        }
-        Some(_) => Err(invalid_param(key, "must be an integer or null")),
-    }
-}
-
 fn opt_enum(body: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, Response> {
     match body.get(key) {
         None => Ok(None),
@@ -1571,8 +1589,6 @@ fn parse_profile_update(body: &Value) -> Result<mk_db::user::ProfileUpdate, Resp
         muted_instances,
         email_notification_types,
         notification_recieve_config,
-        follow_approval_local_seconds: opt_approval_seconds(body, "followApprovalLocalSeconds")?,
-        follow_approval_remote_seconds: opt_approval_seconds(body, "followApprovalRemoteSeconds")?,
     })
 }
 
@@ -1645,15 +1661,6 @@ async fn i_update(state: &AppState, body: &Value, token: Option<String>) -> Resp
     if let Err(e) = mk_db::user::update_profile_subset(pool, &me_id, &update).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_profile_subset");
         return api_err(ApiError::internal_error());
-    }
-
-    // i/update.ts L556 (鍵垢を解除したとき、期間による承認条件も考慮してフォ
-    // ローリクエストを承認): locking OFF re-checks every pending request to
-    // me through shouldRequireFollowApproval against the UPDATED profile
-    // (the approval-window flip rides the same update) and
-    // autoAcceptFollowed; accepted legs follow, the still-pending ones stay.
-    if row.is_locked && update.is_locked == Some(false) {
-        social::accept_all_follow_requests(pool, &me_id).await;
     }
     if let Err(e) = mk_db::user::update_avatar_banner(pool, &me_id, avatar_op, banner_op).await {
         tracing::error!(target: "dbg_i_update", error = %e, "update_avatar_banner");
@@ -3937,6 +3944,40 @@ async fn notifications_mark_all_as_read(state: &AppState, token: Option<String>)
         return api_err(ApiError::internal_error());
     }
     (StatusCode::NO_CONTENT).into_response()
+}
+
+/// `GET /url` — the URL preview route (upstream ClientServerService
+/// fastify.get '/url' → UrlPreviewService.handle). 400 when the `url` query
+/// param is missing (UrlPreviewService.ts L59-63 — empty body); otherwise the
+/// summaly fetch is out of scope for this server (no outbound HTTP client),
+/// so the request mirrors the catch-arm L124-136: 422 +
+/// `URL_PREVIEW_FAILED` with `Cache-Control: max-age=86400, immutable`
+/// (endpoints.ts URL preview 422 assert hits the invalid host e:xample.com).
+pub(crate) async fn url_preview(
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Response {
+    let has_url = raw_query
+        .as_deref()
+        .map(|q| {
+            q.split('&')
+                .any(|pair| pair.split('=').next().map(|k| k == "url").unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if !has_url {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        [(header::CACHE_CONTROL, "max-age=86400, immutable")],
+        Json(json!({
+            "error": {
+                "message": "Failed to get preview",
+                "code": "URL_PREVIEW_FAILED",
+                "id": "09d01cb5-53b9-4856-82e5-38a50c290a3b",
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

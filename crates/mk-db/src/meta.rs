@@ -111,6 +111,74 @@ pub async fn update_meta_enable_fanout_timeline(
     Ok(())
 }
 
+/// NodeinfoServerService.nodeinfo2 meta slice — the columns the nodeinfo
+/// document mirrors (well-known arena; MetaService.fetch(true) semantics:
+/// the sentinel row is ensured on read, absent columns fall back to the
+/// 0001-baseline/TypeORM defaults). (meta."federation" read/update ride the
+/// ff-visibility lane: mk-db/src/ff_visibility.rs::meta_federation /
+/// update_meta_federation.)
+#[derive(Debug, sqlx::FromRow)]
+pub struct MetaNodeinfoRow {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[sqlx(rename = "maintainerName")]
+    pub maintainer_name: Option<String>,
+    #[sqlx(rename = "maintainerEmail")]
+    pub maintainer_email: Option<String>,
+    #[sqlx(rename = "disableRegistration")]
+    pub disable_registration: bool,
+    pub langs: Vec<String>,
+    #[sqlx(rename = "termsOfServiceUrl")]
+    pub terms_of_service_url: Option<String>,
+    #[sqlx(rename = "privacyPolicyUrl")]
+    pub privacy_policy_url: Option<String>,
+    #[sqlx(rename = "inquiryUrl")]
+    pub inquiry_url: Option<String>,
+    #[sqlx(rename = "impressumUrl")]
+    pub impressum_url: Option<String>,
+    #[sqlx(rename = "repositoryUrl")]
+    pub repository_url: String,
+    #[sqlx(rename = "feedbackUrl")]
+    pub feedback_url: String,
+    #[sqlx(rename = "emailRequiredForSignup")]
+    pub email_required_for_signup: bool,
+    #[sqlx(rename = "enableHcaptcha")]
+    pub enable_hcaptcha: bool,
+    #[sqlx(rename = "enableRecaptcha")]
+    pub enable_recaptcha: bool,
+    #[sqlx(rename = "enableMcaptcha")]
+    pub enable_mcaptcha: bool,
+    #[sqlx(rename = "enableTurnstile")]
+    pub enable_turnstile: bool,
+    #[sqlx(rename = "enableEmail")]
+    pub enable_email: bool,
+    #[sqlx(rename = "enableServiceWorker")]
+    pub enable_service_worker: bool,
+    #[sqlx(rename = "themeColor")]
+    pub theme_color: Option<String>,
+    pub policies: serde_json::Value,
+}
+
+/// MetaService.fetch(true) mirror: ensures the sentinel row ('x') then
+/// returns the latest row (fetch with allowCache is called through this
+/// path by nodeinfo2 and the /.well-known/* federation gates).
+pub async fn fetch_nodeinfo_meta(pool: &PgPool) -> Result<MetaNodeinfoRow, sqlx::Error> {
+    sqlx::query(r#"INSERT INTO "meta" ("id") VALUES ('x') ON CONFLICT ("id") DO NOTHING"#)
+        .execute(pool)
+        .await?;
+    sqlx::query_as::<_, MetaNodeinfoRow>(
+        r#"SELECT "name", "description", "maintainerName", "maintainerEmail",
+                  "disableRegistration", "langs", "termsOfServiceUrl", "privacyPolicyUrl",
+                  "inquiryUrl", "impressumUrl", "repositoryUrl", "feedbackUrl",
+                  "emailRequiredForSignup", "enableHcaptcha", "enableRecaptcha",
+                  "enableMcaptcha", "enableTurnstile", "enableEmail", "enableServiceWorker",
+                  "themeColor", "policies"
+           FROM "meta" ORDER BY "id" DESC LIMIT 1"#,
+    )
+    .fetch_one(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,6 +30,7 @@ fn test_state(pool: mk_db::sqlx::PgPool) -> crate::AppState {
             db: None,
             redis: None,
             test: true,
+            version: None,
         },
         pool: Some(pool),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
@@ -7024,6 +7025,7 @@ async fn ftt2_redis_home_timeline_push_shape() {
         db: None,
         redis: Some(redis_cfg.clone()),
         test: true,
+        version: None,
     };
     // The e2e probes ride ioredis `keyPrefix: '<url.host>:'` (config.ts
     // convertRedisOptions L378 — see ftt.rs module doc), so the probes must
@@ -7148,6 +7150,7 @@ async fn ftt3_e2e_keyprefix_parity_probe() {
         db: None,
         redis: Some(redis_cfg.clone()),
         test: true,
+        version: None,
     };
     // same ioredis keyPrefix shape as ftt2 — the exact name the pinned e2e
     // `redisForTimelines.exists/lrange` computes for the followee's HTL.
@@ -8020,9 +8023,7 @@ async fn clips_arena_crud_favorite_notes() {
     mk_db::run_migrations(&pool).await.unwrap();
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
-    // cross-lane compile triage (block lane): the pool is re-borrowed by the
-    // asserts below, so the AppState must clone it (E0382 borrow of moved)
-    let app = crate::build_router(test_state(pool.clone()));
+    let app = crate::build_router(test_state(pool));
     let (_, v) = post_json(
         app.clone(),
         "/api/signup",
@@ -8379,302 +8380,265 @@ async fn ff_visibility_list_gates_and_ap_collections() {
     let _ = (b_id, pool);
 }
 
-// ===== approval-arena: follow-approval windows (follow-approval.ts) =========
-//
-// followApprovalLocalSeconds/RemoteSeconds are Me-detailed profile settings
-// (i/update.ts paramDef: nullable integer 0..=FOLLOW_APPROVAL_MAX_SECONDS
-// 2592000) that hold a fresh local follower's following/create as a pending
-// request (shouldRequireFollowApproval); flipping isLocked false in i/update
-// re-adjudicates every pending request against the UPDATED settings
-// (UserFollowingService.acceptAllFollowRequests L619) — expired-window and
-// null/0 flips accept, the not-yet-expired ones stay pending unless
-// autoAcceptFollowed covers them.
+// ============================================================================
+// well-known arena: /.well-known/* + /nodeinfo/* routes ride OUTSIDE /api/*
+// (upstream test/e2e/well-known.ts — e2e-well-known workflow). Mirrors
+// WellKnownServerService (hook headers, 204 preflight, JRD webfinger, XRD
+// host-meta, RFC8414 oauth metadata) + NodeinfoServerService (links relay +
+// 2.0/2.1 documents). The beforeAll federation flip rides admin/update-meta.
+// ============================================================================
 
+/// GET/OPTIONS probe that keeps the response headers — the well-known asserts
+/// are strict string compares on Access-Control-* / Vary / content-type.
+#[allow(dead_code)]
+async fn request_raw(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+#[allow(dead_code)]
+fn hdr(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// well-known assert 1 (nodeinfo): the /.well-known/nodeinfo links relay —
+/// NodeinfoServerService.getLinks shape (2.1 then 2.0, `{origin}/nodeinfo/*`
+/// hrefs) under Access-Control-Allow-Origin: *.
 #[tokio::test]
-async fn approval_arena_i_update_seconds_roundtrip_validation_and_privacy() {
+async fn well_known_nodeinfo_links() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = fresh_pool("mkapprovset").await;
-    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let pool = fresh_pool("mkwellknown1").await;
     let app = crate::build_router(test_state(pool.clone()));
 
-    let alice = signup(&app, &uname("apa")).await;
+    // well-known.ts beforeAll: signup alice + admin/update-meta federation all
+    let alice = signup(&app, "alice").await;
+    let a_token = alice["token"].as_str().unwrap();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "federation": "all", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "update-meta must 204");
+
+    let (s, h, body) = request_raw(&app, "GET", "/.well-known/nodeinfo").await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(hdr(&h, "access-control-allow-origin").as_deref(), Some("*"));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "links": [{
+                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
+                "href": "http://127.0.0.1:3000/nodeinfo/2.1",
+            }, {
+                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.0",
+                "href": "http://127.0.0.1:3000/nodeinfo/2.0",
+            }],
+        }),
+        "nodeinfo links relay: {v}"
+    );
+
+    // the 2.1/2.0 documents the links point at: software.name 'misskey' +
+    // profile'd content types + REAL usage counts from postgres (alice ⇒ 1).
+    let (s, h21, body) = request_raw(&app, "GET", "/nodeinfo/2.1").await;
+    assert_eq!(s, StatusCode::OK, "nodeinfo/2.1 body: {body}");
+    assert_eq!(
+        hdr(&h21, "content-type").as_deref(),
+        Some("application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"")
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["version"], json!("2.1"));
+    assert_eq!(v["software"]["name"], json!("misskey"));
+    assert_eq!(v["usage"]["users"]["total"], json!(1), "real users count");
+    let (s, h20, body) = request_raw(&app, "GET", "/nodeinfo/2.0").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        hdr(&h20, "content-type").as_deref(),
+        Some("application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.0#\"")
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["version"], json!("2.0"));
+    assert!(
+        v["software"].get("repository").is_none(),
+        "2.0 deletes software.repository: {v}"
+    );
+
+    let _ = pool;
+}
+
+/// well-known assert 2 (webfinger): OPTIONS preflight → 204 with
+/// `Access-Control-Allow-Headers: Accept`; GET JRD — subject + the exact
+/// three links (self /users/:id, profile-page, ostatus subscribe template),
+/// Vary: Accept exposed through Access-Control-Expose-Headers.
+#[tokio::test]
+async fn well_known_webfinger_jrd() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkwellknown2").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
     let a_token = alice["token"].as_str().unwrap();
     let a_id = alice["id"].as_str().unwrap();
-
-    // 初期値は null (follow-approval.ts test 1, first assert)
-    let (s, v) = post_json(app.clone(), "/api/i", json!({ "i": a_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["followApprovalLocalSeconds"], json!(null), "body: {v}");
-    assert_eq!(v["followApprovalRemoteSeconds"], json!(null), "body: {v}");
-
-    // update both, then reset local → remote preserved, response carries both
-    let (s, v) = post_json(
+    let (s, _) = post_json(
         app.clone(),
-        "/api/i/update",
-        json!({ "followApprovalLocalSeconds": 43200, "followApprovalRemoteSeconds": 86400, "i": a_token }),
+        "/api/admin/update-meta",
+        json!({ "federation": "all", "i": a_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["followApprovalLocalSeconds"], json!(43200), "body: {v}");
-    assert_eq!(v["followApprovalRemoteSeconds"], json!(86400), "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "followApprovalLocalSeconds": null, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["followApprovalLocalSeconds"], json!(null), "body: {v}");
-    assert_eq!(v["followApprovalRemoteSeconds"], json!(86400), "body: {v}");
+    assert_eq!(s, StatusCode::NO_CONTENT);
 
-    // 不正な期間を拒否する: -1 / 1.5 / 2592001 → 400 (both keys)
-    for seconds in [-1_i64, 2592001] {
-        for key in ["followApprovalLocalSeconds", "followApprovalRemoteSeconds"] {
-            let (s, v) = post_json(
-                app.clone(),
-                "/api/i/update",
-                json!({ key: seconds, "i": a_token }),
-            )
-            .await;
-            assert_eq!(
-                s,
-                StatusCode::BAD_REQUEST,
-                "seconds={seconds} key={key} body: {v}"
-            );
-        }
-    }
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "followApprovalLocalSeconds": 1.5, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "fractional seconds: {v}");
-
-    // 本人以外には公開されない: public users/show pack omits both keys
-    let (s, v) = post_json(app.clone(), "/api/users/show", json!({ "userId": a_id })).await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert!(
-        v.get("followApprovalLocalSeconds").is_none(),
-        "must not leak on the public pack: {v}"
+    let path = "/.well-known/webfinger?resource=acct:alice@127.0.0.1:3000";
+    let (s, h, _) = request_raw(&app, "OPTIONS", path).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "preflight must 204");
+    assert_eq!(
+        hdr(&h, "access-control-allow-headers").as_deref(),
+        Some("Accept")
     );
-    assert!(
-        v.get("followApprovalRemoteSeconds").is_none(),
-        "must not leak on the public pack: {v}"
+
+    let (s, h, body) = request_raw(&app, "GET", path).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(hdr(&h, "access-control-allow-origin").as_deref(), Some("*"));
+    assert_eq!(
+        hdr(&h, "access-control-expose-headers").as_deref(),
+        Some("Vary")
     );
+    assert_eq!(hdr(&h, "vary").as_deref(), Some("Accept"));
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/jrd+json")
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "subject": "acct:alice@127.0.0.1:3000",
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("http://127.0.0.1:3000/users/{a_id}"),
+            }, {
+                "rel": "http://webfinger.net/rel/profile-page",
+                "type": "text/html",
+                "href": "http://127.0.0.1:3000/@alice",
+            }, {
+                "rel": "http://ostatus.org/schema/1.0/subscribe",
+                "template": "http://127.0.0.1:3000/authorize-follow?acct={uri}",
+            }],
+        }),
+        "webfinger JRD: {v}"
+    );
+
+    // the 404 leg: unknown local resources miss with the upstream status
+    let (s, _, _) = request_raw(
+        &app,
+        "GET",
+        "/.well-known/webfinger?resource=acct:ghost@127.0.0.1:3000",
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 
     let _ = pool;
 }
 
+/// well-known assert 3 (host-meta + oauth): XRD host-meta (xrd content type,
+/// lrdd link template), host-meta.json LRD/JRD template deep-equal, and the
+/// RFC8414 issuer/authorization/token endpoints.
 #[tokio::test]
-async fn approval_arena_fresh_follower_pends_then_manual_accept_204() {
+async fn well_known_hostmeta_and_oauth() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = fresh_pool("mkapprovpending").await;
-    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let pool = fresh_pool("mkwellknown3").await;
     let app = crate::build_router(test_state(pool.clone()));
 
-    let receiver = signup(&app, &uname("apr")).await;
-    let follower = signup(&app, &uname("apf")).await;
-    let (r_id, r_token) = (
-        receiver["id"].as_str().unwrap(),
-        receiver["token"].as_str().unwrap(),
-    );
-    let (f_id, f_token) = (
-        follower["id"].as_str().unwrap(),
-        follower["token"].as_str().unwrap(),
-    );
+    let alice = signup(&app, "alice").await;
+    let a_token = alice["token"].as_str().unwrap();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/update-meta",
+        json!({ "federation": "all", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
 
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "followApprovalLocalSeconds": 43200, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-
-    // 作成直後のローカルユーザーからのフォローを保留: 200 + pending, no follow
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/following/create",
-        json!({ "userId": r_id, "i": f_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/users/show",
-        json!({ "userId": r_id, "i": f_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["isFollowing"], json!(false), "body: {v}");
+    let (s, h, body) = request_raw(&app, "GET", "/.well-known/host-meta").await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(hdr(&h, "access-control-allow-origin").as_deref(), Some("*"));
     assert_eq!(
-        v["hasPendingFollowRequestFromYou"],
-        json!(true),
-        "body: {v}"
-    );
-
-    // 手動で承認: 204 → following edge + request swept
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/following/requests/accept",
-        json!({ "userId": f_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/users/show",
-        json!({ "userId": r_id, "i": f_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["isFollowing"], json!(true), "body: {v}");
-    assert_eq!(
-        v["hasPendingFollowRequestFromYou"],
-        json!(false),
-        "body: {v}"
+        hdr(&h, "content-type").as_deref(),
+        Some("application/xrd+xml")
     );
     assert!(
-        mk_db::social::following_exists(&pool, f_id, r_id)
-            .await
-            .unwrap(),
-        "follow edge written by the manual accept"
+        body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "<Link rel=\"lrdd\" type=\"application/xrd+xml\" template=\"http://127.0.0.1:3000/.well-known/webfinger?resource={uri}\"/>"
+        ),
+        "{body}"
     );
 
-    let _ = pool;
-}
-
-#[tokio::test]
-async fn approval_arena_unlock_readjudicates_pending_requests() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = fresh_pool("mkapprovunlock").await;
-    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
-    let app = crate::build_router(test_state(pool.clone()));
-
-    let receiver = signup(&app, &uname("aur")).await;
-    let bob = signup(&app, &uname("aub")).await;
-    let carol = signup(&app, &uname("auc")).await;
-    let dan = signup(&app, &uname("aud")).await;
-    let (r_id, r_token) = (
-        receiver["id"].as_str().unwrap(),
-        receiver["token"].as_str().unwrap(),
-    );
-    let (b_id, b_token) = (bob["id"].as_str().unwrap(), bob["token"].as_str().unwrap());
-    let (c_id, c_token) = (
-        carol["id"].as_str().unwrap(),
-        carol["token"].as_str().unwrap(),
-    );
-    let d_token = dan["token"].as_str().unwrap();
-    let d_id = dan["id"].as_str().unwrap();
-
-    // leg 1 (指定期間を経過した相手は鍵の解除時に承認される): bob pends under
-    // a 1s window, the window expires, the unlock accepts him.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "isLocked": true, "followApprovalLocalSeconds": 1, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/following/create",
-        json!({ "userId": r_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    // leg 2 (鍵を解除しても指定期間に達していない相手は保留される): carol pends
-    // under a 30d window — the SAME unlock must leave her pending.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/following/create",
-        json!({ "userId": r_id, "i": c_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "isLocked": false, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/users/show",
-        json!({ "userId": r_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, _, body) = request_raw(&app, "GET", "/.well-known/host-meta.json").await;
+    assert_eq!(s, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        v["isFollowing"],
-        json!(true),
-        "expired window accepted: {v}"
+        v,
+        json!({
+            "links": [{
+                "rel": "lrdd",
+                "type": "application/jrd+json",
+                "template": "http://127.0.0.1:3000/.well-known/webfinger?resource={uri}",
+            }],
+        }),
+        "{v}"
+    );
+
+    let (s, _, body) = request_raw(&app, "GET", "/.well-known/oauth-authorization-server").await;
+    assert_eq!(s, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["issuer"], json!("http://127.0.0.1:3000"));
+    assert_eq!(
+        v["authorization_endpoint"],
+        json!("http://127.0.0.1:3000/oauth/authorize")
     );
     assert_eq!(
-        v["hasPendingFollowRequestFromYou"],
-        json!(false),
-        "body: {v}"
-    );
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/users/show",
-        json!({ "userId": r_id, "i": c_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(
-        v["isFollowing"],
-        json!(false),
-        "fresh-window request stays pending: {v}"
-    );
-    assert_eq!(
-        v["hasPendingFollowRequestFromYou"],
-        json!(true),
-        "body: {v}"
-    );
-
-    // leg 3 (鍵の解除と同時に期間を null に変更すると承認される): dan's request
-    // rides an unlock that also clears the window in the SAME i/update.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/following/create",
-        json!({ "userId": r_id, "i": d_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/i/update",
-        json!({ "isLocked": false, "followApprovalLocalSeconds": null, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/users/show",
-        json!({ "userId": r_id, "i": d_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {v}");
-    assert_eq!(v["isFollowing"], json!(true), "null flip accepts dan: {v}");
-    assert_eq!(
-        v["hasPendingFollowRequestFromYou"],
-        json!(false),
-        "body: {v}"
+        v["token_endpoint"],
+        json!("http://127.0.0.1:3000/oauth/token")
     );
 
     let _ = pool;
