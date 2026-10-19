@@ -289,16 +289,18 @@ pub async fn files_find_by_md5(
     .await
 }
 
-/// `drive/files/check-existence.ts`: EXISTS(md5 + userId).
+/// `drive/files/check-existence.ts`: EXISTS(md5 + userId). `SELECT EXISTS`
+/// always yields exactly one row, so `fetch_one` cannot miss (the defensive
+/// Option here does not typecheck — a query_as row type must impl FromRow).
 pub async fn md5_exists(pool: &PgPool, user_id: &str, md5: &str) -> Result<bool, sqlx::Error> {
-    let hit: Option<(bool,)> = sqlx::query_as(
+    let hit: (bool,) = sqlx::query_as(
         r#"SELECT EXISTS(SELECT 1 FROM "drive_file" WHERE "md5" = $1 AND "userId" = $2)"#,
     )
     .bind(md5)
     .bind(user_id)
     .fetch_one(pool)
     .await?;
-    Ok(hit.map(|(v,)| v).unwrap_or(false))
+    Ok(hit.0)
 }
 
 /// `drive/files/show.ts` `findOneBy([{ url }, { webpublicUrl },
