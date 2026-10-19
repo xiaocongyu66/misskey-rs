@@ -618,7 +618,7 @@ async fn passes_local(
     }
 
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
@@ -702,7 +702,7 @@ async fn passes_home(
     }
 
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
@@ -796,7 +796,7 @@ async fn passes_hybrid(
     }
 
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
@@ -830,7 +830,7 @@ async fn passes_global(
 
     let sets = viewer_sets(pool, &sub.user_id).await;
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
@@ -915,7 +915,7 @@ async fn passes_user_list(
     }
 
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
@@ -955,7 +955,7 @@ async fn passes_hashtag(
 
     let sets = viewer_sets(pool, &sub.user_id).await;
     let hosts = settled_hosts(pool, note, hosts_cell, &sets).await;
-    if is_note_muted_or_blocked(note, &sets, hosts.as_deref()) {
+    if is_note_muted_or_blocked(note, &sets, hosts.as_ref()) {
         return false;
     }
     true
