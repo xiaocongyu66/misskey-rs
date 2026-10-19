@@ -52,20 +52,58 @@ pub fn build_router(state: AppState) -> Router {
     // OAuth2ProviderService.createServer under the /oauth prefix; CORS is
     // handled per-handler — only the token server is @fastify/cors-wrapped).
     let oauth = Router::new().route("/oauth/{*rest}", any(api::oauth::dispatch));
+    // arena-fetchres: the GET web surfaces OUTSIDE /api the pinned
+    // test/e2e/fetch-resource.ts drives (upstream ClientServerService.ts +
+    // ActivityPubServerService.ts). /notes/{id} swaps its plain-AP handler
+    // for the apOrHtml negotiation (HTML arm renders the note page; the AP
+    // arm still rides api::ap_note); /streaming swaps to a non-upgrade 503
+    // arm (upstream fastify.get '/streaming') that passes WS upgrades through.
+    let fetch_resource = Router::new()
+        .route("/@{*acct}", get(api::fetch_resource::at_dispatch))
+        .route("/users/{user}", get(api::fetch_resource::users_get))
+        .route("/users/{user}/outbox", get(api::fetch_resource::ap_outbox))
+        .route("/play/{id}", get(api::fetch_resource::play_get))
+        .route("/clips/{clip}", get(api::fetch_resource::clips_get))
+        .route("/gallery/{post}", get(api::fetch_resource::gallery_get))
+        .route("/channels/{channel}", get(api::fetch_resource::channel_get))
+        .route("/robots.txt", get(api::fetch_resource::robots_txt))
+        .route("/opensearch.xml", get(api::fetch_resource::opensearch))
+        .route("/api.json", get(api::fetch_resource::api_json))
+        .route("/favicon.ico", get(api::fetch_resource::favicon))
+        .route(
+            "/apple-touch-icon.png",
+            get(api::fetch_resource::apple_touch_icon),
+        )
+        .route("/twemoji/{*path}", get(api::fetch_resource::twemoji))
+        .route(
+            "/twemoji-badge/{*path}",
+            get(api::fetch_resource::twemoji_badge),
+        )
+        .route(
+            "/fluent-emoji/{*path}",
+            get(api::fetch_resource::fluent_emoji),
+        )
+        .route("/bios", get(api::fetch_resource::bios))
+        .route("/cli", get(api::fetch_resource::cli))
+        .route("/flush", get(api::fetch_resource::flush))
+        .route("/_info_card_", get(api::fetch_resource::info_card));
     Router::new()
         .merge(api)
         .merge(well_known)
         .merge(oauth)
+        .merge(fetch_resource)
         // streaming websocket hub (drive-agent2: publishMainStream /
         // urlUploadFinished — upstream StreamingApiServerService entry).
-        .route("/streaming", get(api::drive::streaming::entry))
+        .route("/streaming", get(api::fetch_resource::streaming_get))
         // ff-arena: the AP collections the ff-visibility.ts AP probes hit
         // (upstream ActivityPubServerService.ts /users/:user/{following,followers}).
         .route("/users/{user}/following", get(api::ff_vis::ap_following))
         .route("/users/{user}/followers", get(api::ff_vis::ap_followers))
         // endpoints-arena: the AP note Document the drive/files/create
-        // getWebpublicType legs probe (ActivityPubServerService /notes/:id).
-        .route("/notes/{id}", get(api::ap_note))
+        // getWebpublicType legs probe — arena-fetchres now negotiates the
+        // HTML mini-render arm upstream serves otherwise (ClientServerService
+        // /notes/:note SSR + ActivityPubServerService apOrHtml constraint).
+        .route("/notes/{id}", get(api::fetch_resource::notes_get))
         // endpoints-arena: the /url preview route (ClientServerService.ts
         // L450 fastify.get '/url' → UrlPreviewService.handle; sits outside
         // /api like the upstream web server).
@@ -74,6 +112,10 @@ pub fn build_router(state: AppState) -> Router {
         // files are fetched through (upstream FileServerService /files/*).
         .route("/files/{*rest}", get(api::exports::files_serve))
         .route("/healthz", get(healthz))
+        // arena-fetchres: the fastify.get('*') renderBase tail (also the
+        // POST-only /inbox + /users/:id/inbox GET rows — they fall through to
+        // the client ' catch-all upstream).
+        .fallback(api::fetch_resource::fallback)
         .layer(middleware::from_fn(json_utf8_charset))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)

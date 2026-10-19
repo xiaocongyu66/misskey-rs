@@ -883,6 +883,44 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END antennas-v2 DISPATCH ARM ====
 
+    // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
+    // gallery/posts/create) ====
+    // The beforeAll create fixtures the pinned test/e2e/fetch-resource.ts
+    // needs that were still catalog-only. Self-contained block on the
+    // clips-arm pattern: method check, body parsing, token extraction and the
+    // credential-declared probe live in this arm; the requireCredential gate
+    // + fixture bodies in api::fetch_resource (SQL on the upstream page /
+    // flash / gallery_post tables the 0001 init already carries). None of the
+    // 3 names collide with an earlier arm, so this shadows nothing.
+    if fetch_resource::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return fetch_resource::api_create(&state, name.as_str(), &body, token, credential_declared)
+            .await;
+    }
+    // ==== END arena-fetchres DISPATCH ARM ====
+
     // ==== arena-api DISPATCH ARM (test + miauth/gen-token) ====
     // api.ts arena on the clips-arm pattern: method check, JSON body parse
     // and token extraction live here; the paramDef roundtrip
@@ -4913,3 +4951,11 @@ mod admin;
 /// `api/stream_auth.rs` owns both; mod.rs only registers the module and the
 /// single dispatch arm above).
 mod stream_auth;
+
+/// arena-fetchres: the GET routes OUTSIDE /api/* (upstream
+/// test/e2e/fetch-resource.ts — e2e-fetch-resource workflow). Module file
+/// `api/fetch_resource.rs` owns the negotiated web/AP surfaces
+/// (ClientServerService SSR pages + feeds + assets, ActivityPubServerService
+/// apOrHtml arms) and the pages{,/flash,{,gallery}/posts}/create fixtures;
+/// mod.rs only registers the module and the single dispatch arm above.
+mod fetch_resource;
