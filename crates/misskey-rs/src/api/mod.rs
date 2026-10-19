@@ -94,6 +94,11 @@ pub(crate) mod ff_vis;
 // mint (upstream endpoints/test.ts + endpoints/miauth/gen-token.ts; the
 // api.ts General-validation suite + createAppToken fixtures).
 mod miauth;
+// arena-oauth: OAuth2 provider flows (upstream server/oauth/* + test/e2e/
+// oauth.ts) — /oauth/{authorize,decision,token} routes + the PKCE grant
+// caches + the access-token bearer resolution the notes/create kind gate
+// reuses.
+pub(crate) mod oauth;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -156,6 +161,14 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
         if key == "MISSKEY_TEST_CHECK_DUPLICATED_TOTP" {
             mk_db::two_factor::set_check_duplicated_totp(value == "1");
+        }
+        // ==== arena-oauth: MISSKEY_TEST_CHECK_IP_RANGE toggle ====
+        // Upstream reads process.env.MISSKEY_TEST_CHECK_IP_RANGE inside
+        // OAuth2ProviderService.#resolveAuthorizationRequest (the /oauth/
+        // authorize loopback guard); the harness controller forwards the
+        // toggle here exactly like the TOTP one above.
+        if key == "MISSKEY_TEST_CHECK_IP_RANGE" {
+            crate::api::oauth::set_check_ip_range(value == "1");
         }
         return (StatusCode::OK, Json(json!({ "success": true }))).into_response();
     }
@@ -2834,13 +2847,59 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         return api_err(ApiError::internal_error());
     };
     let Some(me_id) = resolve_me(pool, token.as_deref()).await else {
-        return api_err(ApiError::new(
-            401,
-            mk_types::api_error::ApiErrorKind::Client,
-            "AUTHENTICATION_FAILED",
-            "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
-            "Authentication failed. Please ensure your token is correct.",
-        ));
+        // ==== arena-oauth: AuthenticateService non-native branch ====
+        // Non-16-length tokens resolve through the access_token table
+        // (hash/token OR lookup) into (user, permission list); the
+        // notes/create ep.meta.kind='write:notes' gate then rides the
+        // ApiCallService.call L465 permission check. A token that resolves
+        // to nothing keeps the AUTHENTICATION_FAILED 401.
+        let oauth_row = match token.as_deref().filter(|t| t.len() != 16) {
+            Some(t) => match crate::api::oauth::resolve_access_token(pool, t).await {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::error!(target: "dbg_oauth", error = %e, "resolve_access_token");
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(row) = oauth_row else {
+            return api_err(ApiError::new(
+                401,
+                mk_types::api_error::ApiErrorKind::Client,
+                "AUTHENTICATION_FAILED",
+                "b0a7f5f8-dc2f-4171-b91f-de88ad238e14",
+                "Authentication failed. Please ensure your token is correct.",
+            ));
+        };
+        // requireCredential gates ride the resolved owner (suspension first,
+        // then the kind permission gate — ApiCallService.call L411/L465).
+        let owner = match mk_db::user::find_user_by_id(pool, &row.user_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: "dbg_oauth", error = %e, "find_user_by_id");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        if owner.map(|o| o.is_suspended).unwrap_or(true) {
+            return api_err(ApiError::new(
+                403,
+                mk_types::api_error::ApiErrorKind::Permission,
+                "YOUR_ACCOUNT_SUSPENDED",
+                "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                "Your account has been suspended.",
+            ));
+        }
+        if !row.permission.iter().any(|p| p == "write:notes") {
+            return api_err(ApiError::new(
+                403,
+                mk_types::api_error::ApiErrorKind::Permission,
+                "PERMISSION_DENIED",
+                "1370e5b7-d4eb-4566-bb1d-7748ee6a1838",
+                "Your app does not have the necessary permissions to use this endpoint.",
+            ));
+        }
+        row.user_id
     };
 
     // social-agent: renote path — upstream notes/create renoteId param with

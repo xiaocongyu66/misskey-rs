@@ -11051,3 +11051,255 @@ fn hex20(s: &str) -> [u8; 20] {
     }
     out
 }
+
+// ==== arena-oauth (_test tail) ====
+// upstream test/e2e/oauth.ts pins: PKCE S256 verify bytes, the /oauth/*
+// route skeleton (501 unsupported_response_type direct + 404
+// UNKNOWN_OAUTH_ENDPOINT + token-endpoint grant-type errors), and the
+// access_token bearer chain into notes/create (write:notes 200 /
+// insufficient_scope 403 / revoked 401).
+
+// arena-oauth: oneshot with method/uri/body/optional bearer → (status, body,
+// access-control-allow-origin, www-authenticate)
+#[allow(dead_code)]
+async fn oauth_oneshot(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    token: Option<&str>,
+) -> (StatusCode, Value, Option<String>, Option<String>) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = app
+        .oneshot(
+            builder
+                .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let www = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v, acao, www)
+}
+
+// arena-oauth: PKCE S256 — the deterministic pair the pinned spec's
+// 'Verify PKCE' describe block hardcodes.
+#[test]
+fn oauth_pkce_s256_verify_bytes() {
+    let code_verifier = "Ew8VSBiH59JirLlg7ocFpLQ6NXuFC1W_rn8gmRzBKc8";
+    let code_challenge = "4w2GDuvaxXlw2l46k5PFIoIcTGHdzw2i3hrn-C_Q6f7u0-nTYKd-beVEYy9XinYsGtAix.Nnvr.GByD3lAii2ibPRsSDrZgIN0YQb.kfevcfR9aDKoTLyOUm4hW4ABhs";
+    assert_eq!(
+        crate::api::oauth::s256_challenge(code_verifier),
+        code_challenge,
+        "BASE64URL(SHA256(verifier)) must equal the challenge (RFC7636 4.6)"
+    );
+    // the four invalid_grant tamper shapes: junk suffix, clip, replace, other
+    assert_ne!(
+        crate::api::oauth::s256_challenge(&format!("{code_verifier}x")),
+        code_challenge
+    );
+    assert_ne!(
+        crate::api::oauth::s256_challenge(&code_verifier[..40]),
+        code_challenge
+    );
+    assert_ne!(
+        crate::api::oauth::s256_challenge(&format!("{}{}", &code_verifier[..30], "x".repeat(8))),
+        code_challenge
+    );
+}
+
+// arena-oauth: /oauth/* route skeleton without a db — direct 501 on
+// response_type=token, token-endpoint grant-type errors under the CORS
+// allow-all, and the UNKNOWN_OAUTH_ENDPOINT catchall (upstream
+// createServer fastify.all('/*') + createTokenServer).
+#[tokio::test]
+async fn oauth_route_skeleton() {
+    let state = crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://misskey.local".to_string(),
+            db: None,
+            redis: None,
+            test: true,
+            version: None,
+        },
+        pool: None,
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+    };
+    let app = crate::build_router(state);
+
+    // Implicit grant → 501 unsupported_response_type, no CORS leak
+    let (status, v, acao, _) = oauth_oneshot(
+        app.clone(),
+        "GET",
+        "/oauth/authorize?response_type=token",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_eq!(v["error"], "unsupported_response_type", "body: {v}");
+    assert_eq!(acao, None, "authorize endpoint must not ride CORS");
+
+    // token endpoint: CORS-permissive (ACAO *) + grant_type errors
+    let (status, v, acao, _) = oauth_oneshot(app.clone(), "POST", "/oauth/token", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"], "invalid_request", "body: {v}");
+    assert_eq!(acao.as_deref(), Some("*"), "token endpoint CORS");
+
+    let (status, v, _, _) = oauth_oneshot(
+        app.clone(),
+        "POST",
+        "/oauth/token",
+        Some(json!({ "grant_type": "client_credentials" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"], "unsupported_grant_type", "body: {v}");
+
+    // unknown endpoint catchall
+    let (status, v, _, _) = oauth_oneshot(app.clone(), "GET", "/oauth/foo", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {v}");
+    assert_eq!(v["error"]["code"], "UNKNOWN_OAUTH_ENDPOINT", "body: {v}");
+}
+
+// arena-oauth: the access_token bearer chain into notes/create (upstream
+// AuthenticateService non-native branch + ApiCallService.call L465 kind
+// gate) — mint rows the way POST /oauth/token does, then ride Bearer creds.
+#[tokio::test]
+async fn oauth_bearer_scope_gate() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkoauth_bearer").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+
+    let username = format!("alice{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://misskey.local".to_string(),
+            db: None,
+            redis: None,
+            test: true,
+            version: None,
+        },
+        pool: Some(pool.clone()),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+    });
+
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let alice_id = v["id"].as_str().unwrap().to_string();
+
+    // mint rows exactly like the token endpoint insert
+    let write_token = mk_core::services::signup::secure_rndstr(128);
+    mk_db::access_token::insert(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        &write_token,
+        &alice_id,
+        None,
+        &["write:notes".to_string()],
+    )
+    .await
+    .unwrap();
+    let read_token = mk_core::services::signup::secure_rndstr(128);
+    mk_db::access_token::insert(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        &read_token,
+        &alice_id,
+        None,
+        &["read:account".to_string()],
+    )
+    .await
+    .unwrap();
+
+    // sufficient scope → 200, note owned by alice
+    let (status, v, _, www) = oauth_oneshot(
+        app.clone(),
+        "POST",
+        "/api/notes/create",
+        Some(json!({ "text": "test" })),
+        Some(&write_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        v["createdNote"]["user"]["username"],
+        username.as_str(),
+        "note owner rides the token owner"
+    );
+    assert_eq!(www, None, "success carries no challenge");
+
+    // insufficient scope → 403 PERMISSION_DENIED + insufficient_scope challenge
+    let (status, v, _, www) = oauth_oneshot(
+        app.clone(),
+        "POST",
+        "/api/notes/create",
+        Some(json!({ "text": "test" })),
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {v}");
+    assert_eq!(v["error"]["code"], "PERMISSION_DENIED", "body: {v}");
+    assert!(
+        www.as_deref().unwrap_or("").starts_with(
+            "Bearer realm=\"Misskey\", error=\"insufficient_scope\", error_description"
+        ),
+        "www-authenticate: {www:?}"
+    );
+
+    // revoked token (row deleted post-grant) → 401 invalid_token shape
+    mk_db::sqlx::query(r#"DELETE FROM "access_token" WHERE "token" = $1"#)
+        .bind(&write_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, v, _, www) = oauth_oneshot(
+        app,
+        "POST",
+        "/api/notes/create",
+        Some(json!({ "text": "test" })),
+        Some(&write_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert!(
+        www.as_deref()
+            .unwrap_or("")
+            .starts_with("Bearer realm=\"Misskey\", error=\"invalid_token\""),
+        "www-authenticate: {www:?}"
+    );
+}

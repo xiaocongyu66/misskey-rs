@@ -22,6 +22,11 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# arena-oauth: PKCE S256 verify (sha256 digest → base64url) + client_id /
+# redirect_uri URL normalization (both already pinned in Cargo.lock via the
+# rsa / reqwest transitives)
+sha2 = "0.10"
+url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

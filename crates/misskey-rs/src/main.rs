@@ -47,9 +47,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/nodeinfo/2.0", get(api::well_known::nodeinfo_20))
         .route("/nodeinfo/2.1", get(api::well_known::nodeinfo_21));
+    // arena-oauth: OAuth2ProviderService /oauth/* provider routes sit OUTSIDE
+    // /api like the upstream fastify instances (ServerModule.ts registers
+    // OAuth2ProviderService.createServer under the /oauth prefix; CORS is
+    // handled per-handler — only the token server is @fastify/cors-wrapped).
+    let oauth = Router::new().route("/oauth/{*rest}", any(api::oauth::dispatch));
     Router::new()
         .merge(api)
         .merge(well_known)
+        .merge(oauth)
         // streaming websocket hub (drive-agent2: publishMainStream /
         // urlUploadFinished — upstream StreamingApiServerService entry).
         .route("/streaming", get(api::drive::streaming::entry))

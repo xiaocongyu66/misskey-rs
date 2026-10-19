@@ -32,8 +32,12 @@ function dbDefaults() {
 
 function serverConfigYaml(): string {
 	const pg = dbDefaults();
+	// arena-oauth: suites that pin the RFC9207/8414 issuer to the upstream
+	// test.yml url (oauth.ts asserts the literal 'http://misskey.local') get
+	// it via MKRS_E2E_URL; everything else keeps the 127.0.0.1 default.
+	const url = process.env.MKRS_E2E_URL ?? `http://127.0.0.1:${PORT}/`;
 	return [
-		`url: http://127.0.0.1:${PORT}/`,
+		`url: ${url}`,
 		`port: ${PORT}`,
 		'db:',
 		`  host: ${pg.host}`,
@@ -109,6 +113,20 @@ export async function setup(): Promise<void> {
 						// acking so the test's set/reset ordering holds. Misc test
 						// env vars have no effect on the rust server; ack only.
 						if (key === 'MISSKEY_TEST_CHECK_DUPLICATED_TOTP') {
+							try {
+								await fetch(`http://127.0.0.1:${PORT}/api/_test/env`, {
+									method: 'POST',
+									headers: { 'content-type': 'application/json' },
+									body: JSON.stringify({ key, value }),
+								});
+							} catch (e) {
+								console.error('[mkrs-harness] env forward failed', e);
+							}
+						}
+						// arena-oauth: the /oauth/authorize loopback-guard toggle is
+						// read by the rust server (OAuth2ProviderService
+						// #resolveAuthorizationRequest parity) — same forward lane.
+						if (key === 'MISSKEY_TEST_CHECK_IP_RANGE') {
 							try {
 								await fetch(`http://127.0.0.1:${PORT}/api/_test/env`, {
 									method: 'POST',
