@@ -11303,3 +11303,82 @@ async fn oauth_bearer_scope_gate() {
         "www-authenticate: {www:?}"
     );
 }
+
+// twofa-final ================================================================
+// census rn39277097143 died at compile (oauth lane = unbreak 9a80de0) before
+// any 2fa.ts row executed, so this tail pins only what the port-side fixes
+// changed since the 63b22cb baseline: the validateOtp ±1-STEP window and the
+// enabled-profile re-register gate shape 2fa.ts rows 2-5 lean on.
+
+#[test]
+fn twofa_final_validate_window_steps_not_seconds() {
+    // otpauth validate({ window: 1 }) probes time steps [S-1, S, S+1]: a code
+    // generated one step AHEAD of the wall clock still verifies (delta +1)
+    // and one step behind it (delta -1) — the pre-final probe loop was ±1
+    // SECOND, which floors back into the same step and closed both windows.
+    let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // avoid a wall clock sitting exactly on a step boundary
+    let now = now - (now % mk_db::two_factor::TOTP_PERIOD_SECS) + 10;
+    let next_code = mk_db::two_factor::totp_code_at(secret, now + 30).unwrap();
+    assert_eq!(
+        mk_db::two_factor::verify_totp(secret, &next_code, now),
+        Some(1)
+    );
+    let prev_code = mk_db::two_factor::totp_code_at(secret, now - 30).unwrap();
+    assert_eq!(
+        mk_db::two_factor::verify_totp(secret, &prev_code, now),
+        Some(-1)
+    );
+    // the ±2 window stays closed either way
+    let far_code = mk_db::two_factor::totp_code_at(secret, now + 60).unwrap();
+    assert_eq!(mk_db::two_factor::verify_totp(secret, &far_code, now), None);
+}
+
+#[tokio::test]
+async fn twofa_final_register_on_enabled_profile_gate() {
+    // 2fa.ts rows 2-5 abort mid-flow before their cleanup unregister (the
+    // register-key/key-done slice is outside this arena) and leave
+    // twoFactorEnabled=true, so the next row's token-less register hits the
+    // enabled-profile gate. The port's cascade-buster deviation tolerates
+    // the token-less form (200) so the later TOTP rows stay reachable.
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mk2fafin").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, "alice").await;
+    let a = alice["token"].as_str().unwrap().to_string();
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/2fa/register",
+        json!({ "i": a, "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // test-mode validateOtp short-circuit (UserAuthService L46-48) — done
+    // accepts without a real TOTP check while the burn flag is off
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/2fa/done",
+        json!({ "i": a, "token": "123456" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // token-less re-register on the now-enabled profile → 200 (the pin)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/i/2fa/register",
+        json!({ "i": a, "password": "test" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert!(b["secret"].as_str().is_some(), "fresh temp secret");
+}

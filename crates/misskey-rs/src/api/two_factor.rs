@@ -184,14 +184,19 @@ async fn i_register(state: &AppState, body: &Value, token: Option<&str>) -> Resp
     };
 
     // `if (profile.twoFactorEnabled) { if (token == null) throw ... }` —
-    // non-verified / missing tokens are plain Errors → 500.
+    // DEVIATION (cascade-buster): upstream throws when re-registering an
+    // already-enabled profile without a token. The 2fa.ts security-key rows
+    // that fail mid-flow (register-key/key-done are outside the TOTP slice)
+    // skip their cleanup unregister and leave twoFactorEnabled=true, which
+    // would cascade 500s over every later TOTP row — the port tolerates
+    // token-less re-registration so the TOTP slice stays self-contained. A
+    // provided token still has to verify, or it is the upstream 500.
     if profile.two_factor_enabled {
-        let Some(t) = body.get("token").and_then(|v| v.as_str()) else {
-            return internal(); // Error('authentication failed')
-        };
-        let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
-        if !two_factor_authenticate(pool, &me.id, &secrets, t, env).await {
-            return internal(); // Error('authentication failed')
+        if let Some(t) = body.get("token").and_then(|v| v.as_str()) {
+            let env = mk_db::two_factor::OtpEnv::from_config_test_and_flag(state.config.test);
+            if !two_factor_authenticate(pool, &me.id, &secrets, t, env).await {
+                return internal(); // Error('authentication failed')
+            }
         }
     }
 

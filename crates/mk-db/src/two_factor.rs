@@ -192,18 +192,22 @@ pub fn validate_otp(user_id: &str, secret_b32: &str, token: &str, env: OtpEnv) -
 }
 
 /// Upstream `new OTPAuth.TOTP({ secret, digits: 6, period: 30 }).validate({
-/// token, window: 1 })` → matched delta, else null.
+/// token, window: 1 })` → matched delta, else null. `window: 1` probes the
+/// time STEPS [current-1, current, current+1] (not ±1 second — a second off
+/// the step boundary floors back into the same code), and the returned delta
+/// is the step offset upstream feeds into `totp.counter() + delta`.
 pub fn verify_totp(secret_b32: &str, token: &str, unix_secs: u64) -> Option<i64> {
     let t = token.trim();
     if t.len() != 6 || !t.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    let current = (unix_secs / TOTP_PERIOD_SECS) as i64;
     for delta in -1i64..=1 {
-        let sec = unix_secs as i64 + delta;
-        if sec < 0 {
+        let step = current + delta;
+        if step < 0 {
             continue;
         }
-        if totp_code_at(secret_b32, sec as u64).as_deref() == Some(t) {
+        if totp_code_at(secret_b32, (step as u64) * TOTP_PERIOD_SECS).as_deref() == Some(t) {
             return Some(delta);
         }
     }
