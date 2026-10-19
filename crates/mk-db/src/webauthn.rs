@@ -388,6 +388,17 @@ type U256 = [u64; 4];
 const ZERO: U256 = [0, 0, 0, 0];
 const ONE: U256 = [1, 0, 0, 0];
 
+/// diag helper: lowercase hex of a byte slice (the e2e lanes read the server
+/// log; the vendored verify emits its inputs/fingerprint there).
+pub fn hex_of(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push(char::from_digit((*b >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((*b & 0xf) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
 // NIST P-256 domain parameters (FIPS 186-5 §G.1.2)
 /// p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
 const P: U256 = [
@@ -771,7 +782,16 @@ pub fn ecdsa_p256_sha256_verify(
     } else {
         x_aff
     };
-    v == r
+    let matched = v == r;
+    tracing::info!(
+        target: "dbg_webauthn",
+        msg_hash = hex_of(&hash),
+        r_limbs = ?r, s_limbs = ?s,
+        pub_x = hex_of(pub_x), pub_y = hex_of(pub_y),
+        x_aff_limbs = ?x_aff, matched,
+        "ecdsa verify trace"
+    );
+    matched
 }
 
 // ==== user_security_key db paths (0001 baseline; pinned MiUserSecurityKey) ====
@@ -1248,6 +1268,17 @@ pub async fn verify_authentication(
     sig_base.extend_from_slice(&authenticator_data);
     sig_base.extend_from_slice(&sha256(&cd_raw));
     let verified = ecdsa_p256_sha256_verify(&sig_base, &pub_x, &pub_y, &signature);
+    tracing::info!(
+        target: "dbg_webauthn",
+        key_id = %key.id,
+        stored_pk = %key.public_key,
+        sig_len = signature.len(),
+        auth_len = authenticator_data.len(),
+        cd_json = %cd_raw,
+        sig_base0 = &hex_of(&sig_base[..40.min(sig_base.len())]),
+        verified,
+        "webauthn assertion verify"
+    );
     if verified {
         touch_key(
             pool,
