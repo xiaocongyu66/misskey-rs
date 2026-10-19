@@ -7221,3 +7221,167 @@ async fn ftt3_e2e_keyprefix_parity_probe() {
 
     let _ = pool;
 }
+
+// stream-rtm =================================================================
+// renote-mute.ts stream arcs: the three `waitFire` rows ride the /streaming
+// timeline channels (`localTimeline` per the pinned spec; `homeTimeline` is
+// the same hub's credential arm). No ws client dep exists, so the registry
+// itself is the spy: subscriptions are registered through
+// api::streaming::connect_channel and the frames the hub would write to the
+// socket are read off the channel. The notes flow through the real router —
+// /api/notes/create text + renote lanes with their `// stream-rtm`
+// publishNotesStream hooks (NoteCreateService.create L842).
+
+#[tokio::test]
+async fn renote_mute_stream_timeline_fanout() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkstreamrtm").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    // ミュート作成 row: alice renote-mutes carol (bob stays clean).
+    let alice = signup(&app, &uname("rtma")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("rtmb")).await;
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let carol = signup(&app, &uname("rtmc")).await;
+    let ct = carol["token"].as_str().unwrap().to_string();
+    let c_id = carol["id"].as_str().unwrap().to_string();
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/renote-mute/create",
+        json!({ "userId": c_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+
+    // Registry spy: alice's localTimeline + homeTimeline subscriptions.
+    let sink = |ch: &'static str, sub: &'static str| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        assert!(crate::api::streaming::connect_channel(
+            ch,
+            &json!({}),
+            sub,
+            tx,
+            &a_id
+        ));
+        rx
+    };
+    let mut ltl = sink("localTimeline", "a-ltl");
+    let mut htl = sink("homeTimeline", "a-htl");
+
+    /// Drain the spy into `note` event ids (idle gap = done).
+    async fn note_ids(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+                Ok(Some(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    if v["type"] == "channel" && v["body"]["type"] == "note" {
+                        if let Some(id) = v["body"]["body"]["id"].as_str() {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                _ => return ids,
+            }
+        }
+    }
+
+    // Positive control: bob's normal note flows on localTimeline (the fanout
+    // + pack hook are alive before any renote row is judged).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hi", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let bob_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got = note_ids(&mut ltl).await;
+    assert!(
+        got.iter().any(|n| n == &bob_note),
+        "ストリームに通常ノートが流れてくる — {got:?}"
+    );
+
+    // Row 1: carol's PURE renote must not flow (renoter is renote-muted,
+    // channel.ts L118 — isRenotePacked && !isQuotePacked && renoter in set).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": bob_note, "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let carol_renote = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got = note_ids(&mut ltl).await;
+    assert!(
+        !got.iter().any(|n| n == &carol_renote),
+        "ストリームにリノートミュートしているユーザーのリノートが流れない — {got:?}"
+    );
+
+    // Row 2: carol's QUOTE (text-carrying renote) must flow — the renote-mute
+    // leg is keyed on pure renotes, quotes bypass.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": bob_note, "text": "kore", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let carol_quote = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got = note_ids(&mut ltl).await;
+    assert!(
+        got.iter().any(|n| n == &carol_quote),
+        "ストリームにリノートミュートしているユーザーの引用が流れる — {got:?}"
+    );
+
+    // Row 3 (#12956): the renote of a renote-muted user's NORMAL note by a
+    // clean author (bob renotes carol's note) must flow — the mute is keyed
+    // on the RENOTER, not the renote target.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "hi", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let carol_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": carol_note, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let bob_renote = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got = note_ids(&mut ltl).await;
+    assert!(
+        got.iter().any(|n| n == &bob_renote),
+        "ストリームにリノートミュートしているユーザーの通常ノートのリノートが流れてくる — {got:?}"
+    );
+
+    // homeTimeline arm: alice follows nobody, so only her own notes ride the
+    // channel (`isMe || following[author]` gate).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "own htl", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let alice_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let got = note_ids(&mut htl).await;
+    assert!(
+        got.iter().any(|n| n == &alice_note),
+        "homeTimeline に自分のノートが流れてくる — {got:?}"
+    );
+
+    crate::api::streaming::remove_user(&a_id);
+    let _ = pool;
+}

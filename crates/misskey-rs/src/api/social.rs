@@ -954,7 +954,13 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
 
     // TODO(M2+): replyId+renoteId quote-combo reply-target validation
     match super::pack_note(state, pool, &id).await {
-        Ok(n) => (StatusCode::OK, Json(json!({ "createdNote": n }))).into_response(),
+        Ok(n) => {
+            // stream-rtm: NoteCreateService.create L842 — the renote row rides
+            // the same `publishNotesStream(noteObj)` fanout (the renote-mute.ts
+            // stream assertions key on these `note` events).
+            crate::api::streaming::publish_notes(pool, &n).await;
+            (StatusCode::OK, Json(json!({ "createdNote": n }))).into_response()
+        }
         Err(r) => *r,
     }
 }

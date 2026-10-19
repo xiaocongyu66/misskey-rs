@@ -56,6 +56,10 @@ mod lists;
 // FanoutTimelineService.push; the timelines.ts `FTT:` probes read
 // `list:homeTimeline:*` Redis lists literally).
 mod ftt;
+// stream-rtm: the /streaming timeline-channel half — `homeTimeline` +
+// `localTimeline` fanout of the notesStream event (upstream
+// GlobalEventService.publishNotesStream + stream/channels/{home,local}-timeline.ts).
+mod streaming;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -3063,6 +3067,9 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         Ok(n) => n,
         Err(r) => return *r,
     };
+    // stream-rtm: NoteCreateService.create L842 — `publishNotesStream(noteObj)`
+    // fans the pack out to the /streaming timeline channels (api::streaming).
+    crate::api::streaming::publish_notes(pool, &note).await;
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
 }
 

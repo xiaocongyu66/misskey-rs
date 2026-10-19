@@ -154,6 +154,8 @@ pub(crate) mod streaming {
                             .and_then(Value::as_str)
                             .map(String::from)
                         {
+                            // stream-rtm: drop the matching timeline sub too.
+                            crate::api::streaming::remove_sub(&user_id, &id);
                             if let Ok(mut reg) = MAIN_SINKS.lock() {
                                 if let Some(v) = reg.get_mut(&user_id) {
                                     v.retain(|(sid, _)| sid != &id);
@@ -176,19 +178,30 @@ pub(crate) mod streaming {
             let Some(sub_id) = body.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            // requireCredential channels need `user != null` (main qualifies);
-            // an unknown channel name throws upstream and connects nothing.
-            if channel != "main" {
-                continue;
-            }
-            let registered = {
-                let Ok(mut reg) = MAIN_SINKS.lock() else {
-                    break;
-                };
-                let entry = reg.entry(user_id.clone()).or_default();
-                entry.retain(|(sid, _)| sid != sub_id);
-                entry.push((sub_id.to_string(), event_tx.clone()));
-                true
+            // requireCredential channels need `user != null` (main qualifies;
+            // an unknown channel name throws upstream and connects nothing).
+            let registered = if channel == "main" {
+                {
+                    let Ok(mut reg) = MAIN_SINKS.lock() else {
+                        break;
+                    };
+                    let entry = reg.entry(user_id.clone()).or_default();
+                    entry.retain(|(sid, _)| sid != sub_id);
+                    entry.push((sub_id.to_string(), event_tx.clone()));
+                    true
+                }
+            } else {
+                // stream-rtm: the timeline-channel half (upstream
+                // stream/channels/{home,local}-timeline.ts) — registry +
+                // per-note filters live in api::streaming; unknown channel
+                // names refuse silently like the upstream throw.
+                crate::api::streaming::connect_channel(
+                    channel,
+                    &body.get("params").cloned().unwrap_or(Value::Null),
+                    sub_id,
+                    event_tx.clone(),
+                    &user_id,
+                )
             };
             if registered && body.get("pong").and_then(Value::as_bool) == Some(true) {
                 let frame = json!({ "type": "connected", "body": { "id": sub_id } });
@@ -197,6 +210,8 @@ pub(crate) mod streaming {
         }
 
         {
+            // stream-rtm: connection teardown drops timeline subs as well.
+            crate::api::streaming::remove_user(&user_id);
             if let Ok(mut reg) = MAIN_SINKS.lock() {
                 reg.remove(&user_id);
             }
