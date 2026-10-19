@@ -94,8 +94,12 @@ jobs:
             || echo "::warning::e2e had failures (census run - see report)"
       - name: Upload vitest report
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: wellknown-e2e-report
           path: upstream/packages/backend/test-output/
           if-no-files-found: ignore
+      - name: junit to log (quota-proof census)
+        if: always()
+        run: cat upstream/packages/backend/test-output/junit.xml || true
