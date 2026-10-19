@@ -122,24 +122,6 @@ pub async fn notify_follower_ids(
     .await
 }
 
-/// The L800-804 pure-renote drop — `renoteMutingsCache.fetch(following
-/// .followerId).has(user.id)`: renote_muting(muterId = follower, muteeId =
-/// note author).
-pub async fn renote_muting_exists(
-    pool: &PgPool,
-    muter_id: &str,
-    mutee_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let n: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM "renote_muting" WHERE "muterId" = $1 AND "muteeId" = $2"#,
-    )
-    .bind(muter_id)
-    .bind(mutee_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(n > 0)
-}
-
 /// `user.isBot` scalar (LocalUserRow does not carry it; reading a plain
 /// column, no join needed).
 pub async fn user_is_bot(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
