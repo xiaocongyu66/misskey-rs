@@ -208,13 +208,15 @@ pub async fn export_clip_notes(
 
 // ==== drive/files {list,show,delete} reads ==================================
 
-/// The `mk_db::drive::find_drive_file` projection — files/{list,show} return
-/// exactly the shape the pack consumes.
-const FILE_COLS: &str = r#""id", "userId" AS "user_id", "md5", "name", ("type"::text) AS "type", "size",
-                  "blurhash", "url", "webpublicUrl" AS "webpublic_url",
-                  "webpublicType" AS "webpublic_type",
+/// The `mk_db::drive::find_drive_file` projection — DriveFileRow's sqlx
+/// renames key on the camelCase column names, so NO snake aliases here
+/// (census rn39294347017: `"userId" AS "user_id"` broke every files/list
+/// decode with 'no column found for name: userId').
+const FILE_COLS: &str = r#""id", "userId", "md5", "name", ("type"::text) AS "type", "size",
+                  "blurhash", "url", "webpublicUrl",
+                  "webpublicType",
                   ("properties"::text)::jsonb AS "properties",
-                  "comment", "isSensitive" AS "is_sensitive", "folderId" AS "folder_id""#;
+                  "comment", "isSensitive", "folderId""#;
 
 /// `drive/files`: `makePaginationQuery(...).andWhere('file.userId = :me')` +
 /// folderId gate (paramDef default null → `folderId IS NULL`) + the type
