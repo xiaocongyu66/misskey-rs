@@ -1274,8 +1274,8 @@ pub async fn verify_authentication(
         stored_pk = %key.public_key,
         sig_len = signature.len(),
         auth_len = authenticator_data.len(),
-        cd_json = %cd_raw,
-        sig_base0 = &hex_of(&sig_base[..40.min(sig_base.len())]),
+        cd_json = hex_of(&cd_raw),
+        sig_base0 = hex_of(&sig_base[..40.min(sig_base.len())]),
         verified,
         "webauthn assertion verify"
     );
