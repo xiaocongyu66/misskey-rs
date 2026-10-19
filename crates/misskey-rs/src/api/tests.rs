@@ -8020,9 +8020,12 @@ async fn clips_arena_crud_favorite_notes() {
     }
     init_tracing();
     let pool = mk_db::test_support::fresh_db("mkclips_arena").await;
+    // pool re-borrowed by the asserts below (E0382 triage, same as 05d5116)
     mk_db::run_migrations(&pool).await.unwrap();
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
+    // cross-lane compile triage (block lane): the pool is re-borrowed by the
+    // asserts below, so the AppState must clone it (E0382 borrow of moved)
     let app = crate::build_router(test_state(pool.clone()));
     let (_, v) = post_json(
         app.clone(),

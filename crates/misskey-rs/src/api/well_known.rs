@@ -385,7 +385,7 @@ pub(crate) async fn well_known_dispatch(State(state): State<AppState>, req: Requ
         "/.well-known/host-meta.json" => host_meta_json(&state).await,
         "/.well-known/nodeinfo" => nodeinfo_index(&state).await,
         "/.well-known/oauth-authorization-server" => oauth_authorization_server(&state).await,
-        "/.well-known/webfinger" => webfinger(state, resource, accept).await,
+        "/.well-known/webfinger" => webfinger(&state, resource, accept).await,
         // WellKnownServerService change-password redirect (302 → /settings/security)
         "/.well-known/change-password" => {
             let mut res = Response::builder()

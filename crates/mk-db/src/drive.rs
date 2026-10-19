@@ -19,6 +19,7 @@ use sqlx::PgPool;
 /// Columns the api layer packs (id supplies the aid createdAt).
 #[derive(Debug, sqlx::FromRow)]
 pub struct DriveFolderRow {
+    pub id: String,
     #[sqlx(rename = "userId")]
     pub user_id: String,
     pub name: String,
@@ -52,7 +53,7 @@ pub async fn find_folder_owned(
     user_id: &str,
 ) -> Result<Option<DriveFolderRow>, sqlx::Error> {
     sqlx::query_as::<_, DriveFolderRow>(
-        r#"SELECT "userId", "name", "parentId" FROM "drive_folder"
+        r#"SELECT "id", "userId", "name", "parentId" FROM "drive_folder"
            WHERE "id" = $1 AND "userId" = $2"#,
     )
     .bind(id)
@@ -68,7 +69,7 @@ pub async fn find_folder_by_id(
     id: &str,
 ) -> Result<Option<DriveFolderRow>, sqlx::Error> {
     sqlx::query_as::<_, DriveFolderRow>(
-        r#"SELECT "userId", "name", "parentId" FROM "drive_folder" WHERE "id" = $1"#,
+        r#"SELECT "id", "userId", "name", "parentId" FROM "drive_folder" WHERE "id" = $1"#,
     )
     .bind(id)
     .fetch_optional(pool)
