@@ -54,10 +54,7 @@ pub fn spawn_queue_workers(pool: mk_db::sqlx::PgPool) {
                             .and_then(Value::as_str)
                             .map(|s| s.to_string());
                         let Some(uid) = uid else {
-                            return Err(format!(
-                                "deleteAccount job {}: malformed payload",
-                                job.id
-                            ));
+                            return Err(format!("deleteAccount job {}: malformed payload", job.id));
                         };
                         run_delete_account(&pool, &uid).await
                     }
@@ -122,7 +119,10 @@ pub(crate) async fn run_ended_poll_notification(
 /// TODO(queue-min): drive files / pages purge, search unindex, the
 /// `soft: false` user-row removal and the Delete Activity delivery stay
 /// unported (upstream `{ // Delete files }` onward).
-pub(crate) async fn run_delete_account(pool: &mk_db::sqlx::PgPool, uid: &str) -> Result<(), String> {
+pub(crate) async fn run_delete_account(
+    pool: &mk_db::sqlx::PgPool,
+    uid: &str,
+) -> Result<(), String> {
     // `usersRepository.findOneBy` — a gone user silently finishes (upstream
     // `if (user == null) return`).
     match mk_db::delete_account::fetch_is_deleted(pool, uid).await {

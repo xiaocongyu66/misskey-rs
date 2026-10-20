@@ -13822,11 +13822,13 @@ async fn queue_min_ended_poll_handler_creates_poll_ended_notifications() {
         .unwrap();
     }
     for nid in ["n1", "n2"] {
-        mk_db::sqlx::query(r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, 'u_auth', 'public')"#)
-            .bind(nid)
-            .execute(&pool)
-            .await
-            .unwrap();
+        mk_db::sqlx::query(
+            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, 'u_auth', 'public')"#,
+        )
+        .bind(nid)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
     let now = now_ms() as i64;
     // n1: expired 30 min ago (inside the last-hour window); n2: expired 3h
@@ -13881,7 +13883,11 @@ async fn queue_min_ended_poll_handler_creates_poll_ended_notifications() {
             && rows.contains(&("u_voter".to_string(), Some("n1".to_string()))),
         "author + local voter notified: {rows:?}"
     );
-    assert_eq!(rows.len(), 2, "remote voter + aged-out n2 stay out: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "remote voter + aged-out n2 stay out: {rows:?}"
+    );
 
     // at-least-once re-delivery dedups (no new rows).
     crate::api::queue_processors::run_ended_poll_notification(&pool, None)
@@ -13918,40 +13924,49 @@ async fn queue_min_delete_account_handler_soft_purges_notes_and_marks_user() {
     let pool = fresh_pool("queue_min_delacct").await;
 
     for uid in ["u_del", "u_other"] {
-        mk_db::sqlx::query(r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $1, $1)"#)
-            .bind(uid)
-            .execute(&pool)
-            .await
-            .unwrap();
+        mk_db::sqlx::query(
+            r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $1, $1)"#,
+        )
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
-    for (nid, uid) in [("n_del1", "u_del"), ("n_del2", "u_del"), ("n_keep", "u_other")] {
-        mk_db::sqlx::query(r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#)
-            .bind(nid)
-            .bind(uid)
-            .execute(&pool)
-            .await
-            .unwrap();
+    for (nid, uid) in [
+        ("n_del1", "u_del"),
+        ("n_del2", "u_del"),
+        ("n_keep", "u_other"),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#,
+        )
+        .bind(nid)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     crate::api::queue_processors::run_delete_account(&pool, "u_del")
         .await
         .unwrap();
 
-    let left: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "userId" = 'u_del'"#)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 0, "the deleted user's notes purged");
-    let kept: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "id" = 'n_keep'"#)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(kept, 1, "unrelated notes survive");
-    let n: i64 =
-        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user" WHERE "id" = 'u_del'"#)
+    let left: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "userId" = 'u_del'"#)
             .fetch_one(&pool)
             .await
             .unwrap();
+    assert_eq!(left, 0, "the deleted user's notes purged");
+    let kept: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "id" = 'n_keep'"#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, 1, "unrelated notes survive");
+    let n: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user" WHERE "id" = 'u_del'"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n, 1, "the user row survives (削除済ユーザーが含まれる)");
     let is_deleted: bool =
         mk_db::sqlx::query_scalar(r#"SELECT "isDeleted" FROM "user" WHERE "id" = 'u_del'"#)
@@ -13965,4 +13980,136 @@ async fn queue_min_delete_account_handler_soft_purges_notes_and_marks_user() {
     crate::api::queue_processors::run_delete_account(&pool, "u_del")
         .await
         .unwrap();
+}
+
+// meili-min: notes/search + notes/search-by-tag (the SQL fallback lanes —
+// which are ALSO upstream's no-Meili default, SearchService.searchNoteByLike)
+#[tokio::test]
+async fn notes_search_sql_fallback_gate_and_hits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_note_search").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // fixtures: an ILIKE target + a tag target (notes/create lowercases the
+    // extract_hashtags output onto the row).
+    let (s, hit) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "the Quick brown Fox", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {hit}");
+    let hit_id = hit["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, tagged) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "tag lane #Hoge", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {tagged}");
+    let tagged_id = tagged["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // ajv: missing query / missing tag → INVALID_PARAM (3d81ceae)
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"), "body: {err}");
+    let (s, err) = post_json(app.clone(), "/api/notes/search-by-tag", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"), "body: {err}");
+
+    // gate: canSearchNotes is DEFAULT-false → UNAVAILABLE. meta.errors.
+    // unavailable carries no kind/httpStatusCode → ApiError client default
+    // → HTTP 400 (the same shape the notes/translate gate answers here).
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "query": "quick", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("UNAVAILABLE"), "body: {err}");
+    assert_eq!(
+        err["error"]["id"],
+        json!("0b44998d-77aa-4427-80d0-d2c9b8523011"),
+        "body: {err}"
+    );
+
+    // grant: role with an explicit canSearchNotes override + assign
+    let (s, role) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({
+            "name": "searcher",
+            "description": "",
+            "color": null,
+            "iconUrl": null,
+            "displayOrder": 0,
+            "target": "manual",
+            "condFormula": {},
+            "isAdministrator": false,
+            "isModerator": false,
+            "isPublic": false,
+            "isExplorable": false,
+            "asBadge": false,
+            "canEditMembersByModerator": false,
+            "policies": { "canSearchNotes": { "priority": 0, "useDefault": false, "value": true } },
+            "i": r_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // ILIKE hit: the uppercased query still matches (case-insensitive text
+    // match; upstream sqlLike lowercases both sides — ILIKE folds the same).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "query": "QUICK", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![hit_id.as_str()], "body: {body}");
+
+    // tag hit — AND no gate: search-by-tag answers WITHOUT the grant
+    // (upstream notes/search-by-tag.ts has no RoleService/canSearchNotes).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/search-by-tag",
+        json!({ "tag": "HOGE" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![tagged_id.as_str()], "body: {body}");
 }
