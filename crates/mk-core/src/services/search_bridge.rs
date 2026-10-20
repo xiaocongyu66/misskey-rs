@@ -71,6 +71,13 @@ pub trait NoteSearchEngine: Send + Sync + 'static {
         query: &'a str,
         limit: u64,
     ) -> EngineFuture<'a, Result<Vec<Value>, SearchError>>;
+    /// Whether this is the [`NoopEngine`] (no search backend configured):
+    /// index writes are skipped and queries keep the endpoints' SQL
+    /// fallbacks — upstream's `if (!this.meilisearch) return` arms. Defaults
+    /// to `false`, so real engines (and test doubles) ride the engine lane.
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -127,6 +134,10 @@ impl From<serde_json::Error> for SearchError {
 pub struct NoopEngine;
 
 impl NoteSearchEngine for NoopEngine {
+    fn is_noop(&self) -> bool {
+        true
+    }
+
     fn add<'a>(&'a self, _id: &'a str, _doc: Value) -> EngineFuture<'a, Result<(), SearchError>> {
         Box::pin(std::future::ready(Ok(())))
     }
