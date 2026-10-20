@@ -14876,3 +14876,310 @@ async fn queue2_export_muting_roundtrip() {
     let expected = format!("{}@127.0.0.1:3000\n", bob["username"].as_str().unwrap());
     assert_eq!(text, expected, "exportMuting CSV lines (timed mute out)");
 }
+
+// meili-2 // — the Meilisearch write/query path (upstream SearchService.ts
+// indexNote / unindexNote / searchNoteByMeilisearch + NoteCreateService
+// .index): the NoteSearchEngine seam is mockable, so the engine lane is
+// pinned without a Meilisearch service.
+
+/// Test double capturing add/remove/search traffic (the trait's boxed-future
+/// shape keeps this dependency-free; AtomicBool so `fail_search` flips
+/// through the shared Arc).
+struct CapturingEngine {
+    docs: std::sync::Mutex<Vec<Value>>,
+    removed: std::sync::Mutex<Vec<String>>,
+    hits: std::sync::Mutex<Vec<Value>>,
+    fail_search: std::sync::atomic::AtomicBool,
+}
+
+impl CapturingEngine {
+    fn new() -> Self {
+        Self {
+            docs: std::sync::Mutex::new(Vec::new()),
+            removed: std::sync::Mutex::new(Vec::new()),
+            hits: std::sync::Mutex::new(Vec::new()),
+            fail_search: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl mk_core::services::search_bridge::NoteSearchEngine for CapturingEngine {
+    fn add<'a>(
+        &'a self,
+        _id: &'a str,
+        doc: Value,
+    ) -> mk_core::services::search_bridge::EngineFuture<
+        'a,
+        Result<(), mk_core::services::search_bridge::SearchError>,
+    > {
+        Box::pin(std::future::ready({
+            self.docs.lock().unwrap().push(doc);
+            Ok(())
+        }))
+    }
+
+    fn remove<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> mk_core::services::search_bridge::EngineFuture<
+        'a,
+        Result<(), mk_core::services::search_bridge::SearchError>,
+    > {
+        Box::pin(std::future::ready({
+            self.removed.lock().unwrap().push(id.to_string());
+            Ok(())
+        }))
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: u64,
+    ) -> mk_core::services::search_bridge::EngineFuture<
+        'a,
+        Result<Vec<Value>, mk_core::services::search_bridge::SearchError>,
+    > {
+        Box::pin(std::future::ready(
+            if self.fail_search.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(mk_core::services::search_bridge::SearchError::Http {
+                    status: 503,
+                    body: "meili down".to_string(),
+                })
+            } else {
+                Ok(self.hits.lock().unwrap().clone())
+            },
+        ))
+    }
+}
+
+/// notes/create → engine.add: indexNote's EXACT document shape (id /
+/// createdAt ms from the aid / userId / userHost / channelId / cw / text /
+/// tags — NO visibility key), plus the shouldIndex gates (public/home only,
+/// local author only, text-or-cw present) and the notes/delete unindex leg.
+#[tokio::test]
+async fn meili_index_document_shape_and_should_index_gate() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_meili_index").await;
+    let engine = std::sync::Arc::new(CapturingEngine::new());
+    let app = crate::build_router(crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://127.0.0.1:3000".to_string(),
+            db: None,
+            redis: None,
+            test: true,
+            version: None,
+            raw_json: serde_json::Value::Null,
+        },
+        pool: Some(pool),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: engine.clone(),
+    });
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+
+    // public text+cw note → indexed with the exact addDocuments payload
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "meili doc shape", "cw": "cw me", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let note_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let docs = engine.docs.lock().unwrap();
+    assert_eq!(docs.len(), 1, "docs: {docs:?}");
+    assert_eq!(
+        docs[0],
+        json!({
+            "id": note_id,
+            "createdAt": mk_types::id::parse_aid_date(&note_id).unwrap(),
+            "userId": alice["id"],
+            "userHost": Value::Null,
+            "channelId": Value::Null,
+            "cw": "cw me",
+            "text": "meili doc shape",
+            "tags": [],
+        }),
+        "doc: {docs[0]}"
+    );
+    drop(docs);
+
+    // shouldIndex gates: a followers-visibility note and a PURE renote (text
+    // null && cw null — NoteCreateService.index) must NOT hit the engine.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "followers only", "visibility": "followers", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": note_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        engine.docs.lock().unwrap().len(),
+        1,
+        "gates must not index: {:?}",
+        engine.docs.lock().unwrap()
+    );
+
+    // notes/delete → unindexNote (public row leaves the index with the row)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/delete",
+        json!({ "noteId": note_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(
+        engine.removed.lock().unwrap().as_slice(),
+        [note_id.as_str()],
+        "removed: {:?}",
+        engine.removed.lock().unwrap()
+    );
+}
+
+/// notes/search rides the ENGINE when one is wired (packing the engine's hit
+/// ids from PG), 500s when the configured engine fails (upstream throws
+/// 'Meilisearch is not available' — never a silent SQL fallback), and
+/// applies the userId hit filter (the meili filter, handler-side here).
+#[tokio::test]
+async fn meili_notes_search_uses_engine_when_present() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_meili_search").await;
+    let engine = std::sync::Arc::new(CapturingEngine::new());
+    let app = crate::build_router(crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://127.0.0.1:3000".to_string(),
+            db: None,
+            redis: None,
+            test: true,
+            version: None,
+            raw_json: serde_json::Value::Null,
+        },
+        pool: Some(pool),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: engine.clone(),
+    });
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "engine hit lane", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let hit_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "root engine note", "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let root_note_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // the canSearchNotes gate still fronts the engine lane (role grant)
+    let (s, role) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({
+            "name": "searcher",
+            "description": "",
+            "color": null,
+            "iconUrl": null,
+            "displayOrder": 0,
+            "target": "manual",
+            "condFormula": {},
+            "isAdministrator": false,
+            "isModerator": false,
+            "isPublic": false,
+            "isExplorable": false,
+            "asBadge": false,
+            "canEditMembersByModerator": false,
+            "policies": { "canSearchNotes": { "priority": 0, "useDefault": false, "value": true } },
+            "i": r_token
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // engine hit → the packed note (loaded from PG by the handler)
+    engine
+        .hits
+        .lock()
+        .unwrap()
+        .push(json!({ "id": hit_id, "userId": alice["id"], "userHost": null }));
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "query": "engine", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![hit_id.as_str()], "body: {body}");
+
+    // configured-but-failing engine → 500 INTERNAL (the 'Meilisearch is not
+    // available' throw), NOT a SQL fallback
+    engine
+        .fail_search
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "query": "engine", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {err}");
+
+    // the userId filter drops hits owned by other authors
+    engine
+        .fail_search
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    engine
+        .hits
+        .lock()
+        .unwrap()
+        .push(json!({ "id": root_note_id, "userId": root["id"], "userHost": null }));
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notes/search",
+        json!({ "query": "engine", "userId": alice["id"], "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert!(
+        body.as_array().unwrap().is_empty(),
+        "userId filter drops foreign hits: {body}"
+    );
+}
