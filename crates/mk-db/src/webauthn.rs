@@ -711,12 +711,14 @@ fn der_parse_ecdsa_sig(der: &[u8]) -> Option<(U256, U256)> {
             return None;
         }
         let int_bytes = &der[start..start + len];
-        // strip leading zero pad; reject a value that needs it after the pad
+        // DER positive INTEGER: the 0x00 pad is required (and legal) exactly
+        // when the value's high bit is set — strip pads, then the value must
+        // still have one data byte left and fit 32 bytes (u256)
         let mut sig = int_bytes;
-        if sig.first() == Some(&0x00) {
+        while sig.first() == Some(&0x00) {
             sig = &sig[1..];
         }
-        if sig.is_empty() || sig.first().is_some_and(|b| *b & 0x80 == 0x80) || sig.len() > 32 {
+        if sig.is_empty() || sig.len() > 32 {
             return None;
         }
         *pos = start + len;

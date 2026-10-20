@@ -11112,6 +11112,16 @@ fn twofa_resume_p256_ecdsa_verify() {
     assert!(mk_db::webauthn::ecdsa_p256_sha256_verify(
         b"sample", &ux, &uy, &der
     ));
+    // the same (r, s) as unpadded 32-byte INTEGERs — the canonical 0x00 pad
+    // for high-bit values (r high byte 0xEF) must not flip the polarity
+    let mut der_short = Vec::new();
+    der_short.extend_from_slice(&[0x30, 0x44, 0x02, 0x20]);
+    der_short.extend_from_slice(&r);
+    der_short.extend_from_slice(&[0x02, 0x20]);
+    der_short.extend_from_slice(&s);
+    assert!(mk_db::webauthn::ecdsa_p256_sha256_verify(
+        b"sample", &ux, &uy, &der_short
+    ));
     // a different message under the same signature (and a flipped signature
     // byte under the right one) both stay invalid
     assert!(!mk_db::webauthn::ecdsa_p256_sha256_verify(
