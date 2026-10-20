@@ -817,6 +817,103 @@ pub async fn replies_of_note(
         .await
 }
 
+// ---------------------------------------------------------------------------
+// meili-min: notes/search + notes/search-by-tag SQL fallback lanes. The SQL
+// branch IS upstream's no-Meili default (`fulltextSearch.provider: 'sqlLike'`
+// → SearchService.searchNoteByLike) for notes/search, and the direct TypeORM
+// query of endpoints/notes/search-by-tag.ts for the tag arm.
+// ---------------------------------------------------------------------------
+
+/// `misc/sql-like-escape.ts` — tames backslash / % / _ before the caller's
+/// fragment is wrapped with `%..%` (search_channels keeps the same inline
+/// trio; shared here so both search lanes escape from one source).
+pub fn escape_like(q: &str) -> String {
+    q.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// notes/search db path: `"text" ILIKE '%q%'` over public/home rows with the
+/// optional host (`'.'` = local → userHost IS NULL) / userId / channelId
+/// filters and the aid paging tail + OFFSET/LIMIT. Upstream orders via
+/// makePaginationQuery (EXCLUSIVE bounds, sinceId-only → ASC else DESC) and
+/// searches note.text only in the sqlLike provider.
+/// userId/channelId mirror the upstream else-if (`if userId … else if
+/// channelId`): a set $3 (userId) masks the $4 arm entirely.
+/// Deviation pinned by the slice: viewer visibility degrades to the guest
+/// lane (`IN ('public','home')`) and only the always-on leg of
+/// generateBaseNoteFilteringQuery (suspended authors) is carried — the
+/// me-aware mute/block sub-selects are TODO with the full visibility walk.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_notes(
+    pool: &PgPool,
+    q_escaped: &str,
+    host: Option<&str>,
+    user_id: Option<&str>,
+    channel_id: Option<&str>,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let pat = format!("%{q_escaped}%");
+    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
+    // $1 pattern $2 host ('.' sentinel folds the IS NULL arm) $3 userId
+    // $4 channelId $5 offset $6 limit — dense placeholders (the
+    // search_channels positional-fill trap).
+    sqlx::query_as::<_, NoteRow>(&format!(
+        r#"SELECT {NOTE_COLS} FROM "note"
+           WHERE "text" ILIKE $1
+             AND "visibility" IN ('public','home')
+             AND "userId" NOT IN (SELECT "id" FROM "user" WHERE "isSuspended" = TRUE)
+             AND ($2::varchar IS NULL OR ($2 = '.' AND "userHost" IS NULL) OR "userHost" = $2)
+             AND ($3::varchar IS NULL OR "userId" = $3)
+             AND ($4::varchar IS NULL OR $3::varchar IS NOT NULL OR "channelId" = $4)
+           ORDER BY "id" {dir} OFFSET $5 LIMIT $6"#
+    ))
+    .bind(&pat)
+    .bind(host)
+    .bind(user_id)
+    .bind(channel_id)
+    .bind(offset)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// notes/search-by-tag db path (the single-`tag` branch): exact tag
+/// membership `$1 = ANY("tags")` over public/home rows. Upstream matches
+/// `:tag <@ note.tags` after normalizeForSearch — lowercasing here (the
+/// insert lane stores lowercased tags, users_by_tag keeps the same fold).
+#[allow(clippy::too_many_arguments)]
+pub async fn search_notes_by_tag(
+    pool: &PgPool,
+    tag: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
+    // $1 tag $2 untilId $3 sinceId $4 offset $5 limit — dense placeholders.
+    sqlx::query_as::<_, NoteRow>(&format!(
+        r#"SELECT {NOTE_COLS} FROM "note"
+           WHERE $1 = ANY("tags")
+             AND "visibility" IN ('public','home')
+             AND "userId" NOT IN (SELECT "id" FROM "user" WHERE "isSuspended" = TRUE)
+             AND ($2::varchar IS NULL OR "id" < $2)
+             AND ($3::varchar IS NULL OR "id" > $3)
+           ORDER BY "id" {dir} OFFSET $4 LIMIT $5"#
+    ))
+    .bind(tag.to_lowercase())
+    .bind(until_id)
+    .bind(since_id)
+    .bind(offset)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// notes/renotes db path: rows whose renoteId is the given note (the endpoint
 /// raises NO_SUCH_NOTE on the target before the query).
 #[allow(clippy::too_many_arguments)]
