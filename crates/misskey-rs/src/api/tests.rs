@@ -14017,12 +14017,7 @@ async fn notes_search_sql_fallback_gate_and_hits() {
     let tagged_id = tagged["createdNote"]["id"].as_str().unwrap().to_string();
 
     // ajv: missing query / missing tag → INVALID_PARAM (3d81ceae)
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/notes/search",
-        json!({ "i": a_token }),
-    )
-    .await;
+    let (s, err) = post_json(app.clone(), "/api/notes/search", json!({ "i": a_token })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("INVALID_PARAM"), "body: {err}");
     let (s, err) = post_json(app.clone(), "/api/notes/search-by-tag", json!({})).await;
