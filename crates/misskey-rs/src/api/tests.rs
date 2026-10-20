@@ -15158,10 +15158,13 @@ async fn meili_notes_search_uses_engine_when_present() {
     .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {err}");
 
-    // the userId filter drops hits owned by other authors
+    // the userId filter drops hits owned by other authors (hits cleared
+    // first — the vec accumulates across this test's earlier calls, and the
+    // earlier alice-owned hit would otherwise legitimately survive the filter)
     engine
         .fail_search
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    engine.hits.lock().unwrap().clear();
     engine
         .hits
         .lock()
