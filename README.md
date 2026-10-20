@@ -92,14 +92,13 @@ tests; upstream `skip`/`todo` rows are excluded.
 | users.ts | 179/179 | 39118917713 |
 | well-known.ts | 5/5 | 39215008064 |
 
-In-flight arenas (not yet cleared, latest logged result):
+In-flight arenas (not yet cleared, latest logged result): none — every arena is green.
 
-| arena | state | reference run |
-|---|---|---|
-| 2fa.ts | 3 passed / 4 failed of 7 | 39300653792 |
-| drive.ts | 3 passed / 1 failed of 4 (later runs died pre-vitest) | 39128302999 |
-| move.ts | 59 passed / 3 failed of 62 (follow-ups died pre-vitest) | 39322949913 |
-| `{user-notes,renote-mute,thread-mute,mute}.ts` (batch-social lane) | 27 passed / 2 failed of 29 (best) | 39199419722 |
+Late corrections (audit-verified; the matrix above holds their final numbers):
+drive.ts 4/4 (rn39130643907), batch-social 29/29 (rn39202308911), move.ts 62/62 ×2
+(rn39326293175 + rn39327166962 @ bcb660f), 2fa.ts 7/7 (rn39343393617 @ 7670e65).
+Extension lanes beyond the 29-file pinned universe: files.ts 8/8, roles.ts 14/14,
+synalio 11/11, fetch-validate 2/2 ×2.
 
 Per-arena census notes (fix history, error-ladder provenance, ×2 confirmations) live in
 [`e2e-harness/census.md`](e2e-harness/census.md) and the CI lane logs
