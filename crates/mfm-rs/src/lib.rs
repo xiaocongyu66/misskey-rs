@@ -62,6 +62,19 @@ pub enum Node {
     /// A `query search` / `query 検索` line → the Google-search link; the
     /// whole line (minus its trailing newline) rides as `content`.
     Search { query: String, content: String },
+    /// `$[name children]` → the upstream `fn` arm: `unixtime` renders a
+    /// `<time>`, the one-child `ruby`-named fn renders `<ruby>`, anything
+    /// else falls to `fnDefault` → `<i>…</i>`.
+    Fn { name: String, children: Vec<Node> },
+    /// `\(...\)` inline formula → `<code>…</code>` (the mathInline arm is
+    /// byte-identical to inlineCode's output shape).
+    MathInline(String),
+    /// `\[…\]` block formula → `<pre><code>…</code></pre>` (mathBlock ==
+    /// blockCode's shape).
+    MathBlock(String),
+    /// `<plain>…</plain>` → `<span>…</span>`; the inner span is re-parsed
+    /// with the inline rule set.
+    Plain(Vec<Node>),
 }
 
 /// The upstream `IMentionedRemoteUsers` entry (src/models/Note.ts) — the
@@ -159,6 +172,92 @@ fn at_line_end(input: &str, i: usize) -> bool {
     i == input.len() || matches!(input.as_bytes()[i], b'\r' | b'\n')
 }
 
+/// mfm-js `fn`: `$[` + name (up to a space) + (space + children) + `]`. The
+/// children re-parse with the inline rule set (nesting rides the depth ctx);
+/// an empty children span stays literal.
+fn try_fn(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
+    if ctx.link_label || !input[start..].starts_with("$[") {
+        return None;
+    }
+    let rest = &input[start + 2..];
+    let name_len = rest
+        .find(|c: char| c == ' ' || c == ']')
+        .filter(|&n| n > 0)?;
+    if !name_len == 0 {
+        return None;
+    }
+    let name = &rest[..name_len];
+    let after_name = &rest[name_len..];
+    if let Some(after_space) = after_name.strip_prefix(' ') {
+        let end = after_space.find(']')?;
+        if end == 0 {
+            return None;
+        }
+        let children_src = &after_space[..end];
+        let children = parse_inline(children_src, ctx.depth, false);
+        let consumed = 2 + name_len + 1 + end + 1;
+        Some((
+            Node::Fn {
+                name: name.to_string(),
+                children,
+            },
+            start + consumed,
+        ))
+    } else {
+        None
+    }
+}
+
+/// mfm-js `mathInline`: `\(` + `[^\n]+?` + `\)` — verbatim body, single line.
+fn try_math_inline(input: &str, start: usize) -> Option<(Node, usize)> {
+    let rest = input[start..].strip_prefix("\\(")?;
+    let end = rest.find("\\)")?;
+    let body = &rest[..end];
+    if body.is_empty() || body.contains('\n') {
+        return None;
+    }
+    Some((Node::MathInline(body.to_string()), start + 2 + end + 2))
+}
+
+/// mfm-js `mathBlock`: `\[` at a line begin + verbatim multi-line body +
+/// `\]` at a line end (newLine.option wraps tolerated on both sides).
+fn try_math_block(input: &str, start: usize) -> Option<(Node, usize)> {
+    let mut i = start;
+    if let Some(n) = newline_len(input, i) {
+        if at_line_begin(input, i + n) {
+            i += n;
+        }
+    }
+    let rest = input[i..].strip_prefix("\\[")?;
+    let end = rest.find("\\]")?;
+    let body = &rest[..end];
+    if body.is_empty() {
+        return None;
+    }
+    let after = end + 2;
+    if !at_line_end(input, i + 2 + after) {
+        return None;
+    }
+    let mut next = i + 2 + after;
+    if let Some(n) = newline_len(input, next) {
+        next += n;
+    }
+    Some((Node::MathBlock(body.to_string()), next))
+}
+
+/// mfm-js `plain`: `<plain>` + children + `</plain>` — the inner span
+/// re-parses with the inline rule set (nestLimit rides the ctx depth).
+fn try_plain(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
+    let rest = input[start..].strip_prefix("<plain>")?;
+    let end = rest.find("</plain>")?;
+    let children_src = &rest[..end];
+    if children_src.is_empty() {
+        return None;
+    }
+    let children = parse_inline(children_src, ctx.depth, false);
+    Some((Node::Plain(children), start + 7 + end + 8))
+}
+
 /// One mfm-js `space` (`' ' | \u{3000} | '\t'`) at `i`.
 fn space_len(input: &str, i: usize) -> usize {
     let rest = &input[i..];
@@ -177,6 +276,9 @@ fn space_len(input: &str, i: usize) -> usize {
 fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
     if !ctx.inline_only {
         if let Some(hit) = try_code_block(input, start) {
+            return Some(hit);
+        }
+        if let Some(hit) = try_math_block(input, start) {
             return Some(hit);
         }
         if let Some(hit) = try_quote(input, start, ctx) {
@@ -198,6 +300,20 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
         }
     }
     let rest = &input[start..];
+    // `$[fn …]` — the mfm-js `fn` rule: name up to the space, children
+    // re-parsed inline until the `]` closer (nesting rides the depth ctx).
+    if let Some(hit) = try_fn(input, start, ctx) {
+        return Some(hit);
+    }
+    // `\(...\)` inline math — verbatim body like inlineCode (mfm-js
+    // mathInline `[^\n]+?`), no rescanning.
+    if let Some(hit) = try_math_inline(input, start) {
+        return Some(hit);
+    }
+    // `<plain>…</plain>` — children re-parsed with the inline rule set.
+    if let Some(hit) = try_plain(input, start, ctx) {
+        return Some(hit);
+    }
     // inline code first: the span is verbatim, nothing inside is rescanned.
     // Guards mirror the mfm-js inlineCode regex `[^\n`]+?` with the `(?!`)
     // closer lookahead: no newline inside, and the closer's next char may not
@@ -1117,9 +1233,140 @@ pub fn to_html(
                 out.push_str(&escape(content));
                 out.push_str("</a>");
             }
+            Node::Fn { name, children } => {
+                // upstream fn arm: `unixtime` → a `<time>` from the first
+                // child's text; a single-child `ruby` fn → `<ruby>` with the
+                // space-split text halves; anything else (and every error
+                // path) rides `fnDefault` → `<i>${children}</i>`.
+                match name.as_str() {
+                    "unixtime" => {
+                        let text = match children.first() {
+                            Some(Node::Text(t)) => t.clone(),
+                            _ => String::new(),
+                        };
+                        match text.parse::<i64>() {
+                            Ok(secs) => {
+                                let iso = unixtime_iso(secs);
+                                if let Some(iso) = iso {
+                                    out.push_str("<time datetime=\"");
+                                    out.push_str(&escape(&iso));
+                                    out.push_str("\">");
+                                    out.push_str(&escape(&iso));
+                                    out.push_str("</time>");
+                                    continue;
+                                }
+                                out.push_str("<i>");
+                                let inner = to_html(children, escape, url, mentioned_remote_users);
+                                out.push_str(&inner);
+                                out.push_str("</i>");
+                            }
+                            Err(_) => {
+                                out.push_str("<i>");
+                                out.push_str(&to_html(
+                                    children,
+                                    escape,
+                                    url,
+                                    mentioned_remote_users,
+                                ));
+                                out.push_str("</i>");
+                            }
+                        }
+                    }
+                    "ruby" => {
+                        if children.len() == 1 {
+                            let text = match &children[0] {
+                                Node::Text(t) => t.clone(),
+                                _ => String::new(),
+                            };
+                            let mut halves = text.splitn(2, ' ');
+                            let base = halves.next().unwrap_or("");
+                            let rt = halves.next().unwrap_or("");
+                            out.push_str("<ruby>");
+                            out.push_str(&escape(base));
+                            out.push_str("<rp>(</rp><rt>");
+                            out.push_str(&escape(rt));
+                            out.push_str("</rt><rp>)</rp></ruby>");
+                        } else {
+                            let Some(Node::Text(rt)) = children.last() else {
+                                out.push_str("<i>");
+                                out.push_str(&to_html(
+                                    children,
+                                    escape,
+                                    url,
+                                    mentioned_remote_users,
+                                ));
+                                out.push_str("</i>");
+                                continue;
+                            };
+                            out.push_str("<ruby>");
+                            out.push_str(&to_html(
+                                &children[..children.len() - 1],
+                                escape,
+                                url,
+                                mentioned_remote_users,
+                            ));
+                            out.push_str("<rp>(</rp><rt>");
+                            out.push_str(&escape(rt.trim()));
+                            out.push_str("</rt><rp>)</rp></ruby>");
+                        }
+                    }
+                    _ => {
+                        out.push_str("<i>");
+                        out.push_str(&to_html(children, escape, url, mentioned_remote_users));
+                        out.push_str("</i>");
+                    }
+                }
+            }
+            Node::MathInline(formula) => {
+                // mathInline == inlineCode's output shape.
+                out.push_str("<code>");
+                out.push_str(&escape(formula));
+                out.push_str("</code>");
+            }
+            Node::MathBlock(formula) => {
+                // mathBlock == blockCode's output shape.
+                out.push_str("<pre><code>");
+                out.push_str(&escape(formula));
+                out.push_str("</code></pre>");
+            }
+            Node::Plain(children) => {
+                out.push_str("<span>");
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
+                out.push_str("</span>");
+            }
         }
     }
     out
+}
+
+/// The `unixtime` fn arm's `new Date(parseInt(text, 10) * 1000).toISOString()`
+/// (civil-from-days, no external time crate; ms always `.000` like upstream).
+fn unixtime_iso(secs: i64) -> Option<String> {
+    let ms = secs.checked_mul(1000)?;
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let secs_of_day = secs.rem_euclid(86_400);
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y,
+        m,
+        d,
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+        millis
+    ))
 }
 
 /// The upstream `misc/escape-html.ts` `escapeHtml` — the exact five-special
@@ -1517,5 +1764,61 @@ mod tests {
             render("> foo search"),
             "<blockquote><a href=\"https://www.google.com/search?q=foo\">foo search</a></blockquote>"
         );
+    }
+
+    #[test]
+    fn fn_arm_unixtime_ruby_and_default() {
+        // fnDefault: unknown names render `<i>${children}</i>`
+        assert_eq!(render("$[tada abc]"), "<i>abc</i>");
+        // fn children re-parse: bold inside the fold
+        assert_eq!(render("$[sparkle **x**]"), "<i><b>x</b></i>");
+        // unixtime: `<time datetime="${iso}">${iso}</time>` from the first
+        // child's text (0 → 1970-01-01T00:00:00.000Z)
+        assert_eq!(
+            render("$[unixtime 0]"),
+            "<time datetime=\"1970-01-01T00:00:00.000Z\">1970-01-01T00:00:00.000Z</time>"
+        );
+        // unixtime parse failure rides fnDefault
+        assert_eq!(render("$[unixtime NaN]"), "<i>NaN</i>");
+        // single-text-child ruby: space-split base/rt halves
+        assert_eq!(
+            render("$[ruby 漢字 かんじ]"),
+            "<ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>"
+        );
+        // no space in the single child → empty rt
+        assert_eq!(
+            render("$[ruby 漢字]"),
+            "<ruby>漢字<rp>(</rp><rt></rt><rp>)</rp></ruby>"
+        );
+        // unterminated $[ stays literal
+        assert_eq!(render("$[tada abc"), "$[tada abc");
+    }
+
+    #[test]
+    fn math_inline_and_block_shapes() {
+        // mathInline == inlineCode's shape: `<code>${escape(formula)}</code>`
+        assert_eq!(render("\\(a<b\\)"), "<code>a&lt;b</code>");
+        // empty or newline-carrying body stays literal
+        assert_eq!(render("\\(\\)"), "\\(\\)");
+        assert_eq!(render("\\(a\nb\\)"), "\\(a<br />b\\)");
+        // mathBlock == blockCode's shape, anchored to lines
+        assert_eq!(render("\\[x+y\\]"), "<pre><code>x+y</code></pre>");
+        // empty block stays literal
+        assert_eq!(render("\\[\\]"), "\\[\\]");
+        // surrounding newlines fold into the node
+        assert_eq!(render("a\n\\[q\\]\nb"), "a<pre><code>q</code></pre>b");
+    }
+
+    #[test]
+    fn plain_wraps_in_span() {
+        // plain arm: `<span>${children}</span>` — children re-parse inline
+        assert_eq!(render("<plain>**x**</plain>"), "<span><b>x</b></span>");
+        // plain suppresses nothing visible in the pinned arm, but block
+        // rules do not apply inside (quote stays literal text)
+        assert_eq!(render("<plain>> q</plain>"), "<span>&gt; q</span>");
+        // empty plain stays literal
+        assert_eq!(render("<plain></plain>"), "&lt;plain&gt;&lt;/plain&gt;");
+        // unterminated stays literal
+        assert_eq!(render("<plain>x"), "&lt;plain&gt;x");
     }
 }
