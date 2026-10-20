@@ -828,6 +828,7 @@ name = "misskey-rs"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "mfm-rs",
  "mk-core",
  "mk-db",
  "mk-types",

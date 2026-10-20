@@ -264,25 +264,17 @@ fn escape_attr(s: &str) -> String {
     escape_xml(s)
 }
 
-/// MfmService.toHtml subset the pinned feed leg needs: '<'/'>'/'&' escaped,
-/// then `**bold**` folded to `<b>` — the literal `**a**` markers must never
-/// survive into a feed body (fetch-resource MFMを含まない rows).
+/// MfmService.toHtml subset the pinned feed leg needs: the mfm_rs inline
+/// node subset (Text/Bold/Italic/Strike/Small/InlineCode) rendered through
+/// the same '<'/'>'/'&'-only escape the old fold hack used — the literal
+/// `**a**` markers must never survive into a feed body (fetch-resource
+/// MFMを含まない rows).
 fn mfm_lite_html(text: &str) -> String {
-    let escaped = text
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    let mut out = String::new();
-    for (i, part) in escaped.split("**").enumerate() {
-        if i % 2 == 1 && !part.is_empty() {
-            out.push_str("<b>");
-            out.push_str(part);
-            out.push_str("</b>");
-        } else {
-            out.push_str(part);
-        }
-    }
-    out
+    mfm_rs::to_html(&mfm_rs::parse(text), &|s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    })
 }
 
 // ---------------------------------------------------------------------------
