@@ -256,6 +256,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "i"
         || name == "i/update"
         || name == "notes/create"
+        || name == "sw/register"
+        || name == "sw/unregister"
         || name == "notes/show"
         || name == "users/search"
         || name == "users/search-by-username-and-host"

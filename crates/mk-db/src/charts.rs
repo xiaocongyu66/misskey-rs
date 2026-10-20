@@ -75,7 +75,7 @@ pub async fn update_note(
                "___{prefix}_diffs_withFile" = "___{prefix}_diffs_withFile" + EXCLUDED."___{prefix}_diffs_withFile""#
     );
     sqlx::query(&sql)
-        .bind(date)
+        .bind(date as i32)
         .bind(total)
         .bind(if is_additional { 1 } else { 0 })
         .bind(if is_additional { 0 } else { 1 })
@@ -137,7 +137,7 @@ async fn bucket_counts(
             i64,
         ),
     >(&sql)
-    .bind(date)
+    .bind(date as i32)
     .fetch_optional(pool)
     .await?;
     Ok(match row {
