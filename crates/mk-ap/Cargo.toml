@@ -7,3 +7,13 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# fed-min: rsa = the SAME workspace crypto dep signup.rs keys users with —
+# RSA-SHA256 (PKCS#1 v1.5) verify + sha2 digest for the draft-cavage Digest
+# check; base64 0.22 rides the lock already (reqwest transitives).
+rsa = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+# fed-min: the createSignedPost round-trip test signs with a fresh key
+# (generate_rsa_keypair_pem's rand::thread_rng pattern).
+rand = { workspace = true }
