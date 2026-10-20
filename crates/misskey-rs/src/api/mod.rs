@@ -275,6 +275,10 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // notes/replies (endpoints/notes/replies.ts, requireCredential)
         || name == "notes/replies"
         || name == "notes/mentions"
+        // meili-min: notes/search (endpoints/notes/search.ts, SQL fallback
+        // branch) + notes/search-by-tag (endpoints/notes/search-by-tag.ts)
+        || name == "notes/search"
+        || name == "notes/search-by-tag"
         || name == "notes/thread-muting/create"
         || name == "notes/thread-muting/delete"
         // mute lane: the reset the Mute e2e stream legs run before each
@@ -358,6 +362,15 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         }
         if name == "notes/mentions" {
             return notes_mentions(&state, &body, token).await;
+        }
+        // meili-min: the two search lanes (guest-ok, a riding me still 401s
+        // and feeds the pack; only notes/search carries the canSearchNotes
+        // gate — upstream notes/search-by-tag.ts has no RoleService)
+        if name == "notes/search" {
+            return notes_search(&state, &body, token).await;
+        }
+        if name == "notes/search-by-tag" {
+            return notes_search_by_tag(&state, &body, token).await;
         }
         if name == "notes/thread-muting/create" || name == "notes/thread-muting/delete" {
             return notes_thread_muting(&state, name.as_str(), &body, token).await;
@@ -4913,6 +4926,253 @@ async fn notes_replies(state: &AppState, body: &Value, token: Option<String>) ->
             Err(r) => return r,
         }
         match pack_note_for(state, pool, &row.id, Some(&me_id)).await {
+            Ok(v) => out.push(v),
+            Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// meili-min: notes/search (endpoints/notes/search.ts) + notes/search-by-tag
+// (endpoints/notes/search-by-tag.ts). The SQL fallback branch IS upstream's
+// no-Meili default (SearchService.searchNoteByLike); search_bridge stays
+// unwired this slice.
+// ---------------------------------------------------------------------------
+
+/// Guest-ok credential resolution for the two search lanes: no token → None
+/// (guest); a PRESENTED token runs the full ApiCallService chain (16-char
+/// check → 401, unresolvable → 401, suspended → 403 YOUR_ACCOUNT_SUSPENDED)
+/// and returns the user row the canSearchNotes gate reads.
+async fn search_lane_me(
+    pool: &mk_db::sqlx::PgPool,
+    token: Option<&str>,
+) -> Result<Option<mk_db::user::LocalUserRow>, Response> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    if token.len() != 16 {
+        return Err(authentication_failed());
+    }
+    let Some(me_id) = resolve_me(pool, Some(token)).await else {
+        return Err(authentication_failed());
+    };
+    match mk_db::user::find_user_by_id(pool, &me_id).await {
+        Ok(Some(row)) => {
+            if row.is_suspended {
+                return Err(api_err(ApiError::new(
+                    403,
+                    mk_types::api_error::ApiErrorKind::Permission,
+                    "YOUR_ACCOUNT_SUSPENDED",
+                    "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370",
+                    "Your account has been suspended.",
+                )));
+            }
+            Ok(Some(row))
+        }
+        Ok(None) => Err(authentication_failed()),
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "find_user_by_id[notes/search]");
+            Err(api_err(ApiError::internal_error()))
+        }
+    }
+}
+
+/// notes/search UNAVAILABLE gate — upstream `policies.canSearchNotes` with
+/// the DEFAULT_POLICIES base `false` (roles_v2.rs:50): granted when ANY
+/// effective role the user holds carries an explicit `useDefault: false,
+/// value: true` entry (a `useDefault: true` entry votes the base false, the
+/// same any-true merge UserPolicy uses for its boolean keys).
+fn can_search_notes(roles: &[mk_db::role::AssignedRole]) -> bool {
+    roles.iter().any(|r| {
+        r.policies
+            .get("canSearchNotes")
+            .and_then(|e| e.as_object())
+            .map(|o| {
+                !o.get("useDefault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+                    && o.get("value").and_then(|v| v.as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// notes/search UNAVAILABLE — meta.errors.unavailable carries NO kind /
+/// httpStatusCode, so ApiError's client default applies → HTTP 400 (the
+/// same shape the notes/translate gate answers in this tree).
+fn search_unavailable() -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        "UNAVAILABLE",
+        "0b44998d-77aa-4427-80d0-d2c9b8523011",
+        "Search of notes unavailable.",
+    ))
+}
+
+/// `POST /api/notes/search` (endpoints/notes/search.ts) — flow mirrors the
+/// endpoint body: params (ajv-equivalent type checks) → sinceDate/untilDate
+/// → id gen (untilId ?? gen(untilDate), the `ps.untilDate ?` guard skipping
+/// 0) → `getUserPolicies(me).canSearchNotes` gate → searchNoteByLike →
+/// packMany(me). Guest note: the base canSearchNotes is DEFAULT-false and
+/// instance meta.policies overrides are not modeled in this lane, so a guest
+/// (and any role-less user) reads UNAVAILABLE.
+async fn notes_search(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me = match search_lane_me(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(query) = body.get("query").and_then(|v| v.as_str()) else {
+        return invalid_param("query", "required");
+    };
+    let limit = match opt_int_param(body, "limit") {
+        Ok(v) => v.unwrap_or(10).clamp(1, 100),
+        Err(r) => return r,
+    };
+    let offset = match opt_int_param(body, "offset") {
+        Ok(v) => v.unwrap_or(0).max(0),
+        Err(r) => return r,
+    };
+    let mut since_id = match opt_id_param(body, "sinceId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+    let mut until_id = match opt_id_param(body, "untilId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+    let since_date = match opt_int_param(body, "sinceDate") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let until_date = match opt_int_param(body, "untilDate") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if until_id.is_none() {
+        if let Some(d) = until_date.filter(|d| *d != 0) {
+            until_id = Some(mk_types::id::gen_aid(d));
+        }
+    }
+    if since_id.is_none() {
+        if let Some(d) = since_date.filter(|d| *d != 0) {
+            since_id = Some(mk_types::id::gen_aid(d));
+        }
+    }
+    let host = match opt_str_param(body, "host") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let user_id = match opt_id_param(body, "userId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+    let channel_id = match opt_id_param(body, "channelId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+
+    let Some(row) = &me else {
+        return search_unavailable();
+    };
+    let granted = match mk_core::services::roles_v2::user_effective_roles(pool, row).await {
+        Ok(roles) => can_search_notes(&roles),
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "user_effective_roles[notes/search]");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    if !granted {
+        return search_unavailable();
+    }
+
+    let rows = match mk_db::note::search_notes(
+        pool,
+        &mk_db::note::escape_like(query),
+        host.as_deref(),
+        user_id.as_deref(),
+        channel_id.as_deref(),
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "search_notes");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        match pack_note_for(state, pool, &r.id, Some(&row.id)).await {
+            Ok(v) => out.push(v),
+            Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `POST /api/notes/search-by-tag` (endpoints/notes/search-by-tag.ts) — the
+/// single-`tag` branch of the direct TypeORM query. Upstream has NO
+/// canSearchNotes gate here (no RoleService in the file) — the endpoint
+/// queries the notes table directly, so only notes/search gates. The `query`
+/// array-of-arrays OR/AND matrix and the reply/renote/withFiles/poll toggles
+/// are not ported this slice; upstream packs packMany(me) likewise.
+async fn notes_search_by_tag(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me = match search_lane_me(pool, token.as_deref()).await {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    // paramDef: `tag` required, minLength 1 (the ajv rejection for both).
+    let tag = match body.get("tag").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => return invalid_param("tag", "required"),
+    };
+    let limit = match opt_int_param(body, "limit") {
+        Ok(v) => v.unwrap_or(10).clamp(1, 100),
+        Err(r) => return r,
+    };
+    let offset = match opt_int_param(body, "offset") {
+        Ok(v) => v.unwrap_or(0).max(0),
+        Err(r) => return r,
+    };
+    let since_id = match opt_id_param(body, "sinceId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+    let until_id = match opt_id_param(body, "untilId") {
+        Ok(v) => v.map(String::from),
+        Err(r) => return r,
+    };
+    let rows = match mk_db::note::search_notes_by_tag(
+        pool,
+        tag,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_search", error = %e, "search_notes_by_tag");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        match pack_note_for(state, pool, &r.id, me.as_ref().map(|m| m.id.as_str())).await {
             Ok(v) => out.push(v),
             Err(r) => return *r,
         }
