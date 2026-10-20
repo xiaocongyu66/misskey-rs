@@ -1224,6 +1224,24 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
         {
             return db_err("renote insert_poll", e);
         }
+        // queue-min (NoteCreateService.ts L819-829): the renote arm of the
+        // ONE upstream create() enqueues the same delayed
+        // `endedPollNotification` job for an expiring poll (fire-and-forget —
+        // see the notes/create text lane for the parity notes).
+        if let Some(exp) = p.expires_at_ms {
+            let delay = (exp - super::now_ms() as i64).max(0) as u64;
+            let payload = json!({ "type": "endedPollNotification", "noteId": id });
+            if let Err(e) = mk_queue::QueueHandle::new(pool.clone())
+                .enqueue_delayed(
+                    "endedPollNotification",
+                    &payload,
+                    std::time::Duration::from_millis(delay),
+                )
+                .await
+            {
+                tracing::error!(target: "dbg_social", error = %e, "renote endedPollNotification enqueue");
+            }
+        }
     }
     // utl-misc (users/notes [チャンネル外リノート] チャンネルミュート leg +
     // the channels/timeline renote legs): insertNote's channel denormalization
