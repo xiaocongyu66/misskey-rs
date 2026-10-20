@@ -84,6 +84,10 @@ pub mod reversi;
 // no migration)
 pub mod user;
 pub mod webhook;
+// charts arena: __chart__notes / __chart_day__notes commit + read paths
+// (0001 baseline — hour/day tables ship with the span split; `date` is the
+// span-normalized epoch second under a UNIQUE btree per table)
+pub mod charts;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await
