@@ -35,3 +35,19 @@ pub async fn fetch_is_deleted(pool: &PgPool, user_id: &str) -> Result<Option<boo
         .fetch_optional(pool)
         .await
 }
+
+/// queue-min (DeleteAccountProcessorService `{ // Delete notes }`): the notes
+/// purge leg of the soft `deleteAccount` queue job. Upstream pages 100 ids
+/// per batch and unindexes each note; the port deletes in one statement (no
+/// search index to unindex yet). The user row itself SURVIVES — the 削除済
+/// census keeps reading it from the users lists.
+/// TODO(queue-min): drive files / pages / avatar-banner purge, the
+/// `soft: false` user-row removal and the Delete Activity delivery stay
+/// unported (upstream `{ // Delete files }` onward).
+pub async fn purge_notes(pool: &PgPool, user_id: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(r#"DELETE FROM "note" WHERE "userId" = $1"#)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}

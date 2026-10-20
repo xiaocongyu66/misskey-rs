@@ -92,6 +92,44 @@ pub async fn insert_if_not_muted(
     insert_notification(pool, n).await
 }
 
+/// queue-min: pollEnded dedup probe — the at-least-once queue (plus the
+/// per-note delayed job AND the hourly window scan both able to fire on the
+/// same poll) must not double-notify; upstream BullMQ gets the same from one
+/// delayed job per note + removeOnComplete. A checked-then-insert probe (not
+/// a unique index) so the shared 42P01 self-heal insert path stays untouched.
+pub async fn poll_ended_notified(
+    pool: &PgPool,
+    notifiee_id: &str,
+    note_id: &str,
+) -> Result<bool, sqlx::Error> {
+    match poll_ended_notified_once(pool, notifiee_id, note_id).await {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            poll_ended_notified_once(pool, notifiee_id, note_id).await
+        }
+        r => r,
+    }
+}
+
+async fn poll_ended_notified_once(
+    pool: &PgPool,
+    notifiee_id: &str,
+    note_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let v: Option<i32> = sqlx::query_scalar(
+        r#"
+        SELECT 1 FROM "notification"
+        WHERE "notifieeId" = $1 AND "type" = 'pollEnded' AND "noteId" = $2
+        LIMIT 1
+        "#,
+    )
+    .bind(notifiee_id)
+    .bind(note_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(v.is_some())
+}
+
 /// Columns carried by the M2 notification pack (createdAt is packed from the
 /// aid timestamp at the pack layer, like notes).
 pub const NOTIFICATION_COLS: &str = r#""id", ("type"::text) AS "type", ("isRead") AS "is_read", "noteId" AS "note_id", "notifierId" AS "notifier_id", "reaction""#;

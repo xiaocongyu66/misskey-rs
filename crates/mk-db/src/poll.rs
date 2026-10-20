@@ -122,6 +122,72 @@ pub async fn bump_poll_vote(pool: &PgPool, note_id: &str, choice: i32) -> Result
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// queue-min: the endedPollNotification scan (upstream
+// EndedPollNotificationProcessorService.ts + the delayed job NoteCreateService
+// enqueues at poll expiry, NoteCreateService.ts L819-829)
+// ---------------------------------------------------------------------------
+
+/// The `endedPollNotification` candidate set, in one query:
+/// - per-note arm (`note_filter = Some`): the given note's poll once its
+///   `expiresAt` passed — the delayed job the note-create path enqueues with
+///   `run_after = expiresAt` can only be claimed afterwards, and the
+///   `<= now()` gate keeps a hand-crafted early payload from notifying ahead
+///   of the deadline;
+/// - scan arm (`note_filter = None`): every poll that expired WITHIN THE LAST
+///   HOUR and carries at least one vote (the window the hourly sweep pins;
+///   it also makes re-scans self-limiting — rows age out of it).
+pub async fn ended_poll_note_ids(
+    pool: &PgPool,
+    note_filter: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT p."noteId" FROM "poll" p
+        JOIN "note" n ON n."id" = p."noteId"
+        WHERE p."expiresAt" IS NOT NULL
+          AND p."expiresAt" <= now()
+          AND ($1::text IS NULL OR p."noteId" = $1)
+          AND (
+              $1::text IS NOT NULL
+              OR (
+                  p."expiresAt" > now() - interval '1 hour'
+                  AND EXISTS (
+                      SELECT 1 FROM "poll_vote" v WHERE v."noteId" = p."noteId"
+                  )
+              )
+          )
+        "#,
+    )
+    .bind(note_filter)
+    .fetch_all(pool)
+    .await
+}
+
+/// Local (`user.host IS NULL`) recipients of the pollEnded notification: the
+/// author plus every distinct voter (EndedPollNotificationProcessorService
+/// L49-57 `[...new Set([note.userId, ...votes.map(v.userId)])]`, then the
+/// per-user `profile.userHost === null` gate).
+pub async fn poll_ended_recipient_ids(
+    pool: &PgPool,
+    note_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT u."id" FROM "user" u
+        WHERE u."host" IS NULL
+          AND u."id" IN (
+              SELECT n."userId" FROM "note" n WHERE n."id" = $1
+              UNION
+              SELECT v."userId" FROM "poll_vote" v WHERE v."noteId" = $1
+          )
+        "#,
+    )
+    .bind(note_id)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
