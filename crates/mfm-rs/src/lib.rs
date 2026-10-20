@@ -35,6 +35,20 @@ pub enum Node {
     /// `:name:` custom emoji → `\u{200B}:name:\u{200B}` (the upstream arm
     /// wraps the code in zero-width spaces, it does not emit an `<img>`).
     EmojiCode(String),
+    /// `#tag` → `<a href="{config.url}/tags/tag" rel="tag">#tag</a>`; the
+    /// rendered href rides the `url` argument of [`to_html`].
+    Hashtag(String),
+}
+
+/// The upstream `IMentionedRemoteUsers` entry (src/models/Note.ts) — the
+/// fields the mention arm reads for the href override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionedRemoteUser {
+    pub username: String,
+    pub host: String,
+    /// `remoteUser.url` — preferred over `uri` when present.
+    pub url: Option<String>,
+    pub uri: String,
 }
 
 /// Scanner context: `inline_only` selects the mfm-js `inline` alternation
@@ -145,6 +159,9 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
         }
     }
     if let Some(hit) = try_emoji_code(input, start) {
+        return Some(hit);
+    }
+    if let Some(hit) = try_hashtag(input, start) {
         return Some(hit);
     }
     let rest = &input[start..];
@@ -395,12 +412,127 @@ fn try_emoji_code(input: &str, start: usize) -> Option<(Node, usize)> {
     Some((Node::EmojiCode(input[name_start..j].to_string()), j + 1))
 }
 
+/// mfm-js hashtag: `'#' + item+` where an item is a `(`/`[`/`「`/`（` bracket
+/// group (nestable, same-type closer) or a char outside the close set
+/// `[ \u{3000}\t.,!?'"#:/[\]【】()「」（）<>\r\n]`. Not a tag: preceded by an
+/// ASCII alnum, empty run, or an all-digit run. The tag text is raw (the
+/// render arm escapes + encodeURIComponent's it).
+fn try_hashtag(input: &str, start: usize) -> Option<(Node, usize)> {
+    if !input[start..].starts_with('#') {
+        return None;
+    }
+    // upstream: notMatch(/[a-z0-9]$/i) over the text before the '#'
+    if let Some(prev) = input[..start].chars().next_back() {
+        if prev.is_ascii_alphanumeric() {
+            return None;
+        }
+    }
+    let mut j = start + 1;
+    while let Some(next) = hash_tag_item(input, j, 0) {
+        j = next;
+    }
+    let tag = &input[start + 1..j];
+    if tag.is_empty() || tag.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((Node::Hashtag(tag.to_string()), j))
+}
+
+/// The four nestable bracket pairs a hashtag item may open.
+const HASH_TAG_BRACKETS: [(&str, &str); 4] = [("(", ")"), ("[", "]"), ("「", "」"), ("（", "）")];
+
+/// One hashtag item; `None` ends the run (the rest stays literal text).
+fn hash_tag_item(input: &str, i: usize, depth: u32) -> Option<usize> {
+    if depth < 20 {
+        for (open, close) in HASH_TAG_BRACKETS {
+            if input[i..].starts_with(open) {
+                let mut j = i + open.len();
+                loop {
+                    if input[j..].starts_with(close) {
+                        return Some(j + close.len());
+                    }
+                    j = hash_tag_item(input, j, depth + 1)?;
+                }
+            }
+        }
+    }
+    let ch = input[i..].chars().next()?;
+    let excluded = matches!(
+        ch,
+        ' ' | '\t'
+            | '\u{3000}'
+            | '.'
+            | ','
+            | '!'
+            | '?'
+            | '\''
+            | '"'
+            | '#'
+            | ':'
+            | '/'
+            | '['
+            | ']'
+            | '【'
+            | '】'
+            | '('
+            | ')'
+            | '「'
+            | '」'
+            | '（'
+            | '）'
+            | '<'
+            | '>'
+            | '\r'
+            | '\n'
+    );
+    if excluded {
+        None
+    } else {
+        Some(i + ch.len_utf8())
+    }
+}
+
+/// JS `encodeURIComponent` — unreserved set `A-Za-z0-9 - _ . ! ~ * ' ( )`;
+/// every other byte rides as UTF-8 percent-encoding (uppercase hex).
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Render nodes to HTML — the `MfmService.toHtml` visitor subset:
 /// bold→`<b>`, strike→`<del>`, italic→`<i>`, small→`<small>`,
 /// inlineCode→`<code>` (content escaped), blockCode→`<pre><code>`,
 /// quote→`<blockquote>`, center→`<div style="text-align: center;">`,
+/// emojiCode→`\u{200B}:name:\u{200B}`, hashtag→`<a href="…/tags/…" rel="tag">`,
 /// text nodes escaped through `escape` with newlines folded to `<br />`.
-pub fn to_html(nodes: &[Node], escape: &dyn Fn(&str) -> String) -> String {
+///
+/// `url` is the upstream `config.url` (an origin, no trailing slash —
+/// upstream normalizes it to `new URL(yamlUrl).origin`); hashtag hrefs hang
+/// off it. `mentioned_remote_users` mirrors the upstream `mentionedRemoteUsers`
+/// default `[]` — the mention arm consults it for href overrides.
+pub fn to_html(
+    nodes: &[Node],
+    escape: &dyn Fn(&str) -> String,
+    url: &str,
+    mentioned_remote_users: &[MentionedRemoteUser],
+) -> String {
     let mut out = String::new();
     for node in nodes {
         match node {
@@ -415,22 +547,22 @@ pub fn to_html(nodes: &[Node], escape: &dyn Fn(&str) -> String) -> String {
             }
             Node::Bold(children) => {
                 out.push_str("<b>");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</b>");
             }
             Node::Italic(children) => {
                 out.push_str("<i>");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</i>");
             }
             Node::Strike(children) => {
                 out.push_str("<del>");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</del>");
             }
             Node::Small(children) => {
                 out.push_str("<small>");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</small>");
             }
             Node::InlineCode(code) => {
@@ -446,14 +578,14 @@ pub fn to_html(nodes: &[Node], escape: &dyn Fn(&str) -> String) -> String {
             }
             Node::Quote(children) => {
                 out.push_str("<blockquote>");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</blockquote>");
             }
             Node::Center(children) => {
                 // upstream: `<div style="text-align: center;">…</div>` (not
                 // the legacy align attribute).
                 out.push_str("<div style=\"text-align: center;\">");
-                out.push_str(&to_html(children, escape));
+                out.push_str(&to_html(children, escape, url, mentioned_remote_users));
                 out.push_str("</div>");
             }
             Node::EmojiCode(name) => {
@@ -465,6 +597,18 @@ pub fn to_html(nodes: &[Node], escape: &dyn Fn(&str) -> String) -> String {
                 out.push_str(&escape(name));
                 out.push(':');
                 out.push('\u{200B}');
+            }
+            Node::Hashtag(tag) => {
+                // upstream: `<a href="${escapeHtml(
+                //   `${config.url}/tags/${encodeURIComponent(hashtag)}`)}" rel="tag">#…</a>`
+                out.push_str("<a href=\"");
+                out.push_str(&escape(&format!(
+                    "{url}/tags/{}",
+                    encode_uri_component(tag)
+                )));
+                out.push_str("\" rel=\"tag\">#");
+                out.push_str(&escape(tag));
+                out.push_str("</a>");
             }
         }
     }
@@ -489,7 +633,7 @@ mod tests {
     /// Render helper — pins ride the upstream escape set
     /// (`misc/escape-html.ts`, the five specials with `&#039;`).
     fn render(input: &str) -> String {
-        to_html(&parse(input), &escape_html)
+        to_html(&parse(input), &escape_html, "http://misskey.local", &[])
     }
 
     // Parity pins: packages/backend/src/core/MfmService.ts `toHtml` handlers
@@ -652,5 +796,47 @@ mod tests {
         assert_eq!(render("x:emoji:y"), "x:emoji:y");
         assert_eq!(render("x:emoji:"), "x\u{200B}:emoji:\u{200B}");
         assert_eq!(render("::"), "::");
+    }
+
+    #[test]
+    fn hashtag_links_to_config_tags() {
+        // hashtag arm: `<a href="${config.url}/tags/…" rel="tag">#…</a>`
+        assert_eq!(
+            render("#foo"),
+            "<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a>"
+        );
+        // close-set chars end the tag and stay text
+        assert_eq!(
+            render("#foo.bar"),
+            "<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a>.bar"
+        );
+        assert_eq!(
+            render("#foo bar"),
+            "<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a> bar"
+        );
+        // bracket groups nest into the tag
+        assert_eq!(
+            render("#foo(bar)"),
+            "<a href=\"http://misskey.local/tags/foo(bar)\" rel=\"tag\">#foo(bar)</a>"
+        );
+        assert_eq!(
+            render("#foo(bar"),
+            "<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a>(bar"
+        );
+        // percent-encoding rides encodeURIComponent (uppercase UTF-8 hex)
+        assert_eq!(
+            render("#日本語タグ"),
+            "<a href=\"http://misskey.local/tags/%E6%97%A5%E6%9C%AC%E8%AA%9E%E3%82%BF%E3%82%B0\" rel=\"tag\">#日本語タグ</a>"
+        );
+    }
+
+    #[test]
+    fn hashtag_needs_anchor_and_non_digits() {
+        assert_eq!(render("x#foo"), "x#foo"); // alnum-preceded '#'
+        assert_eq!(
+            render("##foo"),
+            "#<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a>"
+        );
+        assert_eq!(render("#123"), "#123"); // all-digit run
     }
 }

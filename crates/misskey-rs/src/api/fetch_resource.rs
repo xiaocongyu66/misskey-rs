@@ -264,17 +264,25 @@ fn escape_attr(s: &str) -> String {
     escape_xml(s)
 }
 
-/// MfmService.toHtml subset the pinned feed leg needs: the mfm_rs inline
-/// node subset (Text/Bold/Italic/Strike/Small/InlineCode) rendered through
-/// the same '<'/'>'/'&'-only escape the old fold hack used — the literal
-/// `**a**` markers must never survive into a feed body (fetch-resource
-/// MFMを含まない rows).
-fn mfm_lite_html(text: &str) -> String {
-    mfm_rs::to_html(&mfm_rs::parse(text), &|s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    })
+/// MfmService.toHtml subset the pinned feed leg needs: the mfm_rs node
+/// subset (Text/Bold/Italic/Strike/Small/InlineCode/BlockCode/Quote/Center/
+/// EmojiCode/Hashtag) rendered through the same '<'/'>'/'&'-only escape the
+/// old fold hack used — the literal `**a**`/`#tag`/`:emoji:` markers must
+/// never survive into a feed body (fetch-resource MFMを含まない rows).
+/// `url` rides the feed origin as the upstream `config.url`; the feed lane
+/// passes no `mentionedRemoteUsers` (upstream FeedService default `[]` —
+/// local mentions fall back to `{url}/{acct}` exactly as upstream).
+fn mfm_lite_html(text: &str, url: &str) -> String {
+    mfm_rs::to_html(
+        &mfm_rs::parse(text),
+        &|s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        },
+        url,
+        &[],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +727,7 @@ fn render_rss(
         }
         if let Some(text) = text {
             items.push_str("<content:encoded>");
-            items.push_str(&escape_xml(&mfm_lite_html(text)));
+            items.push_str(&escape_xml(&mfm_lite_html(text, origin)));
             items.push_str("</content:encoded>");
         }
         items.push_str("</item>");
@@ -774,7 +782,7 @@ fn render_atom(
         }
         if let Some(text) = text {
             entries.push_str("<content type=\"html\">");
-            entries.push_str(&escape_xml(&mfm_lite_html(text)));
+            entries.push_str(&escape_xml(&mfm_lite_html(text, origin)));
             entries.push_str("</content>");
         }
         entries.push_str("</entry>");
@@ -819,7 +827,7 @@ fn render_json_feed(
             item["summary"] = json!(cw);
         }
         if let Some(text) = text {
-            item["content_html"] = json!(mfm_lite_html(text));
+            item["content_html"] = json!(mfm_lite_html(text, origin));
         }
         items.push(item);
     }
