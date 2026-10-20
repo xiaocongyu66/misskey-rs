@@ -113,16 +113,27 @@ the web front door (apOrHtml negotiation, feeds, SSR metas), account migration,
 and the export-clips queue lane. Known substantive gaps vs upstream
 (misskey @ ea2c3aed), each verified by absence of the symbol:
 
-- **Federation transport** — no ActivityPub inbox POST handling, no HTTP-Signature
-  signer (`mk-ap` is a stub; only the GET-HTML side of `/inbox` exists).
-- **Queue processors** — only `exportClips` is ported; the BullMQ processor family
-  (email deliverer, export-* beyond clips, etc.) is absent (`mk-queue/src` is lib-only).
+- **Federation transport** — skeleton landed: `mk-ap::signature` (HTTP-Signature
+  parse/signing-string/RSA-SHA256 verify per `ap-request.ts` pins) and
+  `mk-ap::inbox` (activity classify + 202-accept dispatch) are live on
+  `POST /inbox` + `POST /users/:id/inbox`. Still missing: remote-key lookup by
+  keyId, worker-side verify wiring, and the per-activity processors
+  (Create{Note} upsert, Follow rows, etc.).
+- **Queue processors** — `exportClips`, `endedPollNotification` (delayed enqueue
+  on both poll-insert lanes, pollEnded notifications for local author+voters)
+  and `deleteAccount` (soft slice: note purge + isDeleted) are ported onto the
+  durable PG worker. Still missing: the Export*/Import* family beyond clips,
+  email deliverer, Redis fanout on notification insert.
 - **Web push and email** — not implemented (no `web_push`/`sendEmail` symbols).
-- **Meilisearch** — a thin bridge (`search_bridge.rs`); upstream's full indexing
-  domain is not ported.
+- **Meilisearch** — `notes/search` + `notes/search-by-tag` endpoints landed with
+  the upstream no-Meili semantics (SQL ILIKE fallback, `UNAVAILABLE`
+  0b44998d gate, host `.` sentinel, suspended-author filter). Still missing:
+  index writes on note create/delete and Meili-backed query paths.
 - **Charts / stats aggregation** — absent; nodeinfo counts are direct queries.
-- **MFM rendering** — feeds use a minimal bold-fold renderer; the full MFM→HTML
-  pipeline is not ported (`mfm-rs` is a stub).
+- **MFM rendering** — a real parser/renderer lives in `mfm-rs` (Text/Bold/Italic/
+  Strike/Small/InlineCode with upstream escape parity, strike→`<del>`), and
+  feeds use it. Still missing: the remaining mfm-js node set (mentions,
+  hashtags, custom emoji, quote/center/code-block, ruby, fn).
 
 These are roadmap items, not regressions: every claim in the verification matrix is
 backed by a GitHub Actions run log, and nothing in the table asserts federation,
