@@ -223,6 +223,17 @@ async fn i_delete_account(state: &AppState, body: &Value, token: Option<&str>) -
             return internal();
         }
     }
+    // queue-min (DeleteAccountService.deleteAccount → createDeleteAccountJob):
+    // the purge rides the durable `deleteAccount` db-queue job
+    // (`{ user: { id }, soft: true }`); the queue_processors worker runs the
+    // soft slice (notes purge + isDeleted re-assert).
+    let payload = json!({ "type": "deleteAccount", "user": { "id": me.id }, "soft": true });
+    if let Err(e) = mk_queue::QueueHandle::new(pool.clone())
+        .enqueue("deleteAccount", &payload)
+        .await
+    {
+        tracing::error!(target: "dbg_delete_account", error = %e, "deleteAccount enqueue[me]");
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -305,6 +316,14 @@ async fn admin_delete_account(state: &AppState, body: &Value, token: Option<&str
             tracing::error!(target: "dbg_delete_account", error = %e, "soft_delete[target]");
             return internal();
         }
+    }
+    // queue-min: the soft `deleteAccount` job (see the i/delete-account arm).
+    let payload = json!({ "type": "deleteAccount", "user": { "id": target.id }, "soft": true });
+    if let Err(e) = mk_queue::QueueHandle::new(pool.clone())
+        .enqueue("deleteAccount", &payload)
+        .await
+    {
+        tracing::error!(target: "dbg_delete_account", error = %e, "deleteAccount enqueue[target]");
     }
     StatusCode::NO_CONTENT.into_response()
 }

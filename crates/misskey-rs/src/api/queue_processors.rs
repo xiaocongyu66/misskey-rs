@@ -12,11 +12,16 @@
 //!   (DeleteAccountService.ts createDeleteAccountJob —
 //!   `{ user: { id }, soft: true }`).
 //!
+//! Upstream DeleteAccountProcessorService is the full purge (notes, files,
+//! pages, search unindex, `soft: false` user-row removal); the port runs the
+//! SOFT slice (notes purge + `isDeleted` re-assert) — the TODO list rides
+//! run_delete_account and mk-db::delete_account::purge_notes.
+//!
 //! Divergences (documented, intentional): no BullMQ removeOnComplete age
 //! caps — mk_queue deletes a completed job outright (no completed set); the
 //! pollEnded insert carries a dedup probe because the at-least-once queue
 //! (plus the scan arm racing the per-note job) can re-deliver the same
-//! (notifiee, note) pair.
+//! (notifiee, note) pair; deleteAccount's purge is the soft slice only.
 
 use serde_json::Value;
 
