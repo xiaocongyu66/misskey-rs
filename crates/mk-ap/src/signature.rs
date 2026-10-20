@@ -25,6 +25,7 @@ use base64::Engine;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::sha2::{Digest, Sha256};
 use rsa::signature::Verifier;
+use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey};
 
 /// The pieces a caller needs to finish the trust chain upstream performs in
@@ -218,6 +219,45 @@ pub fn verify_http_signature(
         signing_string,
         signature: parsed.signature,
     })
+}
+
+/// `ApRequestCreator.createSignedPost` — the sender-side counterpart of
+/// [`verify_http_signature`]: sign the same four lines
+/// (`(request-target) date host digest`) with rsa-sha256 over the PKCS#8
+/// (PKCS#1 accepted) private key PEM and emit the `Signature:` header value
+/// exactly the way upstream's `Signed.signature` is assembled. The fed-2
+/// processor tests drive the full local loop through this pair (sign →
+/// verify_and_route) the way e2e/AP clients drive the inbox row.
+pub fn create_signed_post(
+    key_id: &str,
+    private_key_pem: &str,
+    method: &str,
+    path: &str,
+    host: &str,
+    date: &str,
+    body: &[u8],
+) -> Result<String, ()> {
+    use rsa::signature::{SignatureEncoding, Signer};
+
+    let key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_key_pem))
+        .map_err(|_| ())?;
+    let digest = create_digest(body);
+    let include: Vec<String> = ["(request-target)", "date", "host", "digest"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let signing_string =
+        gen_signing_string(method, path, host, Some(date), Some(&digest), &include)?;
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(
+        rsa::pkcs1v15::SigningKey::<Sha256>::new(key)
+            .sign(signing_string.as_bytes())
+            .to_bytes(),
+    );
+    Ok(format!(
+        "keyId=\"{key_id}\",algorithm=\"rsa-sha256\",\
+         headers=\"(request-target) date host digest\",signature=\"{signature_b64}\""
+    ))
 }
 
 /// RSA-SHA256 (RSASSA-PKCS1-v1_5 with SHA-256) over the signing string — the

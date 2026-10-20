@@ -12,6 +12,11 @@ serde_json = { workspace = true }
 # check; base64 0.22 rides the lock already (reqwest transitives).
 rsa = { workspace = true }
 base64 = "0.22"
+# fed-2: the InboxProcessorService worker lane persists through mk-db's
+# following/note_reaction/note helpers and ids via mk_types::id (gen_aid_now).
+mk-db = { workspace = true }
+mk-types = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 # fed-min: the createSignedPost round-trip test signs with a fresh key
