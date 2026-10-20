@@ -1,9 +1,9 @@
 //! MFM (Misskey Markup Language) subset: the node types `MfmService.toHtml`
 //! renders on the feed / AP planes — text, bold, italic, strike, small,
-//! inline code, block code, quote, center, emoji code. Hand scanner +
-//! visitor, pinned to the upstream `packages/backend/src/core/MfmService.ts`
-//! handlers; the full mfm-js AST port lands in M2 (needed by
-//! NoteCreateService).
+//! inline code, block code, quote, center, emoji code, hashtag, mention,
+//! link, url, search. Hand scanner + visitor, pinned to the upstream
+//! `packages/backend/src/core/MfmService.ts` handlers; the full mfm-js AST
+//! port lands in M2 (needed by NoteCreateService).
 
 /// One MFM node — the `mfm.MfmNode` subset the upstream
 /// `MfmService.toHtml` visitor (src/core/MfmService.ts) renders.
@@ -46,6 +46,22 @@ pub enum Node {
         host: Option<String>,
         acct: String,
     },
+    /// `[text](url)` / `?[text](url)` → `<a href="…">text</a>`. `silent` is
+    /// parsed but the pinned backend arm never reads it (the frontend
+    /// renderer does). The label parses with the inline rule set under
+    /// mfm-js `linkLabel` (mention/hashtag/url never fold inside).
+    Link {
+        silent: bool,
+        url: String,
+        children: Vec<Node>,
+    },
+    /// Bare `https://…` or bracketed `<https://…>` → `<a href="…">url</a>`;
+    /// the props keep the raw matched url (the render normalizes through
+    /// `new URL`), `brackets` mirrors the mfm-js `urlAlt` prop.
+    Url { url: String, brackets: bool },
+    /// A `query search` / `query 検索` line → the Google-search link; the
+    /// whole line (minus its trailing newline) rides as `content`.
+    Search { query: String, content: String },
 }
 
 /// The upstream `IMentionedRemoteUsers` entry (src/models/Note.ts) — the
@@ -182,10 +198,13 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
         }
     }
     let rest = &input[start..];
-    // inline code first: the span is verbatim, nothing inside is rescanned
+    // inline code first: the span is verbatim, nothing inside is rescanned.
+    // Guards mirror the mfm-js inlineCode regex `[^\n`]+?` with the `(?!`)
+    // closer lookahead: no newline inside, and the closer's next char may not
+    // be another backtick (otherwise ``` splits into code + text).
     if let Some(body) = rest.strip_prefix('`') {
         if let Some(end) = body.find('`') {
-            if end > 0 {
+            if end > 0 && !body[..end].contains('\n') && !body[end + 1..].starts_with('`') {
                 return Some((Node::InlineCode(body[..end].to_string()), start + end + 2));
             }
         }
@@ -201,12 +220,16 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
     } else if rest.starts_with('*') {
         ("*", "*", Node::Italic)
     } else {
-        return None;
+        return try_link_family(input, start, ctx);
     };
     let body = &rest[open.len()..];
-    let end = body.find(close)?;
+    let end = match body.find(close) {
+        Some(end) => end,
+        None => return try_link_family(input, start, ctx),
+    };
     if end == 0 {
-        return None; // empty fold stays literal (mfm-js rejects empty spans)
+        // empty fold stays literal (mfm-js rejects empty spans)
+        return try_link_family(input, start, ctx);
     }
     // ABSOLUTE offset: rest/body/end are all measured within the
     // &input[start..] suffix, so the just-past-the-closer position must add
@@ -582,15 +605,20 @@ fn try_mention(input: &str, start: usize) -> Option<(Node, usize)> {
     }
     let match_end = j;
     let mut invalid = false;
-    if let Some(h) = host.as_mut() {
-        let trim = h.trim_end_matches(['.', '-']).len();
-        if trim == 0 {
+    // host trim: `/[.-]+$/` — an empty trim invalidates the mention and drops
+    // the host, which re-arms the username trim below (upstream sets
+    // modifiedHost = null there).
+    let host = host.and_then(|h| {
+        let t = h.trim_end_matches(['.', '-']);
+        if t.is_empty() {
             invalid = true;
-            host = None;
-        } else if trim != h.len() {
-            h.truncate(trim);
+            None
+        } else {
+            Some(t.to_string())
         }
-    }
+    });
+    // username trim only while no host remains; a trailing run with a host
+    // present invalidates the whole mention
     if host.is_none() {
         let trim = username.trim_end_matches(['.', '-']).len();
         if trim != username.len() {
@@ -613,14 +641,287 @@ fn try_mention(input: &str, start: usize) -> Option<(Node, usize)> {
         Some(h) => format!("@{username}@{h}"),
         None => format!("@{username}"),
     };
+    // upstream consumes only the acct (`success(index + acct.length, …)`), so
+    // trailing trimmed chars stay behind and ride as text
+    let consumed = start + acct.len();
     Some((
         Node::Mention {
             username,
             host,
             acct,
         },
-        match_end,
+        consumed,
     ))
+}
+
+/// The mfm-js tail of the `full` alternation — the `[`/`<`/`https://`/search
+/// rules, which only ever match where the earlier inline openers cannot.
+fn try_link_family(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
+    if let Some(hit) = try_url_alt(input, start, ctx.link_label) {
+        return Some(hit);
+    }
+    if let Some(hit) = try_link(input, start, ctx) {
+        return Some(hit);
+    }
+    if let Some(hit) = try_url(input, start, ctx.link_label) {
+        return Some(hit);
+    }
+    if !ctx.inline_only {
+        return try_search(input, start);
+    }
+    None
+}
+
+/// mfm-js urlAlt: `'<' 'https://' (not('>' | space) char)+ '>'` — the scheme
+/// check is case-SENSITIVE (the upstream `/https?:\/\//` carries no `i` flag),
+/// newlines are allowed inside, and the props mark `brackets`.
+fn try_url_alt(input: &str, start: usize, link_label: bool) -> Option<(Node, usize)> {
+    if link_label || !input[start..].starts_with('<') {
+        return None;
+    }
+    let after = url_scheme_len(&input[start + 1..])?;
+    let mut j = start + 1 + after;
+    loop {
+        let Some(ch) = input[j..].chars().next() else {
+            return None; // ran out before '>'
+        };
+        if ch == '>' {
+            break;
+        }
+        if matches!(ch, ' ' | '\t' | '\u{3000}') {
+            return None; // notMatch(space): the alt form admits no spaces
+        }
+        j += ch.len_utf8();
+    }
+    // many(1): at least one char between the scheme and '>'
+    if j == start + 1 + after {
+        return None;
+    }
+    Some((
+        Node::Url {
+            url: input[start + 1..j].to_string(),
+            brackets: true,
+        },
+        j + 1,
+    ))
+}
+
+/// The upstream url/urlAlt scheme — a case-sensitive `https?://`.
+fn url_scheme_len(rest: &str) -> Option<usize> {
+    if rest.starts_with("https://") {
+        Some(8)
+    } else if rest.starts_with("http://") {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+/// mfm-js url: `notLinkLabel + https?:// + item+` — an item is a `(`/`[`
+/// bracket group or a char from `[.,a-z0-9_/:%#@$&?!~=+-]` (case-insensitive).
+/// A trailing `[.,]+` run trims off (riding as text); a fully-empty remainder
+/// invalidates the whole match.
+fn try_url(input: &str, start: usize, link_label: bool) -> Option<(Node, usize)> {
+    if link_label {
+        return None;
+    }
+    let scheme = url_scheme_len(&input[start..])?;
+    let mut j = start + scheme;
+    while let Some(next) = url_item(input, j, 0) {
+        j = next;
+    }
+    let content = &input[start + scheme..j];
+    let trimmed = content.trim_end_matches(['.', ',']);
+    if trimmed.is_empty() {
+        // upstream returns the whole matched span as text
+        return Some((Node::Text(input[start..j].to_string()), j));
+    }
+    let end = start + scheme + trimmed.len();
+    Some((
+        Node::Url {
+            url: input[start..end].to_string(),
+            brackets: false,
+        },
+        end,
+    ))
+}
+
+/// One url item; `None` ends the url run.
+fn url_item(input: &str, i: usize, depth: u32) -> Option<usize> {
+    if depth < 20 {
+        for (open, close) in [("(", ")"), ("[", "]")] {
+            if input[i..].starts_with(open) {
+                let mut j = i + 1;
+                loop {
+                    if input[j..].starts_with(close) {
+                        return Some(j + 1);
+                    }
+                    j = url_item(input, j, depth + 1)?;
+                }
+            }
+        }
+    }
+    let ch = input[i..].chars().next()?;
+    if ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '.' | ','
+                | '_'
+                | '/'
+                | ':'
+                | '%'
+                | '#'
+                | '@'
+                | '$'
+                | '&'
+                | '?'
+                | '!'
+                | '~'
+                | '='
+                | '+'
+                | '-'
+        )
+    {
+        Some(i + 1)
+    } else {
+        None
+    }
+}
+
+/// mfm-js link: `('[' | '?[') label ']' '(' url ')'` — the label parses with
+/// the inline rule set under `linkLabel` and stops at an unclaimed `]` or a
+/// newline; the target must be a url/urlAlt node (urlAlt first, like the
+/// upstream alt order). The whole construct fails back to text when the
+/// label is empty or the tail is missing. The upstream memoizes failed label
+/// boundaries against backtracking; this port just rescans.
+fn try_link(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
+    if ctx.link_label {
+        return None;
+    }
+    let rest = &input[start..];
+    let (silent, label_start) = if rest.starts_with("?[") {
+        (true, start + 2)
+    } else if rest.starts_with('[') {
+        (false, start + 1)
+    } else {
+        return None;
+    };
+    let mut children: Vec<Node> = Vec::new();
+    let mut text = String::new();
+    let mut items = 0usize;
+    let mut j = label_start;
+    let label_ctx = Ctx {
+        inline_only: true,
+        depth: ctx.depth + 1,
+        link_label: true,
+    };
+    let close = loop {
+        match input.as_bytes().get(j) {
+            None | Some(b']') | Some(b'\r') | Some(b'\n') => break j,
+            _ => {}
+        }
+        match try_open(input, j, label_ctx) {
+            Some((node, next)) => {
+                items += 1;
+                if !text.is_empty() {
+                    children.push(Node::Text(std::mem::take(&mut text)));
+                }
+                children.push(node);
+                j = next;
+            }
+            None => {
+                let ch = input[j..].chars().next().unwrap();
+                text.push(ch);
+                items += 1;
+                j += ch.len_utf8();
+            }
+        }
+    };
+    if items == 0 || !input[close..].starts_with(']') {
+        return None;
+    }
+    if !text.is_empty() {
+        children.push(Node::Text(std::mem::take(&mut text)));
+    }
+    let after = close + 1;
+    if !input[after..].starts_with('(') {
+        return None;
+    }
+    let target = try_url_alt(input, after + 1, false).or_else(|| try_url(input, after + 1, false));
+    let (Node::Url { url, .. }, url_end) = target? else {
+        return None;
+    };
+    if !input[url_end..].starts_with(')') {
+        return None;
+    }
+    Some((
+        Node::Link {
+            silent,
+            url,
+            children,
+        },
+        url_end + 1,
+    ))
+}
+
+/// mfm-js search: `newLine.option + lineBegin + query-chars(≥1) + space +
+/// button + lineEnd + newLine.option` — the button is `[search]`/`[検索]` or
+/// `search`/`検索` (ASCII form case-insensitive), and a query char is
+/// anything that is not a newline and not the start of `space + button +
+/// lineEnd`. The node's `content` (the link text) is the whole line minus the
+/// trailing newline; the leading newline folds into the node like the other
+/// blocks.
+fn try_search(input: &str, start: usize) -> Option<(Node, usize)> {
+    let mut i = start;
+    if let Some(n) = newline_len(input, i) {
+        if at_line_begin(input, i + n) {
+            i += n;
+        }
+    }
+    if !at_line_begin(input, i) {
+        return None;
+    }
+    let query_start = i;
+    let mut j = i;
+    loop {
+        if newline_len(input, j).is_some() || j == input.len() {
+            return None; // the line ended without a button
+        }
+        let s = space_len(input, j);
+        if s > 0 {
+            if let Some(bend) = search_button(input, j + s) {
+                if at_line_end(input, bend) {
+                    if j == query_start {
+                        return None; // many(1): the query cannot be empty
+                    }
+                    let mut end = bend;
+                    if let Some(n) = newline_len(input, end) {
+                        end += n;
+                    }
+                    return Some((
+                        Node::Search {
+                            query: input[query_start..j].to_string(),
+                            content: input[query_start..bend].to_string(),
+                        },
+                        end,
+                    ));
+                }
+            }
+        }
+        j += input[j..].chars().next().unwrap().len_utf8();
+    }
+}
+
+/// The search button — `[search]`/`[検索]`/`search`/`検索` (ASCII form
+/// case-insensitive); yields the offset past it.
+fn search_button(input: &str, i: usize) -> Option<usize> {
+    const BUTTONS: [&str; 4] = ["[search]", "[検索]", "search", "検索"];
+    for b in BUTTONS {
+        if input[i..].len() >= b.len() && input[i..i + b.len()].eq_ignore_ascii_case(b) {
+            return Some(i + b.len());
+        }
+    }
+    None
 }
 
 /// Render nodes to HTML — the `MfmService.toHtml` visitor subset:
@@ -761,6 +1062,60 @@ pub fn to_html(
                     }
                     Err(_) => out.push_str(&escape(acct)),
                 }
+            }
+            Node::Link {
+                silent: _,
+                url: target,
+                children,
+            } => {
+                // upstream link arm: `new URL(props.url)` →
+                // `<a href="${escapeHtml(url.href)}">${children}</a>`; an
+                // unparseable url falls back to literal `[text](url)`. The
+                // `silent` prop rides the parse only — this arm never reads
+                // it (the frontend renderer does).
+                match url::Url::parse(target) {
+                    Ok(u) => {
+                        out.push_str("<a href=\"");
+                        out.push_str(&escape(u.as_str()));
+                        out.push_str("\">");
+                        out.push_str(&to_html(children, escape, url, mentioned_remote_users));
+                        out.push_str("</a>");
+                    }
+                    Err(_) => {
+                        out.push('[');
+                        out.push_str(&to_html(children, escape, url, mentioned_remote_users));
+                        out.push_str("](");
+                        out.push_str(&escape(target));
+                        out.push(')');
+                    }
+                }
+            }
+            Node::Url { url, brackets: _ } => {
+                // upstream url arm: `<a href="${escapeHtml(url.href)}">${
+                //   escapeHtml(node.props.url)}</a>` — the TEXT keeps the raw
+                // matched url, the href rides normalization.
+                match url::Url::parse(url) {
+                    Ok(u) => {
+                        out.push_str("<a href=\"");
+                        out.push_str(&escape(u.as_str()));
+                        out.push_str("\">");
+                        out.push_str(&escape(url));
+                        out.push_str("</a>");
+                    }
+                    Err(_) => out.push_str(&escape(url)),
+                }
+            }
+            Node::Search { query, content } => {
+                // upstream search arm: a google-search link; `content` (the
+                // raw line) is the link text.
+                out.push_str("<a href=\"");
+                out.push_str(&escape(&format!(
+                    "https://www.google.com/search?q={}",
+                    encode_uri_component(query)
+                )));
+                out.push_str("\">");
+                out.push_str(&escape(content));
+                out.push_str("</a>");
             }
         }
     }
@@ -1064,6 +1419,103 @@ mod tests {
         assert_eq!(
             html("@remoteuser"),
             "<a href=\"http://misskey.local/@remoteuser\" class=\"u-url mention\">@remoteuser</a>"
+        );
+    }
+
+    #[test]
+    fn link_folds_label_and_normalizes_url() {
+        // link arm: `<a href="${escapeHtml(new URL(url).href)}">${children}</a>`
+        // — new URL adds the WHATWG root slash
+        assert_eq!(
+            render("[foo](https://example.com)"),
+            "<a href=\"https://example.com/\">foo</a>"
+        );
+        // the label parses inline (bold folds; silent ?[ renders the same)
+        assert_eq!(
+            render("[**b**](https://example.com)"),
+            "<a href=\"https://example.com/\"><b>b</b></a>"
+        );
+        assert_eq!(
+            render("?[foo](https://example.com)"),
+            "<a href=\"https://example.com/\">foo</a>"
+        );
+        // the target must be an http(s) url — anything else stays literal
+        assert_eq!(render("[foo](bar)"), "[foo](bar)");
+        assert_eq!(
+            render("[foo](javascript:alert(1))"),
+            "[foo](javascript:alert(1))"
+        );
+        // an empty label or missing tail falls back — the url then folds bare
+        assert_eq!(
+            render("[](https://example.com)"),
+            "[](<a href=\"https://example.com/\">https://example.com</a>)"
+        );
+        assert_eq!(
+            render("[a](https://x"),
+            "[a](<a href=\"https://x/\">https://x</a>"
+        );
+        // a trailing-dot target trims out of the url node and breaks the link
+        assert_eq!(
+            render("[a](https://example.com.)"),
+            "[a](<a href=\"https://example.com/\">https://example.com</a>.)"
+        );
+    }
+
+    #[test]
+    fn url_folds_bare_and_bracketed() {
+        // url arm: `<a href="${new URL(url).href}">${escapeHtml(url)}</a>` —
+        // the TEXT keeps the raw match, the HREF is normalized
+        assert_eq!(
+            render("https://example.com"),
+            "<a href=\"https://example.com/\">https://example.com</a>"
+        );
+        // trailing [.,]+ rides back as text
+        assert_eq!(
+            render("https://example.com."),
+            "<a href=\"https://example.com/\">https://example.com</a>."
+        );
+        // bracket groups nest into the url; the scheme check is case-sensitive
+        assert_eq!(
+            render("https://example.com/a(b)"),
+            "<a href=\"https://example.com/a(b)\">https://example.com/a(b)</a>"
+        );
+        assert_eq!(
+            render("<https://example.com/x>"),
+            "<a href=\"https://example.com/x\">https://example.com/x</a>"
+        );
+        assert_eq!(render("HTTPS://X"), "HTTPS://X");
+        assert_eq!(render("https://."), "https://.");
+    }
+
+    #[test]
+    fn search_line_folds_to_google_link() {
+        // search arm: `<a href="https://www.google.com/search?q={query}">${
+        //   content}</a>` — the whole line is the text
+        assert_eq!(
+            render("foo search"),
+            "<a href=\"https://www.google.com/search?q=foo\">foo search</a>"
+        );
+        assert_eq!(
+            render("foo [search]"),
+            "<a href=\"https://www.google.com/search?q=foo\">foo [search]</a>"
+        );
+        // earlier spaces ride the query, the last one is the separator
+        assert_eq!(
+            render("foo  search"),
+            "<a href=\"https://www.google.com/search?q=foo%20\">foo  search</a>"
+        );
+        // no button / mid-line button stays literal
+        assert_eq!(render("search"), "search");
+        assert_eq!(render("foo search bar"), "foo search bar");
+        // the line's surrounding newlines fold into the node
+        assert_eq!(
+            render("a\nfoo search\nbar"),
+            "a<a href=\"https://www.google.com/search?q=foo\">foo search</a>bar"
+        );
+        // search rides the full parser inside quotes
+        assert_eq!(
+            render("> foo search"),
+            "<blockquote><a href=\"https://www.google.com/search?q=foo\">foo search</a></blockquote>"
         );
     }
 }

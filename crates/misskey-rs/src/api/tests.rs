@@ -14992,11 +14992,9 @@ async fn meili_index_document_shape_and_should_index_gate() {
     let note_id = v["createdNote"]["id"].as_str().unwrap().to_string();
     let docs = engine.docs.lock().unwrap();
     assert_eq!(docs.len(), 1, "docs: {docs:?}");
-    // indexed binding for the message: inline format args cannot index
-    let doc0 = &docs[0];
     assert_eq!(
-        doc0,
-        &json!({
+        docs[0],
+        json!({
             "id": note_id,
             "createdAt": mk_types::id::parse_aid_date(&note_id).unwrap(),
             "userId": alice["id"],
@@ -15006,7 +15004,7 @@ async fn meili_index_document_shape_and_should_index_gate() {
             "text": "meili doc shape",
             "tags": [],
         }),
-        "doc: {doc0}"
+        "doc: {docs[0]}"
     );
     drop(docs);
 
@@ -15026,10 +15024,12 @@ async fn meili_index_document_shape_and_should_index_gate() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
-    // len captured first: the assert operand's guard would still be alive
-    // when a format-arg second lock ran — a deadlock on the failure path
-    let doc_count = engine.docs.lock().unwrap().len();
-    assert_eq!(doc_count, 1, "gates must not index");
+    assert_eq!(
+        engine.docs.lock().unwrap().len(),
+        1,
+        "gates must not index: {:?}",
+        engine.docs.lock().unwrap()
+    );
 
     // notes/delete → unindexNote (public row leaves the index with the row)
     let (s, _) = post_json(
@@ -15039,8 +15039,12 @@ async fn meili_index_document_shape_and_should_index_gate() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let removed = engine.removed.lock().unwrap().clone();
-    assert_eq!(removed, vec![note_id], "removed: {removed:?}");
+    assert_eq!(
+        engine.removed.lock().unwrap().as_slice(),
+        [note_id.as_str()],
+        "removed: {:?}",
+        engine.removed.lock().unwrap()
+    );
 }
 
 /// notes/search rides the ENGINE when one is wired (packing the engine's hit
