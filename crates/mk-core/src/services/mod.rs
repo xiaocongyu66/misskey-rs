@@ -1,5 +1,8 @@
 //! Services ported from `src/core/`.
 
+// email4: EmailSender seam (upstream EmailService.sendEmail) + Noop/SMTP
+// senders. Deliberately unwired this slice — seam + contract tests only.
+pub mod email;
 pub mod misc;
 // arena-move: account-migration pure helpers — Acct.parse parity, the
 // TypeORM `simple-array` alsoKnownAs codec and local-user-URI math
