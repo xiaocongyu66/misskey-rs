@@ -1,8 +1,9 @@
 //! MFM (Misskey Markup Language) subset: the node types `MfmService.toHtml`
 //! renders on the feed / AP planes — text, bold, italic, strike, small,
-//! inline code, block code, quote, center. Hand scanner + visitor, pinned to
-//! the upstream `packages/backend/src/core/MfmService.ts` handlers; the full
-//! mfm-js AST port lands in M2 (needed by NoteCreateService).
+//! inline code, block code, quote, center, emoji code. Hand scanner +
+//! visitor, pinned to the upstream `packages/backend/src/core/MfmService.ts`
+//! handlers; the full mfm-js AST port lands in M2 (needed by
+//! NoteCreateService).
 
 /// One MFM node — the `mfm.MfmNode` subset the upstream
 /// `MfmService.toHtml` visitor (src/core/MfmService.ts) renders.
@@ -31,6 +32,9 @@ pub enum Node {
     /// `<center>…</center>` line → `<div style="text-align: center;">…</div>`;
     /// the inner span is re-parsed with the inline-only rule set.
     Center(Vec<Node>),
+    /// `:name:` custom emoji → `\u{200B}:name:\u{200B}` (the upstream arm
+    /// wraps the code in zero-width spaces, it does not emit an `<img>`).
+    EmojiCode(String),
 }
 
 /// Scanner context: `inline_only` selects the mfm-js `inline` alternation
@@ -139,6 +143,9 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
         if let Some(hit) = try_center(input, start, ctx) {
             return Some(hit);
         }
+    }
+    if let Some(hit) = try_emoji_code(input, start) {
+        return Some(hit);
     }
     let rest = &input[start..];
     // inline code first: the span is verbatim, nothing inside is rescanned
@@ -355,6 +362,39 @@ fn try_center(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
     Some((node, end))
 }
 
+/// mfm-js emojiCode: `":" [a-z0-9_+-]+ ":" (lineEnd | not-alnum)`. The
+/// upstream left guard `alt([lineBegin, not-alnum])` always passes on the
+/// leading `':'`, so only the right side is load-bearing (`x:emoji:` folds,
+/// `:emoji:x` does not).
+fn try_emoji_code(input: &str, start: usize) -> Option<(Node, usize)> {
+    if !input[start..].starts_with(':') {
+        return None;
+    }
+    let name_start = start + 1;
+    let mut j = name_start;
+    while let Some(&b) = input.as_bytes().get(j) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-') {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if j == name_start {
+        return None; // empty name
+    }
+    if input.as_bytes().get(j) != Some(&b':') {
+        return None;
+    }
+    if !at_line_end(input, j + 1) {
+        // /[a-z0-9]/i — ASCII only
+        let next = input[j + 1..].chars().next().unwrap();
+        if next.is_ascii_alphanumeric() {
+            return None;
+        }
+    }
+    Some((Node::EmojiCode(input[name_start..j].to_string()), j + 1))
+}
+
 /// Render nodes to HTML — the `MfmService.toHtml` visitor subset:
 /// bold→`<b>`, strike→`<del>`, italic→`<i>`, small→`<small>`,
 /// inlineCode→`<code>` (content escaped), blockCode→`<pre><code>`,
@@ -415,6 +455,16 @@ pub fn to_html(nodes: &[Node], escape: &dyn Fn(&str) -> String) -> String {
                 out.push_str("<div style=\"text-align: center;\">");
                 out.push_str(&to_html(children, escape));
                 out.push_str("</div>");
+            }
+            Node::EmojiCode(name) => {
+                // upstream: `\u200B:${escapeHtml(node.props.name)}:\u200B` —
+                // zero-width spaces, not an <img>; they keep the emoji code
+                // from gluing to neighboring text in HTML consumers.
+                out.push('\u{200B}');
+                out.push(':');
+                out.push_str(&escape(name));
+                out.push(':');
+                out.push('\u{200B}');
             }
         }
     }
@@ -590,5 +640,17 @@ mod tests {
             render("<center>a</center>\nz"),
             "<div style=\"text-align: center;\">a</div>z"
         );
+    }
+
+    #[test]
+    fn emoji_code_wraps_in_zero_widths() {
+        // emojiCode arm: `\u200B:${escapeHtml(name)}:\u200B`
+        assert_eq!(render(":emoji:"), "\u{200B}:emoji:\u{200B}");
+        assert_eq!(render(":a-b_c+d:"), "\u{200B}:a-b_c+d:\u{200B}");
+        // only the right side guard is load-bearing (probed on mfm-js 0.27.0)
+        assert_eq!(render(":emoji:x"), ":emoji:x");
+        assert_eq!(render("x:emoji:y"), "x:emoji:y");
+        assert_eq!(render("x:emoji:"), "x\u{200B}:emoji:\u{200B}");
+        assert_eq!(render("::"), "::");
     }
 }
