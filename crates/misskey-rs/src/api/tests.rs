@@ -14117,3 +14117,101 @@ async fn notes_search_sql_fallback_gate_and_hits() {
         .collect();
     assert_eq!(ids, vec![tagged_id.as_str()], "body: {body}");
 }
+
+// fed-min // — the inbox POST skeleton (mk_ap::signature + mk_ap::inbox,
+// upstream test/unit/ap-request.ts signing-string pins + ApInboxService
+// .performOneActivity dispatch). Unit-level: no DB, no remote key fetch —
+// the queue-worker lane (InboxProcessorService) owns those.
+
+/// Upstream test/unit/ap-request.ts request-target rules, pinned against
+/// mk_ap::signature::gen_signing_string: `(request-target): <method>
+/// <path>?<query>` with the fragment stripped, an empty query delimiter
+/// preserved, and the createSignedPost include set joined with `\n`.
+#[test]
+fn fed_min_signing_string_shape_matches_ap_request_ts() {
+    use mk_ap::signature::{gen_signing_string, parse_signature_header};
+
+    // 'createSignedPost includes query string in request-target'
+    let with_query = gen_signing_string(
+        "POST",
+        "/inbox?token=abc#ignored",
+        "",
+        None,
+        None,
+        &["(request-target)".to_string()],
+    )
+    .unwrap();
+    assert_eq!(with_query, "(request-target): post /inbox?token=abc");
+    // 'request-target omits hash and preserves empty query delimiter'
+    let empty_query = gen_signing_string(
+        "GET",
+        "/outbox?#ignored",
+        "",
+        None,
+        None,
+        &["(request-target)".to_string()],
+    )
+    .unwrap();
+    assert_eq!(empty_query, "(request-target): get /outbox?");
+    // the full createSignedPost line set, joined with \n
+    let include: Vec<String> = ["(request-target)", "date", "host", "digest"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let full = gen_signing_string(
+        "Post",
+        "/inbox",
+        "example.com",
+        Some("d"),
+        Some("SHA-256=x"),
+        &include,
+    )
+    .unwrap();
+    assert_eq!(
+        full,
+        "(request-target): post /inbox\ndate: d\nhost: example.com\ndigest: SHA-256=x"
+    );
+    // header parse: keyId/headers/signature survive, headers lowercased in
+    // signed order, algorithm absent → rsa-sha256 default
+    let parsed = parse_signature_header(
+        "keyId=\"https://a.test/users/x#main-key\",headers=\"(request-target) Digest\",\
+         signature=\"ab==\"",
+    )
+    .unwrap();
+    assert_eq!(parsed.key_id, "https://a.test/users/x#main-key");
+    assert_eq!(parsed.headers, vec!["(request-target)", "digest"]);
+    assert_eq!(parsed.signature, "ab==");
+}
+
+/// The performOneActivity dispatch table: the five pinned arms classify by
+/// name, and everything else — unrecognized types, unparseable bodies — is
+/// accepted silently (upstream: the fastify inbox row enqueued + answered
+/// 202 before the worker could even fail the parse).
+#[test]
+fn fed_min_inbox_dispatch_table_accepts_known_and_unknown_silently() {
+    use mk_ap::inbox::{self, ActivityKind};
+
+    for (ty, kind) in [
+        ("Follow", ActivityKind::Follow),
+        ("Create", ActivityKind::Create),
+        ("Like", ActivityKind::Like),
+        ("Undo", ActivityKind::Undo),
+        ("Delete", ActivityKind::Delete),
+    ] {
+        assert_eq!(inbox::classify(&serde_json::json!({ "type": ty })), kind);
+    }
+    // the unlisted upstream arms ride Other — never an HTTP error
+    for ty in ["Update", "Accept", "Reject", "Add", "Remove", "Announce"] {
+        assert_eq!(
+            inbox::classify(&serde_json::json!({ "type": ty })),
+            ActivityKind::Other
+        );
+    }
+    // unrecognized type → 202 parity (worker reason string, not a status)
+    assert_eq!(
+        inbox::handle(br#"{"type":"EvilActivity"}"#).kind,
+        ActivityKind::Other
+    );
+    // unparseable body → 202 parity
+    assert_eq!(inbox::handle(b"not json").kind, ActivityKind::Other);
+}
