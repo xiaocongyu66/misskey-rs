@@ -311,6 +311,49 @@ pub async fn export_muting_ids(pool: &PgPool, muter_id: &str) -> Result<Vec<Stri
         .await
 }
 
+/// Export{Muting,Blocking}ProcessorService page: the muter's/blocker's rows
+/// `id` ASC joined to the target user (the upstream per-100 MoreThan(cursor)
+/// loop collapsed; mutes filter `expiresAt IS NULL` — timed mutes never
+/// export). A dangling target row simply drops out of the join (upstream
+/// `if (u == null) { exportedCount++; continue; }` writes nothing).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExportAcctRow {
+    pub username: String,
+    pub host: Option<String>,
+}
+
+pub async fn export_mutes_asc(
+    pool: &PgPool,
+    muter_id: &str,
+) -> Result<Vec<ExportAcctRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportAcctRow>(
+        r#"SELECT u."username", u."host"
+           FROM "muting" m
+           INNER JOIN "user" u ON u."id" = m."muteeId"
+           WHERE m."muterId" = $1 AND m."expiresAt" IS NULL
+           ORDER BY m."id" ASC"#,
+    )
+    .bind(muter_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn export_blockings_asc(
+    pool: &PgPool,
+    blocker_id: &str,
+) -> Result<Vec<ExportAcctRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportAcctRow>(
+        r#"SELECT u."username", u."host"
+           FROM "blocking" b
+           INNER JOIN "user" u ON u."id" = b."blockeeId"
+           WHERE b."blockerId" = $1
+           ORDER BY b."id" ASC"#,
+    )
+    .bind(blocker_id)
+    .fetch_all(pool)
+    .await
+}
+
 // ==== drive/files {list,show,delete} reads ==================================
 
 /// The `mk_db::drive::find_drive_file` projection — DriveFileRow's sqlx

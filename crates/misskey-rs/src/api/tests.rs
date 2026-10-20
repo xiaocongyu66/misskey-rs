@@ -14339,3 +14339,540 @@ async fn queue2_export_user_lists_roundtrip() {
     );
     assert_eq!(text, expected, "exportUserLists CSV lines");
 }
+
+// fed-2 // — the InboxProcessorService worker lane with real effects
+// (mk_ap::processor::verify_and_route): keyId → user_keypair (the 0001
+// schema stand-in for upstream user_publickey; our `user` table carries NO
+// keypair column), the RSA verify, the actor gate, then the
+// Create{Note}/Follow/Like/Undo arms over real rows. Local loop only:
+// keyIds/uris fold against the config host (127.0.0.1:3000, the test_state
+// url), remote keyIds are the resolver boundary → Err (the HTTP row still
+// answers 202).
+
+const FED2_HOST: &str = "127.0.0.1:3000";
+
+/// A local-loop user with a real generated keypair (UserKeypairService's
+/// RSA-2048 SPKI/PKCS#8 PEMs) — the keyId owner the signatures ride.
+async fn fed2_user(pool: &mk_db::sqlx::PgPool, username: &str) -> (String, String) {
+    let (public_pem, private_pem) =
+        mk_core::services::signup::generate_rsa_keypair_pem().expect("keygen");
+    let id = mk_types::id::gen_aid_now();
+    mk_db::user::insert_new_user(
+        pool,
+        &mk_db::user::NewUser {
+            id: &id,
+            username,
+            username_lower: username,
+            name: None,
+            host: None,
+            token: &mk_core::services::signup::generate_native_user_token(),
+            password_hash: "x",
+            public_key: &public_pem,
+            private_key: &private_pem,
+        },
+    )
+    .await
+    .expect("insert keypair user");
+    (id, private_pem)
+}
+
+fn fed2_sign(private_pem: &str, user_id: &str, body: &[u8]) -> ((String, String), String) {
+    let date = "Tue, 20 Oct 2026 12:00:00 GMT";
+    let key_id = format!("https://{FED2_HOST}/users/{user_id}#main-key");
+    let sig = mk_ap::signature::create_signed_post(
+        &key_id,
+        private_pem,
+        "POST",
+        "/inbox",
+        FED2_HOST,
+        date,
+        body,
+    )
+    .expect("createSignedPost");
+    (
+        ("digest".to_string(), mk_ap::signature::create_digest(body)),
+        sig,
+    )
+}
+
+/// The Create{Note} local loop: a signed Create with an inline Note object
+/// upserts the note row — uri = object.id, text = content with the
+/// `<br/>`→\n fold + entity decode, userId = the verified keyId owner,
+/// userHost = their host column (NULL local), visibility from the Public
+/// to-leg — and a re-delivered Create is the 'skip: note exists' upsert.
+#[tokio::test]
+async fn fed2_verify_and_route_create_note_local_loop() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkfed2create").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let (author_id, private_pem) = fed2_user(&pool, "fed2author").await;
+    let actor_uri = format!("https://{FED2_HOST}/users/{author_id}");
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{actor_uri}/activities/1"),
+        "type": "Create",
+        "actor": actor_uri,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": format!("https://{FED2_HOST}/notes/remote-note-1"),
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "<p>hello<br/>world &amp; friends</p>",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+    let body = serde_json::to_vec(&activity).unwrap();
+    let (digest_header, sig_header) = fed2_sign(&private_pem, &author_id, &body);
+    let headers = vec![
+        ("host".to_string(), FED2_HOST.to_string()),
+        (
+            "date".to_string(),
+            "Tue, 20 Oct 2026 12:00:00 GMT".to_string(),
+        ),
+        digest_header,
+        (
+            "content-type".to_string(),
+            "application/activity+json".to_string(),
+        ),
+        ("signature".to_string(), sig_header),
+    ];
+
+    let effect =
+        mk_ap::processor::verify_and_route("POST", "/inbox", &headers, &body, FED2_HOST, &pool)
+            .await
+            .expect("signed Create routes");
+    let note_uri = format!("https://{FED2_HOST}/notes/remote-note-1");
+    match &effect {
+        mk_ap::processor::RouteEffect::NoteCreated { .. } => {}
+        other => panic!("expected NoteCreated, got {other:?}"),
+    }
+    let (text, user_id, user_host, visibility): (Option<String>, String, Option<String>, String) =
+        mk_db::sqlx::query_as(
+            r#"SELECT "text", "userId", "userHost", ("visibility"::text)
+               FROM "note" WHERE "uri" = $1"#,
+        )
+        .bind(&note_uri)
+        .fetch_one(&pool)
+        .await
+        .expect("note row");
+    // content → text: <br/> folds, tags strip, &amp; decodes
+    assert_eq!(text.as_deref(), Some("hello\nworld & friends"));
+    // attribution: the verified keyId owner + their host column
+    assert_eq!(user_id, author_id);
+    assert_eq!(user_host, None);
+    assert_eq!(visibility, "public");
+    assert!(matches!(
+        effect,
+        mk_ap::processor::RouteEffect::NoteCreated { .. }
+    ));
+
+    // re-delivered Create → the 'skip: note exists' arm (note.uri unique)
+    let again =
+        mk_ap::processor::verify_and_route("POST", "/inbox", &headers, &body, FED2_HOST, &pool)
+            .await
+            .expect("re-delivery still routes");
+    assert_eq!(again, mk_ap::processor::RouteEffect::NoteExists);
+}
+
+/// Follow lands the following row (+ the denormalized counter bumps), Like
+/// appends the plain reaction row + the reactions map (reaction_acceptance
+/// ignored), and the Undo arms delete both — request-then-following like
+/// upstream undoFollow, the swallowed not-reacted error like undoLike.
+#[tokio::test]
+async fn fed2_follow_like_and_undo_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkfed2follow").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let (follower_id, follower_pem) = fed2_user(&pool, "fed2follower").await;
+    let (followee_id, followee_pem) = fed2_user(&pool, "fed2followee").await;
+    let follower_uri = format!("https://{FED2_HOST}/users/{follower_id}");
+    let followee_uri = format!("https://{FED2_HOST}/users/{followee_id}");
+
+    let route = |body: &[u8], pem: &str, uid: &str| {
+        let (digest_header, sig_header) = fed2_sign(pem, uid, body);
+        vec![
+            ("host".to_string(), FED2_HOST.to_string()),
+            (
+                "date".to_string(),
+                "Tue, 20 Oct 2026 12:00:00 GMT".to_string(),
+            ),
+            digest_header,
+            (
+                "content-type".to_string(),
+                "application/activity+json".to_string(),
+            ),
+            ("signature".to_string(), sig_header),
+        ]
+    };
+
+    // --- Follow: follower → local followee ---
+    let follow = serde_json::json!({
+        "id": format!("{follower_uri}/activities/follow/1"),
+        "type": "Follow",
+        "actor": follower_uri,
+        "object": followee_uri
+    });
+    let body = serde_json::to_vec(&follow).unwrap();
+    let effect = mk_ap::processor::verify_and_route(
+        "POST",
+        "/inbox",
+        &route(&body, &follower_pem, &follower_id),
+        &body,
+        FED2_HOST,
+        &pool,
+    )
+    .await
+    .expect("signed Follow routes");
+    assert_eq!(effect, mk_ap::processor::RouteEffect::Followed);
+    let row: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+    )
+    .bind(&follower_id)
+    .bind(&followee_id)
+    .fetch_one(&pool)
+    .await
+    .expect("following row");
+    assert_eq!(row, 1, "the Follow arm landed the following row");
+    let following_count: i32 =
+        mk_db::sqlx::query_scalar(r#"SELECT "followingCount" FROM "user" WHERE "id" = $1"#)
+            .bind(&follower_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let followers_count: i32 =
+        mk_db::sqlx::query_scalar(r#"SELECT "followersCount" FROM "user" WHERE "id" = $1"#)
+            .bind(&followee_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((following_count, followers_count), (1, 1), "counter bumps");
+
+    // --- the followee authors a note, the follower Likes it ---
+    let note_uri = format!("https://{FED2_HOST}/notes/fed2-local-1");
+    let create = serde_json::json!({
+        "type": "Create",
+        "actor": followee_uri,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_uri,
+            "type": "Note",
+            "attributedTo": followee_uri,
+            "content": "note to like",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+    let body = serde_json::to_vec(&create).unwrap();
+    let created = mk_ap::processor::verify_and_route(
+        "POST",
+        "/inbox",
+        &route(&body, &followee_pem, &followee_id),
+        &body,
+        FED2_HOST,
+        &pool,
+    )
+    .await
+    .expect("followee's Create routes");
+    assert!(matches!(
+        created,
+        mk_ap::processor::RouteEffect::NoteCreated { .. }
+    ));
+
+    let like = serde_json::json!({
+        "id": format!("{follower_uri}/activities/like/1"),
+        "type": "Like",
+        "actor": follower_uri,
+        "object": note_uri,
+        "content": "👍"
+    });
+    let body = serde_json::to_vec(&like).unwrap();
+    let effect = mk_ap::processor::verify_and_route(
+        "POST",
+        "/inbox",
+        &route(&body, &follower_pem, &follower_id),
+        &body,
+        FED2_HOST,
+        &pool,
+    )
+    .await
+    .expect("signed Like routes");
+    assert_eq!(
+        effect,
+        mk_ap::processor::RouteEffect::Liked {
+            reaction: "👍".to_string()
+        }
+    );
+    let reaction_row: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "note_reaction"
+           WHERE "noteId" = (SELECT "id" FROM "note" WHERE "uri" = $1)
+             AND "userId" = $2"#,
+    )
+    .bind(&note_uri)
+    .bind(&follower_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reaction row");
+    assert_eq!(reaction_row, 1, "the Like arm landed the note_reaction row");
+    let packed: String =
+        mk_db::sqlx::query_scalar(r#"SELECT ("reactions"->>'👍') FROM "note" WHERE "uri" = $1"#)
+            .bind(&note_uri)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(packed, "1", "reactions map bump");
+
+    // --- Undo{Like} then Undo{Follow}: both rows gone ---
+    let undo_like = serde_json::json!({
+        "id": format!("{follower_uri}/activities/undo/1"),
+        "type": "Undo",
+        "actor": follower_uri,
+        "object": {
+            "id": format!("{follower_uri}/activities/like/1"),
+            "type": "Like",
+            "actor": follower_uri,
+            "object": note_uri
+        }
+    });
+    let body = serde_json::to_vec(&undo_like).unwrap();
+    let effect = mk_ap::processor::verify_and_route(
+        "POST",
+        "/inbox",
+        &route(&body, &follower_pem, &follower_id),
+        &body,
+        FED2_HOST,
+        &pool,
+    )
+    .await
+    .expect("signed Undo{Like} routes");
+    assert_eq!(effect, mk_ap::processor::RouteEffect::Unliked);
+    let reaction_row: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "note_reaction"
+           WHERE "noteId" = (SELECT "id" FROM "note" WHERE "uri" = $1)
+             AND "userId" = $2"#,
+    )
+    .bind(&note_uri)
+    .bind(&follower_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reaction_row, 0, "undo deleted the reaction row");
+
+    let undo_follow = serde_json::json!({
+        "id": format!("{follower_uri}/activities/undo/2"),
+        "type": "Undo",
+        "actor": follower_uri,
+        "object": {
+            "id": format!("{follower_uri}/activities/follow/1"),
+            "type": "Follow",
+            "actor": follower_uri,
+            "object": followee_uri
+        }
+    });
+    let body = serde_json::to_vec(&undo_follow).unwrap();
+    let effect = mk_ap::processor::verify_and_route(
+        "POST",
+        "/inbox",
+        &route(&body, &follower_pem, &follower_id),
+        &body,
+        FED2_HOST,
+        &pool,
+    )
+    .await
+    .expect("signed Undo{Follow} routes");
+    assert_eq!(effect, mk_ap::processor::RouteEffect::Unfollowed);
+    let row: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+    )
+    .bind(&follower_id)
+    .bind(&followee_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, 0, "undo deleted the following row");
+    let followers_count: i32 =
+        mk_db::sqlx::query_scalar(r#"SELECT "followersCount" FROM "user" WHERE "id" = $1"#)
+            .bind(&followee_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(followers_count, 0, "counter decrement");
+}
+
+/// The unverifiable legs never turn into 4xx: a tampered body (digest
+/// half) and a missing Signature header both fail verify_and_route, and
+/// the HTTP inbox row still answers 202 on both (the enqueue already
+/// happened upstream-side; the failure is a worker job reason).
+#[tokio::test]
+async fn fed2_unverifiable_routes_err_and_still_202s() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkfed2tamper").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let (author_id, private_pem) = fed2_user(&pool, "fed2author2").await;
+    let actor_uri = format!("https://{FED2_HOST}/users/{author_id}");
+
+    let activity = serde_json::json!({
+        "type": "Create",
+        "actor": actor_uri,
+        "object": {
+            "id": format!("https://{FED2_HOST}/notes/tampered-1"),
+            "type": "Note",
+            "content": "will not land",
+        }
+    });
+    let body = serde_json::to_vec(&activity).unwrap();
+    let (digest_header, sig_header) = fed2_sign(&private_pem, &author_id, &body);
+    let headers = vec![
+        ("host".to_string(), FED2_HOST.to_string()),
+        (
+            "date".to_string(),
+            "Tue, 20 Oct 2026 12:00:00 GMT".to_string(),
+        ),
+        digest_header,
+        ("signature".to_string(), sig_header),
+    ];
+
+    // tampered body: the signed digest no longer covers the received bytes
+    let mut tampered = body.clone();
+    tampered[0] ^= 0x01;
+    assert!(
+        mk_ap::processor::verify_and_route(
+            "POST", "/inbox", &headers, &tampered, FED2_HOST, &pool,
+        )
+        .await
+        .is_err(),
+        "digest-vs-body failure collapses to Err"
+    );
+    // no Signature header at all
+    assert!(
+        mk_ap::processor::verify_and_route("POST", "/inbox", &[], &body, FED2_HOST, &pool,)
+            .await
+            .is_err(),
+        "missing signature is Err"
+    );
+    // nothing landed
+    let rows: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "unverifiable activities touch no rows");
+
+    // through the HTTP row: both legs answer 202
+    let app = crate::build_router(test_state(pool));
+    let post = |uri: &str, hdrs: Vec<(String, String)>, payload: Vec<u8>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/activity+json");
+        for (name, value) in hdrs {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::from(payload)).unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post("/inbox", headers.clone(), tampered))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "tampered → 202");
+    let resp = app.oneshot(post("/inbox", Vec::new(), body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "unsigned → 202");
+}
+
+/// export-muting full roundtrip: one acct line per NON-EXPIRING mute (a
+/// far-future expiresAt row must NOT export — `expiresAt IS NULL`) → a
+/// `mute-yyyy-MM-dd-HH-mm-ss.csv` drive file through the /files byte route.
+#[tokio::test]
+async fn queue2_export_muting_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("queue2_mutes").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("q2m")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("q2n")).await;
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+    let carol = signup(&app, &uname("q2o")).await;
+    let carol_id = carol["id"].as_str().unwrap().to_string();
+
+    // indefinite mute on bob + a timed mute on carol (must stay out)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": bob_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": carol_id, "expiresAt": crate::api::now_ms() as i64 + 86_400_000, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+
+    // enqueue → 204 → claim → processor → drive file
+    let (s, b) = post_json(app.clone(), "/api/i/export-mute", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let handle = mk_queue::QueueHandle::new(pool.clone());
+    let job = handle
+        .claim_next(&["exportMuting"])
+        .await
+        .unwrap()
+        .expect("queued exportMuting job claimable");
+    crate::api::exports::run_export_muting_job(
+        &pool,
+        "http://127.0.0.1:3000",
+        &job.payload["user"]["id"].as_str().unwrap(),
+    )
+    .await
+    .expect("exportMuting processor");
+
+    let (s, files) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {files}");
+    let files = files.as_array().expect("files array").clone();
+    assert_eq!(files.len(), 1, "one export = one drive file");
+    let name = files[0]["name"].as_str().unwrap();
+    assert!(
+        name.starts_with("mute-") && name.ends_with(".csv"),
+        "name: {name}"
+    );
+    assert_eq!(name.len(), "mute-".len() + 19 + 4, "name: {name}");
+    assert_eq!(files[0]["type"], json!("text/csv"));
+
+    // the bytes: only the indefinite mute's acct line (config-host acct)
+    let path = url::Url::parse(files[0]["url"].as_str().unwrap())
+        .unwrap()
+        .path()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let expected = format!("{}@127.0.0.1:3000\n", bob["username"].as_str().unwrap());
+    assert_eq!(text, expected, "exportMuting CSV lines (timed mute out)");
+}

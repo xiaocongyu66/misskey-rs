@@ -49,6 +49,7 @@ pub(crate) const EXPORT_ENDPOINTS: &[&str] = &[
     "i/export-clips",
     "i/export-user-lists",
     "i/export-following",
+    "i/export-mute",
 ];
 
 pub(crate) fn handles(name: &str) -> bool {
@@ -70,6 +71,7 @@ pub(crate) async fn handle(
         "i/export-clips" => export_clips(pool, body, token.as_deref()).await,
         "i/export-user-lists" => export_user_lists(pool, body, token.as_deref()).await,
         "i/export-following" => export_following(pool, body, token.as_deref()).await,
+        "i/export-mute" => export_mute(pool, body, token.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
 }
@@ -139,6 +141,7 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
             "exportClips".to_string(),
             "exportUserLists".to_string(),
             "exportFollowing".to_string(),
+            "exportMuting".to_string(),
         ],
         std::sync::Arc::new(move |_queue, job| {
             let pool = pool.clone();
@@ -176,6 +179,7 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
                         )
                         .await
                     }
+                    "exportMuting" => run_export_muting_job(&pool, &base_url, &uid).await,
                     other => Err(format!("unknown export kind: {other}")),
                 }
             })
@@ -386,6 +390,65 @@ pub(crate) async fn run_export_following_job(
     let file_name = format!("following-{}.csv", filename_timestamp_ms(now_ms));
     add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
     tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportFollowing: exported");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// i/export-mute — export-mute.ts: enqueue and answer 204
+// ---------------------------------------------------------------------------
+
+async fn export_mute(pool: &mk_db::sqlx::PgPool, body: &Value, token: Option<&str>) -> Response {
+    let me_id = match super::require_credential_me_id(pool, token, "dbg_export").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    // QueueService.createExportMuteJob: dbQueue.add('exportMuting',
+    // { user: { id } }). paramDef {} — nothing else rides the params.
+    let _ = body;
+    let queue = mk_queue::QueueHandle::new(pool.clone());
+    let payload = json!({ "type": "exportMuting", "user": { "id": me_id } });
+    if let Err(e) = queue.enqueue("exportMuting", &payload).await {
+        return db_err("export_mute enqueue", e);
+    }
+    ok_empty()
+}
+
+/// The `exportMuting` job (ExportMutingProcessorService.process): one acct
+/// line per NON-EXPIRING mute (`expiresAt IS NULL` — timed mutes never
+/// export) → addFile `mute-…csv`. The exportCompleted notification is NOT
+/// ported — the same documented divergence as exportClips.
+pub(crate) async fn run_export_muting_job(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    uid: &str,
+) -> Result<(), String> {
+    // `usersRepository.findOneBy({ id })` — a deleted user silently finishes.
+    let Some(_user) = mk_db::user::find_user_by_id(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        tracing::warn!(target: "dbg_export", user = %uid, "exportMuting: user gone; job finished noop");
+        return Ok(());
+    };
+    let mutes = mk_db::export_blob::export_mutes_asc(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_host = url_host(base_url);
+    let mut out = String::new();
+    for m in &mutes {
+        // `this.utilityService.getFullApAccount(u.username, u.host)`
+        out.push_str(&full_ap_account(
+            &m.username,
+            m.host.as_deref(),
+            &local_host,
+        ));
+        out.push('\n');
+    }
+    // DriveService.addFile({ name: 'mute-...csv', force: true, ext: 'csv' })
+    let now_ms = crate::api::now_ms() as i64;
+    let file_name = format!("mute-{}.csv", filename_timestamp_ms(now_ms));
+    add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
+    tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportMuting: exported");
     Ok(())
 }
 
