@@ -13140,7 +13140,12 @@ async fn fetchres_seed(
     )
     .await;
     assert_eq!(s, StatusCode::OK, "notes/create: {note}");
-    let note_id = note["id"].as_str().unwrap().to_string();
+    // notes/create returns the upstream `{ createdNote }` envelope (endpoints/
+    // notes/create.ts → Note entity pack) — the bare `note["id"]` read here
+    // birth-panicked `unwrap` on Null and kept all three fetchres pins red
+    // ON SERIAL while the e2e lane ran the same routes green (the Node
+    // census reads body.createdNote.id).
+    let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
 
     let (s, page) = post_json(
         app.clone(),
