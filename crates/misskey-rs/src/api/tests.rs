@@ -14996,7 +14996,7 @@ async fn meili_index_document_shape_and_should_index_gate() {
     let doc0 = &docs[0];
     assert_eq!(
         doc0,
-        json!({
+        &json!({
             "id": note_id,
             "createdAt": mk_types::id::parse_aid_date(&note_id).unwrap(),
             "userId": alice["id"],
