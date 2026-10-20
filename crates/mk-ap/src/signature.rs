@@ -43,14 +43,18 @@ pub struct VerifiedKey {
 }
 
 /// Draft-cavage `Signature:` header parameters.
+/// Draft-cavage `Signature:` header parameters (public: the caller needs
+/// `key_id` for the actor-key lookup and `signature` for the audit trail —
+/// the private-in-public lint was right to complain).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedSignature {
-    key_id: String,
-    algorithm: Option<String>,
+pub struct ParsedSignature {
+    pub key_id: String,
+    /// Lower-cased algorithm parameter; `None` (absent) implies rsa-sha256.
+    pub algorithm: Option<String>,
     /// Signed header names, lowercased, in signed order.
-    headers: Vec<String>,
+    pub headers: Vec<String>,
     /// Base64 signature bytes as sent.
-    signature: String,
+    pub signature: String,
 }
 
 /// Parse `keyId="…",algorithm="…",headers="…",signature="…"`.
