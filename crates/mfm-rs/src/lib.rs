@@ -38,6 +38,14 @@ pub enum Node {
     /// `#tag` → `<a href="{config.url}/tags/tag" rel="tag">#tag</a>`; the
     /// rendered href rides the `url` argument of [`to_html`].
     Hashtag(String),
+    /// `@user` / `@user@host` → `<a href="…" class="u-url mention">@acct</a>`;
+    /// the parse keeps the matched case (the render escapes the acct as
+    /// typed) and the trimmed username/host.
+    Mention {
+        username: String,
+        host: Option<String>,
+        acct: String,
+    },
 }
 
 /// The upstream `IMentionedRemoteUsers` entry (src/models/Note.ts) — the
@@ -52,13 +60,15 @@ pub struct MentionedRemoteUser {
 }
 
 /// Scanner context: `inline_only` selects the mfm-js `inline` alternation
-/// (block rules dropped — it is what quote/center content runs under), and
+/// (block rules dropped — it is what quote/center content runs under),
 /// `depth` mirrors the mfm-js `nestLimit` (20) so `>>>>…` spam cannot recurse
-/// without bound.
+/// without bound, and `link_label` is the mfm-js `state.linkLabel` (set while
+/// a `[label](url)` label is parsed — mention/hashtag/url never fold there).
 #[derive(Clone, Copy)]
 struct Ctx {
     inline_only: bool,
     depth: u32,
+    link_label: bool,
 }
 
 /// Parse an MFM string. A marker only folds when its matching closer exists;
@@ -69,18 +79,20 @@ pub fn parse(input: &str) -> Vec<Node> {
         Ctx {
             inline_only: false,
             depth: 0,
+            link_label: false,
         },
     )
 }
 
 /// The mfm-js `inline` alternation — block rules dropped (center/quote
 /// content runs under it upstream).
-fn parse_inline(input: &str, depth: u32) -> Vec<Node> {
+fn parse_inline(input: &str, depth: u32, link_label: bool) -> Vec<Node> {
     parse_ctx(
         input,
         Ctx {
             inline_only: true,
             depth,
+            link_label,
         },
     )
 }
@@ -161,8 +173,13 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
     if let Some(hit) = try_emoji_code(input, start) {
         return Some(hit);
     }
-    if let Some(hit) = try_hashtag(input, start) {
-        return Some(hit);
+    if !ctx.link_label {
+        if let Some(hit) = try_mention(input, start) {
+            return Some(hit);
+        }
+        if let Some(hit) = try_hashtag(input, start) {
+            return Some(hit);
+        }
     }
     let rest = &input[start..];
     // inline code first: the span is verbatim, nothing inside is rescanned
@@ -203,6 +220,7 @@ fn try_open(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
             Ctx {
                 inline_only: ctx.inline_only,
                 depth: ctx.depth + 1,
+                link_label: ctx.link_label,
             },
         )),
         start + open.len() + end + close.len(),
@@ -309,6 +327,7 @@ fn try_quote(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
         Ctx {
             inline_only: false,
             depth: ctx.depth + 1,
+            link_label: ctx.link_label,
         },
     ));
     for _ in 0..2 {
@@ -364,6 +383,7 @@ fn try_center(input: &str, start: usize, ctx: Ctx) -> Option<(Node, usize)> {
     let node = Node::Center(parse_inline(
         &input[content_start..content_end],
         ctx.depth + 1,
+        ctx.link_label,
     ));
     let mut end = content_end;
     if let Some(n) = newline_len(input, end) {
@@ -516,6 +536,93 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
+/// mfm-js mention: `'@' + [a-z0-9_.-]+ ('@' + [a-z0-9_.-]+)?` over
+/// case-insensitive ASCII classes, never preceded by an ASCII alnum. Trailing
+/// `.`/`-` runs trim off the host (an empty trim invalidates and drops the
+/// host) and off the username when no host remains; a trimmed-empty or
+/// `.`/`-`-leading username, a `.`/`-`-leading host, or a trailing run on the
+/// username while a host is present invalidates the mention — the whole
+/// matched span then rides as literal text.
+fn try_mention(input: &str, start: usize) -> Option<(Node, usize)> {
+    if !input[start..].starts_with('@') {
+        return None;
+    }
+    if let Some(prev) = input[..start].chars().next_back() {
+        if prev.is_ascii_alphanumeric() {
+            return None;
+        }
+    }
+    let mut j = start + 1;
+    while let Some(&b) = input.as_bytes().get(j) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-') {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if j == start + 1 {
+        return None;
+    }
+    let mut username = input[start + 1..j].to_string();
+    let mut host: Option<String> = None;
+    if input.as_bytes().get(j) == Some(&b'@') {
+        let host_start = j + 1;
+        let mut k = host_start;
+        while let Some(&b) = input.as_bytes().get(k) {
+            if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-') {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+        if k > host_start {
+            host = Some(input[host_start..k].to_string());
+            j = k;
+        }
+    }
+    let match_end = j;
+    let mut invalid = false;
+    if let Some(h) = host.as_mut() {
+        let trim = h.trim_end_matches(['.', '-']).len();
+        if trim == 0 {
+            invalid = true;
+            host = None;
+        } else if trim != h.len() {
+            h.truncate(trim);
+        }
+    }
+    if host.is_none() {
+        let trim = username.trim_end_matches(['.', '-']).len();
+        if trim != username.len() {
+            username.truncate(trim);
+        }
+    } else if username.ends_with(['.', '-']) {
+        invalid = true;
+    }
+    if username.is_empty() || username.starts_with(['.', '-']) {
+        invalid = true;
+    }
+    if host.as_ref().is_some_and(|h| h.starts_with(['.', '-'])) {
+        invalid = true;
+    }
+    if invalid {
+        // upstream returns the whole matched span as text
+        return Some((Node::Text(input[start..match_end].to_string()), match_end));
+    }
+    let acct = match &host {
+        Some(h) => format!("@{username}@{h}"),
+        None => format!("@{username}"),
+    };
+    Some((
+        Node::Mention {
+            username,
+            host,
+            acct,
+        },
+        match_end,
+    ))
+}
+
 /// Render nodes to HTML — the `MfmService.toHtml` visitor subset:
 /// bold→`<b>`, strike→`<del>`, italic→`<i>`, small→`<small>`,
 /// inlineCode→`<code>` (content escaped), blockCode→`<pre><code>`,
@@ -609,6 +716,51 @@ pub fn to_html(
                 out.push_str("\" rel=\"tag\">#");
                 out.push_str(&escape(tag));
                 out.push_str("</a>");
+            }
+            Node::Mention {
+                username,
+                host,
+                acct,
+            } => {
+                // upstream mention arm: a `mentionedRemoteUsers` hit wins
+                // (url, else uri) — matched username/host case-insensitively,
+                // and a null mention host never matches (the upstream
+                // `remoteUser.host?.toLowerCase() === host?.toLowerCase()`
+                // compares a string against undefined); otherwise
+                // `{config.url}/{acct}` with a self-host suffix strip that
+                // can never fire upstream (the config.url is an origin —
+                // scheme and all — while an acct host never carries one);
+                // ported verbatim regardless. The href then rides
+                // `new URL(...).href` normalization.
+                let remote = mentioned_remote_users.iter().find(|r| {
+                    r.username.to_lowercase() == username.to_lowercase()
+                        && match host.as_deref() {
+                            Some(h) => r.host.to_lowercase() == h.to_lowercase(),
+                            None => false,
+                        }
+                });
+                let href = match remote {
+                    Some(r) => r.url.clone().unwrap_or_else(|| r.uri.clone()),
+                    None => {
+                        let suffix = format!("@{url}");
+                        let tail = if acct.ends_with(&suffix) {
+                            acct[..acct.len() - suffix.len()].to_string()
+                        } else {
+                            acct.clone()
+                        };
+                        format!("{url}/{tail}")
+                    }
+                };
+                match url::Url::parse(&href) {
+                    Ok(u) => {
+                        out.push_str("<a href=\"");
+                        out.push_str(&escape(u.as_str()));
+                        out.push_str("\" class=\"u-url mention\">");
+                        out.push_str(&escape(acct));
+                        out.push_str("</a>");
+                    }
+                    Err(_) => out.push_str(&escape(acct)),
+                }
             }
         }
     }
@@ -838,5 +990,80 @@ mod tests {
             "#<a href=\"http://misskey.local/tags/foo\" rel=\"tag\">#foo</a>"
         );
         assert_eq!(render("#123"), "#123"); // all-digit run
+    }
+
+    #[test]
+    fn mention_links_to_config_acct() {
+        // mention arm fallback: `<a href="{config.url}/{acct}"
+        // class="u-url mention">{acct}</a>`
+        assert_eq!(
+            render("@user"),
+            "<a href=\"http://misskey.local/@user\" class=\"u-url mention\">@user</a>"
+        );
+        assert_eq!(
+            render("@user@host.example"),
+            "<a href=\"http://misskey.local/@user@host.example\" class=\"u-url mention\">@user@host.example</a>"
+        );
+        // trailing trim: the dot stays text
+        assert_eq!(
+            render("@user@host."),
+            "<a href=\"http://misskey.local/@user@host\" class=\"u-url mention\">@user@host</a>."
+        );
+        // a host-ful username trailing run invalidates the whole span
+        assert_eq!(render("@user.@host"), "@user.@host");
+        assert_eq!(render("@user@."), "@user@.");
+        assert_eq!(render("@.user"), "@.user");
+        // hostless username trailing run trims into the acct
+        assert_eq!(
+            render("@user-"),
+            "<a href=\"http://misskey.local/@user\" class=\"u-url mention\">@user</a>-"
+        );
+        // mid-name dots are fine; alnum-preceded '@' stays literal
+        assert_eq!(
+            render("@u..ser"),
+            "<a href=\"http://misskey.local/@u..ser\" class=\"u-url mention\">@u..ser</a>"
+        );
+        assert_eq!(render("a@b"), "a@b");
+    }
+
+    #[test]
+    fn mention_remote_lookup_overrides_href() {
+        // upstream: a mentionedRemoteUsers hit renders its url (else uri) —
+        // matched case-insensitively on username+host
+        let mentioned = vec![
+            MentionedRemoteUser {
+                username: "remoteuser".into(),
+                host: "remote.example".into(),
+                url: Some("https://remote.example/@remoteuser".into()),
+                uri: "https://remote.example/users/9x".into(),
+            },
+            MentionedRemoteUser {
+                username: "nourl".into(),
+                host: "remote.example".into(),
+                url: None,
+                uri: "https://remote.example/users/9y".into(),
+            },
+        ];
+        let html = |input: &str| {
+            to_html(
+                &parse(input),
+                &escape_html,
+                "http://misskey.local",
+                &mentioned,
+            )
+        };
+        assert_eq!(
+            html("@REMOTEUSER@remote.example"),
+            "<a href=\"https://remote.example/@remoteuser\" class=\"u-url mention\">@REMOTEUSER@remote.example</a>"
+        );
+        assert_eq!(
+            html("@nourl@remote.example"),
+            "<a href=\"https://remote.example/users/9y\" class=\"u-url mention\">@nourl@remote.example</a>"
+        );
+        // a local (host-less) mention never matches a remote row
+        assert_eq!(
+            html("@remoteuser"),
+            "<a href=\"http://misskey.local/@remoteuser\" class=\"u-url mention\">@remoteuser</a>"
+        );
     }
 }

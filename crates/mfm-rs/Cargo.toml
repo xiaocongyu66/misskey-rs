@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# mention/link/url arms: `new URL(href).href` normalization (WHATWG, the
+# same semantics as the upstream JS)
+url = "2"
