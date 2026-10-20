@@ -13723,3 +13723,246 @@ fn synalio_final_user_created_unpermitted_and_type_mismatch_no_enqueue() {
         "a hook without the event type never enqueues"
     );
 }
+
+// queue-min // — the durable-queue processor slice (upstream
+// EndedPollNotificationProcessorService.ts + DeleteAccountProcessorService.ts):
+// enqueue rows visible, the ended-poll handler's pollEnded rows, the
+// deleteAccount soft purge.
+
+/// enqueue rows visible: both new kinds land in mk_queue_jobs with the
+/// upstream payload shapes — the delayed variant (run_after = now + 1h) is
+/// NOT yet due so claim skips it, while the due deleteAccount job claims
+/// with its payload intact.
+#[tokio::test]
+async fn queue_min_enqueue_rows_visible_and_delayed_not_due() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("queue_min_enqueue").await;
+    let q = mk_queue::QueueHandle::new(pool.clone());
+
+    let ended = q
+        .enqueue_delayed(
+            "endedPollNotification",
+            &json!({ "type": "endedPollNotification", "noteId": "note1" }),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    let del = q
+        .enqueue(
+            "deleteAccount",
+            &json!({ "type": "deleteAccount", "user": { "id": "u_del" }, "soft": true }),
+        )
+        .await
+        .unwrap();
+
+    let (kind, payload): (String, Value) =
+        mk_db::sqlx::query_as(r#"SELECT "kind", "payload" FROM "mk_queue_jobs" WHERE "id" = $1"#)
+            .bind(del)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kind, "deleteAccount");
+    assert_eq!(payload["user"]["id"], json!("u_del"));
+    assert_eq!(payload["soft"], json!(true));
+    let (kind, payload): (String, Value) =
+        mk_db::sqlx::query_as(r#"SELECT "kind", "payload" FROM "mk_queue_jobs" WHERE "id" = $1"#)
+            .bind(ended)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kind, "endedPollNotification");
+    assert_eq!(payload["noteId"], json!("note1"));
+
+    let job = q
+        .claim_next(&["endedPollNotification", "deleteAccount"])
+        .await
+        .unwrap()
+        .expect("the due deleteAccount job claims");
+    assert_eq!(job.id, del);
+    q.complete(job.id).await.unwrap();
+    assert!(
+        q.claim_next(&["endedPollNotification", "deleteAccount"])
+            .await
+            .unwrap()
+            .is_none(),
+        "the future run_after delayed job stays unclaimed"
+    );
+}
+
+/// the ended-poll handler creates `pollEnded` notification rows for the
+/// LOCAL author + voters of a poll expired inside the hourly scan window
+/// (remote users stay out); an at-least-once re-run dedups; the per-note arm
+/// reaches polls whose window already aged out.
+#[tokio::test]
+async fn queue_min_ended_poll_handler_creates_poll_ended_notifications() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("queue_min_endedpoll").await;
+
+    // EndedPollNotificationProcessorService L49-57: userIds = unique[author,
+    // ...voters], `profile.userHost === null` gate per recipient.
+    for (uid, host) in [
+        ("u_auth", None),
+        ("u_voter", None),
+        ("u_remote", Some("remote.example")),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "user" ("id", "username", "usernameLower", "host")
+               VALUES ($1, $1, $1, $2)"#,
+        )
+        .bind(uid)
+        .bind(host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for nid in ["n1", "n2"] {
+        mk_db::sqlx::query(r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, 'u_auth', 'public')"#)
+            .bind(nid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let now = now_ms() as i64;
+    // n1: expired 30 min ago (inside the last-hour window); n2: expired 3h
+    // ago (window aged out — the scan arm must skip it, the per-note arm
+    // reaches it).
+    mk_db::poll::insert_poll(
+        &pool,
+        "n1",
+        &["a".to_string(), "b".to_string()],
+        false,
+        Some(now - 30 * 60_000),
+        "public",
+        "u_auth",
+    )
+    .await
+    .unwrap();
+    mk_db::poll::insert_poll(
+        &pool,
+        "n2",
+        &["a".to_string(), "b".to_string()],
+        false,
+        Some(now - 3 * 3_600_000),
+        "public",
+        "u_auth",
+    )
+    .await
+    .unwrap();
+    mk_db::poll::insert_poll_vote(&pool, "v1", "u_voter", "n1", 0)
+        .await
+        .unwrap();
+    mk_db::poll::insert_poll_vote(&pool, "v2", "u_remote", "n2", 0)
+        .await
+        .unwrap();
+
+    let poll_ended_rows = || async {
+        mk_db::sqlx::query_as::<_, (String, Option<String>)>(
+            r#"SELECT ("notifieeId"), ("noteId") FROM "notification"
+               WHERE "type" = 'pollEnded' ORDER BY "id""#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+
+    // scan arm (payload-less job): n1 only — author + local voter.
+    crate::api::queue_processors::run_ended_poll_notification(&pool, None)
+        .await
+        .unwrap();
+    let rows = poll_ended_rows().await;
+    assert!(
+        rows.contains(&("u_auth".to_string(), Some("n1".to_string())))
+            && rows.contains(&("u_voter".to_string(), Some("n1".to_string()))),
+        "author + local voter notified: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "remote voter + aged-out n2 stay out: {rows:?}");
+
+    // at-least-once re-delivery dedups (no new rows).
+    crate::api::queue_processors::run_ended_poll_notification(&pool, None)
+        .await
+        .unwrap();
+    assert_eq!(poll_ended_rows().await.len(), 2, "re-run dedups");
+
+    // per-note arm: the aged-out n2 — local author notified, remote voter not.
+    crate::api::queue_processors::run_ended_poll_notification(&pool, Some("n2"))
+        .await
+        .unwrap();
+    let rows = poll_ended_rows().await;
+    assert_eq!(
+        rows,
+        vec![
+            ("u_auth".to_string(), Some("n1".to_string())),
+            ("u_voter".to_string(), Some("n1".to_string())),
+            ("u_auth".to_string(), Some("n2".to_string())),
+        ],
+        "n2 author notified via the per-note arm: {rows:?}"
+    );
+}
+
+/// the deleteAccount job's soft slice: the user's note rows purge (upstream
+/// `{ // Delete notes }`), unrelated notes survive, and the user ROW itself
+/// survives with `isDeleted` (削除済ユーザーが含まれる keeps reading it from
+/// the users lists).
+#[tokio::test]
+async fn queue_min_delete_account_handler_soft_purges_notes_and_marks_user() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("queue_min_delacct").await;
+
+    for uid in ["u_del", "u_other"] {
+        mk_db::sqlx::query(r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $1, $1)"#)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for (nid, uid) in [("n_del1", "u_del"), ("n_del2", "u_del"), ("n_keep", "u_other")] {
+        mk_db::sqlx::query(r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#)
+            .bind(nid)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    crate::api::queue_processors::run_delete_account(&pool, "u_del")
+        .await
+        .unwrap();
+
+    let left: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "userId" = 'u_del'"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the deleted user's notes purged");
+    let kept: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "note" WHERE "id" = 'n_keep'"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "unrelated notes survive");
+    let n: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user" WHERE "id" = 'u_del'"#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 1, "the user row survives (削除済ユーザーが含まれる)");
+    let is_deleted: bool =
+        mk_db::sqlx::query_scalar(r#"SELECT "isDeleted" FROM "user" WHERE "id" = 'u_del'"#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(is_deleted, "isDeleted stays marked");
+
+    // idempotent: a re-claimed job (gone user row path NOT taken — the row
+    // exists) re-runs the purge as a noop.
+    crate::api::queue_processors::run_delete_account(&pool, "u_del")
+        .await
+        .unwrap();
+}
