@@ -788,7 +788,7 @@ mod tests {
         async fn add_user(pool: &mk_db::sqlx::PgPool, id: &str) {
             mk_db::sqlx::query(
                 r#"INSERT INTO "user" ("id", "username", "usernameLower", "token")
-                   VALUES ($1, $1, $1, '0123456789abcdef')"#,
+                   VALUES ($1, $1, $1, left(md5($1), 16))"#,
             )
             .bind(id)
             .execute(pool)
