@@ -64,6 +64,29 @@ pub async fn find_subscription(
     Ok(row)
 }
 
+/// One `sw_subscription` row as the push-delivery leg reads it (upstream
+/// `MiSwSubscription` via PushNotificationService's per-user cache fetch,
+/// `findBy({ userId })`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Row {
+    pub endpoint: String,
+    pub auth: String,
+    pub publickey: String,
+    pub send_read_message: bool,
+}
+
+/// `subscriptionsCache.fetcher: findBy({ userId })` — every subscription of
+/// one user, in PK order (stable for tests; upstream relies on cache order).
+pub async fn list_by_user(pool: &PgPool, user_id: &str) -> Result<Vec<Row>, sqlx::Error> {
+    sqlx::query_as::<_, Row>(
+        r#"SELECT "endpoint", "auth", "publickey", "sendReadMessage" FROM "sw_subscription"
+           WHERE "userId" = $1 ORDER BY "id""#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// `delete(subscriptions.map(s => s.id))` — unregister removes every row
 /// matching the endpoint/auth/publickey triple for this user.
 pub async fn delete_subscription(

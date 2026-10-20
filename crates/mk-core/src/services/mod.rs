@@ -10,7 +10,10 @@ pub mod misc;
 // shortcut). Shared by the UserDetailed pack and api::move_account.
 pub mod move_account;
 pub mod note_pack;
+// push-send: PushNotificationService.pushNotification delivery leg
+// (list_by_user → type filter → vapid_jwt + minimal TCP POST; 404/410 prune).
 pub mod notification_pack;
+pub mod push_deliver;
 pub mod role;
 // roles-v2: conditional-role engine (evalCond/getUserRoles) + Role-pack
 // policy surface (DEFAULT_POLICIES fill / explicit canPublicNote override)

@@ -231,6 +231,19 @@ pub(crate) async fn notify_note_to_followers(
             }
         }
         notify_note_event(pool, &follower_id, author_id, "note", note_id).await;
+        // push-send: PushNotificationService.pushNotification(userId, 'note',
+        // { noteId }) — fire-and-forget per follower; all delivery errors are
+        // logged and swallowed inside send_to_user (upstream `.catch`).
+        let (pool, follower_id, note_id) = (pool.clone(), follower_id.clone(), note_id.to_string());
+        tokio::spawn(async move {
+            mk_core::push_deliver::send_to_user(
+                &pool,
+                &follower_id,
+                "note",
+                &serde_json::json!({ "noteId": note_id }),
+            )
+            .await;
+        });
     }
 }
 

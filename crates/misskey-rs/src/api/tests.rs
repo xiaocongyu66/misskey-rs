@@ -15390,3 +15390,127 @@ async fn sw_register_row_already_subscribed_and_unregister_void() {
             .unwrap();
     assert_eq!(rows, 0, "unregister removed the row: {rows}");
 }
+
+// ===== push-send: PushNotificationService delivery leg (sendToUser) ======
+
+// list_by_user row shape + the readAllNotifications sendReadMessage filter
+// (upstream L105-107); attempt counts are post-filter, dead endpoints are
+// swallowed inside send_to_user.
+#[tokio::test]
+async fn push_send_list_by_user_row_shape_and_type_filter() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_push_send_list").await;
+    let uid = mk_types::id::gen_aid_now();
+    mk_db::sw::insert_subscription(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        &uid,
+        "http://127.0.0.1:9/push/a",
+        "authA",
+        "pubA",
+        true,
+    )
+    .await
+    .unwrap();
+    mk_db::sw::insert_subscription(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        &uid,
+        "http://127.0.0.1:9/push/b",
+        "authB",
+        "pubB",
+        false,
+    )
+    .await
+    .unwrap();
+
+    // row shape: endpoint/auth/publickey/sendReadMessage come back verbatim
+    let rows = mk_db::sw::list_by_user(&pool, &uid).await.unwrap();
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    let (a, b) = (
+        rows.iter()
+            .find(|r| r.endpoint.ends_with("/push/a"))
+            .expect("row a"),
+        rows.iter()
+            .find(|r| r.endpoint.ends_with("/push/b"))
+            .expect("row b"),
+    );
+    assert_eq!(a.auth, "authA");
+    assert_eq!(a.publickey, "pubA");
+    assert!(a.send_read_message);
+    assert_eq!(b.auth, "authB");
+    assert_eq!(b.publickey, "pubB");
+    assert!(!b.send_read_message);
+
+    // filter: readAllNotifications attempts only the opted-in row
+    let attempted = mk_core::push_deliver::send_to_user(
+        &pool,
+        &uid,
+        "readAllNotifications",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(attempted, 1, "non-opted row filtered out");
+    // 'note' (the notify_note_to_followers wiring type) attempts every row
+    let attempted =
+        mk_core::push_deliver::send_to_user(&pool, &uid, "note", &json!({ "noteId": "probe" }))
+            .await;
+    assert_eq!(attempted, 2, "'note' attempts every row");
+}
+
+// A dead push endpoint is swallowed (no panic, no 500): the direct delivery
+// attempt errors away, and a note whose fanout carries the fire-and-forget
+// push still answers 200.
+#[tokio::test]
+async fn push_send_dead_endpoint_swallowed_note_still_200s() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_push_send_dead").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let (a_id, a_token) = (alice["id"].as_str().unwrap(), alice["token"].as_str().unwrap());
+    let b_id = bob["id"].as_str().unwrap();
+
+    // bob follows alice → the note-notify fanout (and its push leg) reaches him
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": a_id, "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "follow: {v}");
+
+    // bob's push subscription points at a refused port; the direct attempt
+    // must swallow every error and report the single (dead) attempt
+    mk_db::sw::insert_subscription(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        b_id,
+        "http://127.0.0.1:9/dead",
+        "auth",
+        "pub",
+        false,
+    )
+    .await
+    .unwrap();
+    let attempted =
+        mk_core::push_deliver::send_to_user(&pool, b_id, "note", &json!({ "noteId": "probe" }))
+            .await;
+    assert_eq!(attempted, 1, "dead endpoint attempted, error swallowed");
+
+    // the note that fans the push still 200s
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "push smoke", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note with dead push endpoint: {v}");
+    assert_eq!(v["createdNote"]["text"], "push smoke", "body: {v}");
+}
