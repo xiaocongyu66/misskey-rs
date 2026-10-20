@@ -213,6 +213,6 @@ mod tests {
     fn unterminated_markup_stays_literal() {
         assert_eq!(render("**a"), "**a");
         assert_eq!(render("a * b"), "a * b");
-        assert_eq!(render("<i>a"), "<i>a");
+        assert_eq!(render("<i>a"), "&lt;i&gt;a");
     }
 }
