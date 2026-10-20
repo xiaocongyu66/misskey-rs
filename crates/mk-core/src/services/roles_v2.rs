@@ -675,8 +675,8 @@ mod tests {
         mk_db::run_migrations(&pool).await.expect("migrations");
 
         mk_db::sqlx::query(
-            r#"INSERT INTO "user" ("id", "username", "usernameLower", "isBot")
-               VALUES ('u1', 'botuser', 'botuser', TRUE)"#,
+            r#"INSERT INTO "user" ("id", "username", "usernameLower", "isBot", "token")
+               VALUES ('u1', 'botuser', 'botuser', TRUE, gen_random_uuid()::text)"#,
         )
         .execute(&pool)
         .await
