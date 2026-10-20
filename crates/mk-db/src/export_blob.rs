@@ -354,6 +354,42 @@ pub async fn export_blockings_asc(
     .await
 }
 
+/// ExportFavoritesProcessorService page: the user's NOTE favorites
+/// (`note_favorite` — note favorites, not clip favorites) `id` ASC joined to
+/// the note + the note author. Same projection as [`export_clip_notes`] —
+/// the favorite id rides the `clip_note_id` slot and the
+/// generateVisibilityQuery + shouldHideNoteByTime inputs ride along for the
+/// api-side filter.
+/// rides the `clip_note_id` slot and the generateVisibilityQuery +
+/// shouldHideNoteByTime inputs ride along for the api-side filter.
+pub async fn export_favorites_asc(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<ExportClipNoteRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportClipNoteRow>(
+        r#"SELECT nf."id" AS "clip_note_id",
+                  n."id" AS "note_id", n."text", n."cw",
+                  ("n"."visibility"::text) AS "visibility",
+                  n."fileIds" AS "file_ids", n."replyId" AS "reply_id",
+                  n."renoteId" AS "renote_id", n."replyUserId" AS "reply_user_id",
+                  n."visibleUserIds" AS "visible_user_ids", n."mentions",
+                  n."hasPoll" AS "has_poll", n."localOnly" AS "local_only",
+                  n."reactionAcceptance" AS "reaction_acceptance",
+                  n."uri" AS "note_uri", n."url" AS "note_url",
+                  u."id" AS "author_id", u."username", u."name" AS "author_name",
+                  u."host", u."uri" AS "author_uri",
+                  u."makeNotesHiddenBefore" AS "make_notes_hidden_before"
+           FROM "note_favorite" nf
+           INNER JOIN "note" n ON n."id" = nf."noteId"
+           INNER JOIN "user" u ON u."id" = n."userId"
+           WHERE nf."userId" = $1
+           ORDER BY nf."id" ASC"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
 // ==== drive/files {list,show,delete} reads ==================================
 
 /// The `mk_db::drive::find_drive_file` projection — DriveFileRow's sqlx

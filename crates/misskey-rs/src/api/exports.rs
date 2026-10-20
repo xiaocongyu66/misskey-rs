@@ -51,6 +51,7 @@ pub(crate) const EXPORT_ENDPOINTS: &[&str] = &[
     "i/export-following",
     "i/export-mute",
     "i/export-blocking",
+    "i/export-favorites",
 ];
 
 pub(crate) fn handles(name: &str) -> bool {
@@ -74,6 +75,7 @@ pub(crate) async fn handle(
         "i/export-following" => export_following(pool, body, token.as_deref()).await,
         "i/export-mute" => export_mute(pool, body, token.as_deref()).await,
         "i/export-blocking" => export_blocking(pool, body, token.as_deref()).await,
+        "i/export-favorites" => export_favorites(pool, body, token.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
 }
@@ -145,6 +147,7 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
             "exportFollowing".to_string(),
             "exportMuting".to_string(),
             "exportBlocking".to_string(),
+            "exportFavorites".to_string(),
         ],
         std::sync::Arc::new(move |_queue, job| {
             let pool = pool.clone();
@@ -184,6 +187,7 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
                     }
                     "exportMuting" => run_export_muting_job(&pool, &base_url, &uid).await,
                     "exportBlocking" => run_export_blocking_job(&pool, &base_url, &uid).await,
+                    "exportFavorites" => run_export_favorites_job(&pool, &base_url, &uid).await,
                     other => Err(format!("unknown export kind: {other}")),
                 }
             })
@@ -516,6 +520,134 @@ pub(crate) async fn run_export_blocking_job(
     let file_name = format!("blocking-{}.csv", filename_timestamp_ms(now_ms));
     add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
     tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportBlocking: exported");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// i/export-favorites — export-favorites.ts: enqueue and answer 204
+// ---------------------------------------------------------------------------
+
+async fn export_favorites(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let me_id = match super::require_credential_me_id(pool, token, "dbg_export").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    // QueueService.createExportFavoritesJob: dbQueue.add('exportFavorites',
+    // { user: { id } }). paramDef {} — nothing else rides the params.
+    let _ = body;
+    let queue = mk_queue::QueueHandle::new(pool.clone());
+    let payload = json!({ "type": "exportFavorites", "user": { "id": me_id } });
+    if let Err(e) = queue.enqueue("exportFavorites", &payload).await {
+        return db_err("export_favorites enqueue", e);
+    }
+    ok_empty()
+}
+
+/// The `exportFavorites` job (ExportFavoritesProcessorService.process): a
+/// JSON array of the user's NOTE favorites (`note_favorite`, favorite.id
+/// ASC), each `{ id, createdAt, note }` with the SAME note record shape +
+/// generateVisibilityQuery + shouldHideNoteByTime + poll legs the clipNotes
+/// lane runs (the upstream favorites query filters `me` = the favoriting
+/// user exactly like the clips one) → addFile `favorites-…json`. The
+/// exportCompleted notification is NOT ported — the same documented
+/// divergence as exportClips.
+pub(crate) async fn run_export_favorites_job(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    uid: &str,
+) -> Result<(), String> {
+    // `usersRepository.findOneBy({ id })` — a deleted user silently finishes.
+    let Some(_user) = mk_db::user::find_user_by_id(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        tracing::warn!(target: "dbg_export", user = %uid, "exportFavorites: user gone; job finished noop");
+        return Ok(());
+    };
+    let favorites = mk_db::export_blob::export_favorites_asc(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let followees: std::collections::HashSet<String> = mk_db::social::followee_ids(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    let now_ms = crate::api::now_ms() as i64;
+
+    let mut out: Vec<Value> = Vec::with_capacity(favorites.len());
+    for fav in &favorites {
+        let Some(note_created_ms) = mk_types::id::parse_aid_date(&fav.note_id) else {
+            continue;
+        };
+        if !clip_note_visible_for(fav, uid, &followees) {
+            continue;
+        }
+        if should_hide_note_by_time(fav.make_notes_hidden_before, note_created_ms, now_ms) {
+            continue;
+        }
+        // OneByOrFail poll (only when the note carries one — `poll: undefined`
+        // drops the JSON key, exactly like the upstream serializer).
+        let poll = if fav.has_poll {
+            match mk_db::poll::find_poll_by_note(pool, &fav.note_id).await {
+                Ok(Some(p)) => Some(json!({
+                    "noteId": p.note_id,
+                    "expiresAt": p.expires_at_ms.map(mk_core::services::signup::ms_to_iso),
+                    "multiple": p.multiple,
+                    "choices": p.choices,
+                    "votes": p.votes,
+                })),
+                Ok(None) => None, // dangling hasPoll; upstream fails hard
+                Err(e) => return Err(e.to_string()),
+            }
+        } else {
+            None
+        };
+        let iso =
+            |ms: Option<i64>| -> Option<String> { ms.map(mk_core::services::signup::ms_to_iso) };
+        let mut note_v = json!({
+            "id": fav.note_id,
+            "text": fav.text,
+            "createdAt": iso(mk_types::id::parse_aid_date(&fav.note_id)),
+            "fileIds": fav.file_ids,
+            "replyId": fav.reply_id,
+            "renoteId": fav.renote_id,
+            "cw": fav.cw,
+            "visibility": fav.visibility,
+            "visibleUserIds": fav.visible_user_ids,
+            "localOnly": fav.local_only,
+            "reactionAcceptance": fav.reaction_acceptance,
+            "uri": fav.note_uri,
+            "url": fav.note_url,
+            "user": {
+                "id": fav.author_id,
+                "name": fav.author_name,
+                "username": fav.username,
+                "host": fav.host,
+                "uri": fav.author_uri,
+            },
+        });
+        if let Some(p) = poll {
+            note_v
+                .as_object_mut()
+                .expect("note_v object")
+                .insert("poll".to_string(), p);
+        }
+        out.push(json!({
+            "id": fav.clip_note_id,
+            "createdAt": iso(mk_types::id::parse_aid_date(&fav.clip_note_id)),
+            "note": note_v,
+        }));
+    }
+
+    let bytes = serde_json::to_vec(&Value::Array(out)).map_err(|e| e.to_string())?;
+    // DriveService.addFile({ name: 'favorites-...json', force: true, ext: 'json' })
+    let file_name = format!("favorites-{}.json", filename_timestamp_ms(now_ms));
+    add_export_file(pool, base_url, uid, &file_name, "application/json", &bytes).await?;
+    tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportFavorites: exported");
     Ok(())
 }
 
