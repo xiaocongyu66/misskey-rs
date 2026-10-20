@@ -676,7 +676,7 @@ mod tests {
 
         mk_db::sqlx::query(
             r#"INSERT INTO "user" ("id", "username", "usernameLower", "isBot", "token")
-               VALUES ('u1', 'botuser', 'botuser', TRUE, gen_random_uuid()::text)"#,
+               VALUES ('u1', 'botuser', 'botuser', TRUE, '0123456789abcdef')"#,
         )
         .execute(&pool)
         .await
