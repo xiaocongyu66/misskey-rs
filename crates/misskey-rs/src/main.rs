@@ -169,6 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the delayed (test: 10s / prod: 24h) unfollow of the moved
             // account's own followings (AccountMoveService + queueService).
             api::move_account::spawn_move_worker(pool.clone());
+            // queue-min: the endedPollNotification + deleteAccount consumers
+            // (upstream's BullMQ endedPollNotification queue + the db-queue
+            // `deleteAccount` processor) — one PG-brokered worker by kind.
+            api::queue_processors::spawn_queue_workers(pool.clone());
             tracing::info!("postgres connected, migrations applied");
             Some(pool)
         }

@@ -126,6 +126,12 @@ pub(crate) mod move_account;
 // caches + the access-token bearer resolution the notes/create kind gate
 // reuses.
 pub(crate) mod oauth;
+// queue-min: the endedPollNotification + deleteAccount durable-queue
+// processors (upstream queue/processors/EndedPollNotificationProcessor
+// Service.ts + DeleteAccountProcessorService.ts) — enqueue sites at the
+// notes/create poll branch + the delete-account endpoints; pub(crate):
+// main.rs spawns the worker.
+pub(crate) mod queue_processors;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -3994,6 +4000,26 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         {
             tracing::error!(target: "dbg_notes", error = %e, "insert_poll");
             return api_err(ApiError::internal_error());
+        }
+        // queue-min (NoteCreateService.ts L819-829): an expiring poll rides a
+        // `endedPollNotification` delayed job due at expiresAt (BullMQ
+        // `{ delay }` — mk-queue's claim skips rows with a future run_after,
+        // so the job becomes due exactly when the poll ends). Fire-and-forget
+        // upstream (the .add() is unawaited) — a broker hiccup logs, it must
+        // not fail the already-committed note.
+        if let Some(exp) = p.expires_at_ms {
+            let delay = (exp - now_ms() as i64).max(0) as u64;
+            let payload = json!({ "type": "endedPollNotification", "noteId": id });
+            if let Err(e) = mk_queue::QueueHandle::new(pool.clone())
+                .enqueue_delayed(
+                    "endedPollNotification",
+                    &payload,
+                    std::time::Duration::from_millis(delay),
+                )
+                .await
+            {
+                tracing::error!(target: "dbg_notes", error = %e, "endedPollNotification enqueue");
+            }
         }
     }
     if let Some(rid) = reply_id {
