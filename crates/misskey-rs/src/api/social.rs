@@ -1319,6 +1319,34 @@ pub(crate) async fn notes_create_renote(state: &AppState, body: &Value, me_id: &
         }
     }
 
+    // charts3: NoteCreateService.postNoteCreated L754 covers the renote arm
+    // of the ONE upstream create() too — diffs.renote moves for every
+    // renote/quote row (renoteId != null), the renoter's host picks the
+    // local/remote prefix, and this lane cannot carry replyId or files.
+    // Best-effort like the text lane.
+    let renoter_host = mk_db::note::user_host_of(pool, me_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(target: "dbg_social", error = %e, "renote user_host_of[charts]");
+            None
+        });
+    for span in ["hour", "day"] {
+        if let Err(e) = mk_db::charts::update_note(
+            pool,
+            span,
+            mk_db::charts::bucket(span, super::now_ms() as i64),
+            renoter_host.as_deref(),
+            None,
+            Some(renote_id),
+            false,
+            true,
+        )
+        .await
+        {
+            tracing::error!(target: "dbg_social", error = %e, "charts update_note[renote]");
+        }
+    }
+
     // TODO(M2+): replyId+renoteId quote-combo reply-target validation
     match super::pack_note(state, pool, &id).await {
         Ok(n) => {
@@ -1850,16 +1878,20 @@ pub(crate) async fn notes_delete(
     };
     // meili-idx: SearchService.unindexNote's visibility gate
     // (`!['home','public'].includes(note.visibility)` → skip) reads the row
-    // BEFORE the DELETE takes it — fetched only when a real engine is wired,
-    // so the Noop lane stays query-free (upstream fetched the note anyway).
+    // BEFORE the DELETE takes it, and charts3 needs the same row for the
+    // NoteDeleteService.ts L94 `notesChart.update(note, false)` commit
+    // (userHost prefix + reply/renote/file diffs) — fetched unconditionally
+    // now; upstream's endpoint fetched the note for the service call anyway.
+    // A read failure stays swallowed (best-effort lane), the chart commit
+    // just skips.
+    let row = mk_db::note::find_note_by_id(pool, note_id)
+        .await
+        .ok()
+        .flatten();
     let unindex_visibility = if state.search_engine.is_noop() {
         None
     } else {
-        mk_db::note::find_note_by_id(pool, note_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|n| n.visibility)
+        row.as_ref().map(|n| n.visibility.clone())
     };
     match mk_db::note::delete_note(pool, note_id, me_id).await {
         Ok(1) => {
@@ -1873,6 +1905,28 @@ pub(crate) async fn notes_delete(
             if matches!(unindex_visibility.as_deref(), Some("public" | "home")) {
                 if let Err(e) = state.search_engine.remove(note_id).await {
                     tracing::error!(target: "dbg_notes", error = %e, "search engine unindex");
+                }
+            }
+            // charts3: NoteDeleteService.ts L94 `notesChart.update(note,
+            // false)` — the hour+day decrement pair read off the pre-delete
+            // row. Best-effort: a chart failure logs, never fails the
+            // already-committed delete.
+            if let Some(n) = &row {
+                for span in ["hour", "day"] {
+                    if let Err(e) = mk_db::charts::update_note(
+                        pool,
+                        span,
+                        mk_db::charts::bucket(span, super::now_ms() as i64),
+                        n.user_host.as_deref(),
+                        n.reply_id.as_deref(),
+                        n.renote_id.as_deref(),
+                        !n.file_ids.is_empty(),
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::error!(target: "dbg_notes", error = %e, "charts update_note[delete]");
+                    }
                 }
             }
             axum::http::StatusCode::NO_CONTENT.into_response()

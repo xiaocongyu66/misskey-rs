@@ -15182,3 +15182,132 @@ async fn meili_notes_search_uses_engine_when_present() {
         "userId filter drops foreign hits: {body}"
     );
 }
+
+/// charts3: the charts/notes endpoint (upstream endpoints/charts/notes.ts —
+/// no requireCredential, so the guest read works) returns the nested
+/// {local, remote} getChart shape with every array limit-long, span is a
+/// REQUIRED paramDef enum (ajv INVALID_PARAM id 3d81ceae on absence), and
+/// the create/delete commits (NoteCreateService.postNoteCreated L754 /
+/// NoteDeleteService.ts L94) move local.total in both spans.
+#[tokio::test]
+async fn charts_notes_shape_and_create_delete_commits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_charts_notes").await;
+    let app = crate::build_router(test_state(pool));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+
+    // shape: {local, remote}, each {total, inc, dec, diffs{4}} arrays
+    // limit-long (zero-filled + latest-known extrapolation upstream)
+    let (s, chart) = post_json(
+        app.clone(),
+        "/api/charts/notes",
+        json!({ "span": "hour", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {chart}");
+    for side in ["local", "remote"] {
+        for key in ["total", "inc", "dec"] {
+            assert_eq!(
+                chart[side][key].as_array().map(Vec::len),
+                Some(5),
+                "{side}.{key}: {chart}"
+            );
+        }
+        for key in ["normal", "renote", "reply", "withFile"] {
+            assert_eq!(
+                chart[side]["diffs"][key].as_array().map(Vec::len),
+                Some(5),
+                "{side}.diffs.{key}: {chart}"
+            );
+        }
+    }
+
+    // span is required (paramDef required: ['span']) → ajv INVALID_PARAM
+    let (s, e) = post_json(app.clone(), "/api/charts/notes", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], "INVALID_PARAM", "body: {e}");
+    assert_eq!(
+        e["error"]["id"], "3d81ceae-475f-4600-b2a8-2bc116157532",
+        "body: {e}"
+    );
+
+    // create commits (hour + day): local.total bumps to 1 in the latest
+    // bucket, diffs.normal counts the plain note
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "chart bump", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let note_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    for span in ["hour", "day"] {
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/notes",
+            json!({ "span": span, "limit": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {chart}");
+        assert_eq!(
+            chart["local"]["total"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_i64(),
+            Some(1),
+            "create bumps {span} local.total: {chart}"
+        );
+        assert_eq!(
+            chart["local"]["diffs"]["normal"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_i64(),
+            Some(1),
+            "plain note moves {span} diffs.normal: {chart}"
+        );
+    }
+
+    // delete decrements: total back to 0, the dec leg counted once
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/delete",
+        json!({ "noteId": note_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, chart) = post_json(
+        app.clone(),
+        "/api/charts/notes",
+        json!({ "span": "hour", "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {chart}");
+    assert_eq!(
+        chart["local"]["total"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_i64(),
+        Some(0),
+        "delete decrements local.total: {chart}"
+    );
+    assert_eq!(
+        chart["local"]["dec"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_i64(),
+        Some(1),
+        "delete counts the dec leg: {chart}"
+    );
+}

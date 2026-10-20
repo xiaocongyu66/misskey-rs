@@ -301,6 +301,11 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "notes"
         || name == "notes/polls/vote"
         || name == "notes/translate"
+        // charts3: the notes chart read (upstream endpoints/charts/notes.ts
+        // has no requireCredential and no meta.errors → guests chart too;
+        // allowGet + cacheSec ride the upstream meta, POST-only like the
+        // other lanes in this arm)
+        || name == "charts/notes"
         // freq-agent: users/get-frequently-replied-users slice + requisites
         // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
         || name == "users/get-frequently-replied-users"
@@ -424,6 +429,12 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         }
         if name == "notes/polls/vote" || name == "notes/translate" {
             return note_extras::handle(&state, name.as_str(), &body, token).await;
+        }
+        // charts3 arm: span required enum day|hour, limit 1..500 default 30,
+        // offset nullable ms — the read is mk-db notes_chart (getChartRaw
+        // port) in charts_notes below.
+        if name == "charts/notes" {
+            return charts_notes(&state, &body).await;
         }
         // ff-arena: persist meta."federation" on admin/update-meta BEFORE the
         // note/freq lane arms — those `return` on the name, so an arm placed
@@ -4131,6 +4142,28 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     // stream-rtm: NoteCreateService.create L842 — `publishNotesStream(noteObj)`
     // fans the pack out to the /streaming timeline channels (api::streaming).
     crate::api::streaming::publish_notes(pool, &note).await;
+    // charts3: NoteCreateService.postNoteCreated L754 `notesChart.update(note,
+    // true)` — the hour+day commit pair for the fresh row (userHost prefix,
+    // reply/renote/file diffs). This lane never carries renoteId (every
+    // renoteId request routes to notes_create_renote, which commits its own
+    // update). Upstream awaits inside create(); best-effort here — a chart
+    // failure logs and must not fail the already-committed note.
+    for span in ["hour", "day"] {
+        if let Err(e) = mk_db::charts::update_note(
+            pool,
+            span,
+            mk_db::charts::bucket(span, now_ms() as i64),
+            me_host.as_deref(),
+            reply_id,
+            None,
+            !file_ids.is_empty(),
+            true,
+        )
+        .await
+        {
+            tracing::error!(target: "dbg_notes", error = %e, "charts update_note[create]");
+        }
+    }
     // meili-idx: NoteCreateService.index (L1031-1036) →
     // SearchService.indexNote — public/home notes from a LOCAL author carrying
     // text or cw are pushed into the Meilisearch index (scope 'local' is
@@ -4159,6 +4192,57 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
         }
     }
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
+}
+
+/// `POST /api/charts/notes` (upstream endpoints/charts/notes.ts — no
+/// requireCredential, meta allowGet + cacheSec 60*60; the handler is just
+/// `notesChart.getChart(span, limit, offset ? new Date(offset) : null)`).
+/// paramDef: span a REQUIRED enum day|hour, limit 1..500 default 30, offset
+/// a nullable integer (ms epoch). The nested `{local, remote}` response is
+/// mk-db `notes_chart` (the getChartRaw + nestedProperty port).
+async fn charts_notes(state: &AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    // ajv paramDef failures carry the endpoint-base INVALID_PARAM id
+    // (endpoint-base.ts L63), not the ApiCallService envelope id.
+    let invalid = || {
+        api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "INVALID_PARAM",
+            "3d81ceae-475f-4600-b2a8-2bc116157532",
+            "Invalid param.",
+        ))
+    };
+    let span = match body.get("span").and_then(|v| v.as_str()) {
+        Some(s @ ("day" | "hour")) => s,
+        _ => return invalid(),
+    };
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 30usize,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=500) => n as usize,
+            _ => return invalid(),
+        },
+    };
+    // `ps.offset ? new Date(ps.offset) : null` — falsy 0 collapses to null;
+    // a non-integer is the ajv type failure.
+    let offset = match body.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(0) => None,
+            Some(ms) => Some(ms),
+            None => return invalid(),
+        },
+    };
+    match mk_db::charts::notes_chart(pool, span, limit, offset).await {
+        Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "notes_chart");
+            api_err(ApiError::internal_error())
+        }
+    }
 }
 
 /// `NoteEntityService.isVisibleForMe` (author / specified-listed /
