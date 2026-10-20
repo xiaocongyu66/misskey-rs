@@ -240,19 +240,58 @@ async fn healthz(State(state): State<AppState>) -> (StatusCode, &'static str) {
 /// `verify_http_signature` terms + ApInboxService.performOneActivity) and
 /// answer 202. Unknown/unparseable bodies never become 4xx: the enqueue
 /// already happened, the failure modes are worker-side job reasons.
-async fn inbox_post(req: axum::extract::Request) -> (StatusCode, &'static str) {
-    let outcome = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
-        Ok(body) => Some(mk_ap::inbox::handle(&body)),
+/// fed-2: with a pool the route now runs the worker lane inline —
+/// mk_ap::processor::verify_and_route (keyId → user_keypair, the RSA verify,
+/// the Create{Note}/Follow/Like/Undo arms) — and STILL answers 202 on every
+/// outcome: Err (remote keyId, unverifiable signature, DB error) is the
+/// worker job reason upstream logs, never an HTTP status.
+async fn inbox_post(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> (StatusCode, &'static str) {
+    let method = req.method().as_str().to_string();
+    // the request-target the signing string covered: path + query verbatim
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+    match (&state.pool, body) {
+        (Some(pool), Ok(body)) => {
+            match mk_ap::processor::verify_and_route(
+                &method,
+                &path,
+                &headers,
+                &body,
+                &state.config.host(),
+                pool,
+            )
+            .await
+            {
+                Ok(effect) => tracing::info!(?effect, "inbox activity routed"),
+                Err(()) => tracing::info!("inbox activity not verifiable (202 anyway)"),
+            }
+        }
+        // no-pool surface keeps the classify-only skeleton (parse + dispatch)
+        (None, Ok(body)) => {
+            let outcome = mk_ap::inbox::handle(&body);
+            tracing::info!(kind = outcome.kind.as_str(), "inbox activity dispatched");
+        }
         // oversized frame: DefaultBodyLimit rejects before this runs; a
         // transport-level body error still rides the 202 (nothing upstream
         // answers 4xx from this row — the queue took the job)
-        Err(err) => {
-            tracing::warn!(%err, "inbox body read failed");
-            None
-        }
-    };
-    if let Some(outcome) = outcome {
-        tracing::info!(kind = outcome.kind.as_str(), "inbox activity dispatched");
+        (_, Err(err)) => tracing::warn!(%err, "inbox body read failed"),
     }
     (StatusCode::ACCEPTED, "inbox")
 }
