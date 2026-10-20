@@ -4131,6 +4131,33 @@ async fn notes_create(state: &AppState, body: &Value, token: Option<String>) -> 
     // stream-rtm: NoteCreateService.create L842 — `publishNotesStream(noteObj)`
     // fans the pack out to the /streaming timeline channels (api::streaming).
     crate::api::streaming::publish_notes(pool, &note).await;
+    // meili-idx: NoteCreateService.index (L1031-1036) →
+    // SearchService.indexNote — public/home notes from a LOCAL author carrying
+    // text or cw are pushed into the Meilisearch index (scope 'local' is
+    // upstream's default: `if (note.userHost == null) break; return;`). The
+    // document shape mirrors indexNote's addDocuments payload field-for-field
+    // (id/createdAt/userId/userHost/channelId/cw/text/tags — no visibility
+    // key upstream). Fire-and-forget at the upstream call site, best-effort
+    // here: a failed push logs, it must not fail the already-committed note.
+    if !state.search_engine.is_noop()
+        && (text.is_some() || cw.is_some())
+        && (visibility == "public" || visibility == "home")
+        && me_host.is_none()
+    {
+        let doc = json!({
+            "id": id,
+            "createdAt": mk_types::id::parse_aid_date(&id).unwrap_or_default(),
+            "userId": me_id,
+            "userHost": me_host,
+            "channelId": channel_id,
+            "cw": cw,
+            "text": text,
+            "tags": hashtags,
+        });
+        if let Err(e) = state.search_engine.add(&id, doc).await {
+            tracing::error!(target: "dbg_notes", error = %e, "search engine index");
+        }
+    }
     (StatusCode::OK, Json(json!({ "createdNote": note }))).into_response()
 }
 
