@@ -13895,19 +13895,28 @@ async fn queue_min_ended_poll_handler_creates_poll_ended_notifications() {
         .unwrap();
     assert_eq!(poll_ended_rows().await.len(), 2, "re-run dedups");
 
-    // per-note arm: the aged-out n2 — local author notified, remote voter not.
+    // per-note arm: the aged-out n2 — local author notified, remote voter
+    // not. (Contains + len, NOT an ordered exact-match: aid ids minted in
+    // the same millisecond carry no cross-row order guarantee, and the
+    // handler runs sit inside one ms.)
     crate::api::queue_processors::run_ended_poll_notification(&pool, Some("n2"))
         .await
         .unwrap();
     let rows = poll_ended_rows().await;
     assert_eq!(
-        rows,
-        vec![
-            ("u_auth".to_string(), Some("n1".to_string())),
-            ("u_voter".to_string(), Some("n1".to_string())),
-            ("u_auth".to_string(), Some("n2".to_string())),
-        ],
+        rows.len(),
+        3,
+        "exactly the three local recipients: {rows:?}"
+    );
+    assert!(
+        rows.contains(&("u_auth".to_string(), Some("n2".to_string()))),
         "n2 author notified via the per-note arm: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(u, n)| *n == Some("n2".to_string()) && u != "u_auth"),
+        "the remote n2 voter stays out: {rows:?}"
     );
 }
 
