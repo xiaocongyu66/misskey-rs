@@ -59,7 +59,7 @@ fn try_open(input: &str, start: usize) -> Option<(Node, usize)> {
     if let Some(body) = rest.strip_prefix('`') {
         if let Some(end) = body.find('`') {
             if end > 0 {
-                return Some((Node::InlineCode(body[..end].to_string()), end + 2));
+                return Some((Node::InlineCode(body[..end].to_string()), start + end + 2));
             }
         }
     }
@@ -81,7 +81,16 @@ fn try_open(input: &str, start: usize) -> Option<(Node, usize)> {
     if end == 0 {
         return None; // empty fold stays literal (mfm-js rejects empty spans)
     }
-    Some((wrap(parse(&body[..end])), open.len() + end + close.len()))
+    // ABSOLUTE offset: rest/body/end are all measured within the
+    // &input[start..] suffix, so the just-past-the-closer position must add
+    // `start` back — parse assigns it straight onto `i`. Relative values
+    // made every node starting at a nonzero offset rewind the scanner
+    // ("**a *b* c**" re-emitted the mid-span literal as "b* c"; the sibling
+    // single-node pins never noticed because start == 0 there).
+    Some((
+        wrap(parse(&body[..end])),
+        start + open.len() + end + close.len(),
+    ))
 }
 
 /// Render nodes to HTML — the `MfmService.toHtml` visitor subset:
