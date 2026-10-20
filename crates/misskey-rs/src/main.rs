@@ -116,8 +116,17 @@ pub fn build_router(state: AppState) -> Router {
         // fastify.post '/inbox' + '/users/:user/inbox' — parse, enqueue, 202;
         // the signature verify + per-type work run worker-side upstream, so
         // both rows answer 202 unconditionally, unknown types included).
-        .route("/inbox", post(inbox_post))
-        .route("/users/{user}/inbox", post(inbox_post))
+        // Non-POST methods keep the pre-fed-min fall-through (the GET rows
+        // ride the client catch-all upstream → fallback here): a post()-only
+        // MethodRouter would 405 the GET /inbox HTML rows (CI 39424566365).
+        .route(
+            "/inbox",
+            post(inbox_post).fallback(api::fetch_resource::fallback),
+        )
+        .route(
+            "/users/{user}/inbox",
+            post(inbox_post).fallback(api::fetch_resource::fallback),
+        )
         // arena-fetchres: the fastify.get('*') renderBase tail (also the
         // POST-only /inbox + /users/:id/inbox GET rows — they fall through to
         // the client ' catch-all upstream).
