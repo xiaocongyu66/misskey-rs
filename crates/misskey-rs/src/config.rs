@@ -20,6 +20,12 @@ pub struct Config {
     /// load() fills it from env/built/meta.json when the yaml omits it.
     #[serde(default)]
     pub version: Option<String>,
+    /// The raw yaml as JSON, filled by load() (`serde_yaml::from_str::<
+    /// serde_json::Value>` alongside the typed parse). The search engine
+    /// factory reads the `meilisearch` subtree off it — keys the typed struct
+    /// deliberately ignores (the mk-core services/search_bridge.rs contract).
+    #[serde(skip)]
+    pub raw_json: serde_json::Value,
 }
 
 fn default_port() -> u16 {
@@ -105,6 +111,12 @@ impl Config {
 pub fn load(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     let mut config: Config = serde_yaml::from_str(&raw)?;
+    // search-bridge contract (services/search_bridge.rs): the raw map rides
+    // the keys the typed parse ignores (meilisearch host/apiKey/port/ssl/
+    // index) — a yaml that fails the JSON roundtrip falls back to Null, the
+    // same "no engine" shape an empty config produces.
+    config.raw_json =
+        serde_yaml::from_str::<serde_json::Value>(&raw).unwrap_or(serde_json::Value::Null);
     // upstream config.ts version resolution chain: yaml `version:` →
     // built/meta.json (resolve(cwd, 'built/meta.json')) — the harness spawn
     // runs with cwd = upstream/packages/backend, mirroring projectBuiltDir.

@@ -22,6 +22,11 @@ pub struct AppState {
     pub config: Config,
     pub pool: Option<mk_db::sqlx::PgPool>,
     pub rate_limiter: std::sync::Arc<ratelimit::RateLimiter>,
+    // meili-idx: the NoteSearchEngine seam (mk-core services/search_bridge —
+    // upstream DI.meilisearch + SearchService). NoopEngine when the config
+    // carries no meilisearch.host: index writes drop, queries keep the
+    // endpoints' SQL fallbacks.
+    pub search_engine: std::sync::Arc<dyn mk_core::services::search_bridge::NoteSearchEngine>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -199,10 +204,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let port = config.port;
     let url = config.url.clone();
+    // meili-idx: the engine_from_config wiring the search_bridge module doc
+    // spells out (borrow before the `config` move, hence the hoisted let).
+    let search_engine = mk_core::services::search_bridge::engine_from_config(&config.raw_json);
     let state = AppState {
         config,
         pool,
         rate_limiter: std::sync::Arc::new(ratelimit::RateLimiter::new()),
+        search_engine,
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

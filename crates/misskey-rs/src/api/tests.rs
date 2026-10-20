@@ -31,9 +31,11 @@ fn test_state(pool: mk_db::sqlx::PgPool) -> crate::AppState {
             redis: None,
             test: true,
             version: None,
+            raw_json: serde_json::Value::Null,
         },
         pool: Some(pool),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     }
 }
 
@@ -7029,6 +7031,7 @@ async fn ftt2_redis_home_timeline_push_shape() {
         redis: Some(redis_cfg.clone()),
         test: true,
         version: None,
+        raw_json: serde_json::Value::Null,
     };
     // The e2e probes ride ioredis `keyPrefix: '<url.host>:'` (config.ts
     // convertRedisOptions L378 — see ftt.rs module doc), so the probes must
@@ -7039,6 +7042,7 @@ async fn ftt2_redis_home_timeline_push_shape() {
         config: cfg,
         pool: Some(pool.clone()),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     });
 
     // first signup = root (SignupService L160) — update-meta is requireAdmin
@@ -7154,6 +7158,7 @@ async fn ftt3_e2e_keyprefix_parity_probe() {
         redis: Some(redis_cfg.clone()),
         test: true,
         version: None,
+        raw_json: serde_json::Value::Null,
     };
     // same ioredis keyPrefix shape as ftt2 — the exact name the pinned e2e
     // `redisForTimelines.exists/lrange` computes for the followee's HTL.
@@ -7163,6 +7168,7 @@ async fn ftt3_e2e_keyprefix_parity_probe() {
         config: cfg,
         pool: Some(pool.clone()),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     });
 
     // first signup = root (SignupService L160) — update-meta is requireAdmin
@@ -9018,9 +9024,11 @@ async fn endpoints_catalog_full_registry() {
             redis: None,
             test: true,
             version: None,
+            raw_json: serde_json::Value::Null,
         },
         pool: None,
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     });
     let (status, body) = post_json(app, "/api/endpoints", json!({})).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -11250,9 +11258,11 @@ async fn oauth_route_skeleton() {
             redis: None,
             test: true,
             version: None,
+            raw_json: serde_json::Value::Null,
         },
         pool: None,
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     };
     let app = crate::build_router(state);
 
@@ -11313,9 +11323,11 @@ async fn oauth_bearer_scope_gate() {
             redis: None,
             test: true,
             version: None,
+            raw_json: serde_json::Value::Null,
         },
         pool: Some(pool.clone()),
         rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
     });
 
     let (_, v) = post_json(
