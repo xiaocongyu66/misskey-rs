@@ -260,6 +260,57 @@ pub async fn export_list_members_asc(
     .await
 }
 
+/// ExportFollowingProcessorService page: the follower's edges `id` ASC
+/// (the upstream per-100 MoreThan(cursor) loop collapsed), joined to the
+/// followee with the updatedAt the excludeInactive arm probes. `exclude_ids`
+/// carries the excludeMuting mutee set — `Not(In(mutings))` (an empty set is
+/// vacuously true, matching the upstream `mutings.length > 0` gate; NULL
+/// skips the filter for the no-exclude arm).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExportFollowingRow {
+    #[sqlx(rename = "followee_id")]
+    pub followee_id: String,
+    pub username: String,
+    pub host: Option<String>,
+    #[sqlx(rename = "with_replies")]
+    pub with_replies: bool,
+    #[sqlx(rename = "updated_at_ms")]
+    pub updated_at_ms: Option<i64>,
+}
+
+pub async fn export_following_asc(
+    pool: &PgPool,
+    follower_id: &str,
+    exclude_ids: Option<Vec<String>>,
+) -> Result<Vec<ExportFollowingRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportFollowingRow>(
+        r#"SELECT f."followeeId" AS "followee_id", u."username", u."host",
+                  f."withReplies" AS "with_replies",
+                  CASE WHEN u."updatedAt" IS NULL THEN NULL
+                       ELSE (EXTRACT(EPOCH FROM u."updatedAt") * 1000)::bigint
+                  END AS "updated_at_ms"
+           FROM "following" f
+           INNER JOIN "user" u ON u."id" = f."followeeId"
+           WHERE f."followerId" = $1
+             AND ($2::varchar[] IS NULL OR f."followeeId" <> ALL($2))
+           ORDER BY f."id" ASC"#,
+    )
+    .bind(follower_id)
+    .bind(exclude_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// ExportFollowing's excludeMuting input: the muter's mutee ids
+/// (`mutingsRepository.findBy({ muterId })` — no expiry filter, upstream
+/// includes timed mutes in the exclusion set).
+pub async fn export_muting_ids(pool: &PgPool, muter_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "muteeId" FROM "muting" WHERE "muterId" = $1"#)
+        .bind(muter_id)
+        .fetch_all(pool)
+        .await
+}
+
 // ==== drive/files {list,show,delete} reads ==================================
 
 /// The `mk_db::drive::find_drive_file` projection — DriveFileRow's sqlx

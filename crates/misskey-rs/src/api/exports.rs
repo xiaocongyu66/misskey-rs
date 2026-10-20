@@ -45,7 +45,11 @@ use crate::error::{ApiError, api_err};
 /// upstream endpoints/i/export-{user-lists,following,mute,blocking,
 /// favorites}.ts — all requireCredential, void handler → 204 after the
 /// `dbQueue.add` (QueueService.createExport*Job).
-pub(crate) const EXPORT_ENDPOINTS: &[&str] = &["i/export-clips", "i/export-user-lists"];
+pub(crate) const EXPORT_ENDPOINTS: &[&str] = &[
+    "i/export-clips",
+    "i/export-user-lists",
+    "i/export-following",
+];
 
 pub(crate) fn handles(name: &str) -> bool {
     EXPORT_ENDPOINTS.contains(&name)
@@ -65,6 +69,7 @@ pub(crate) async fn handle(
     match name {
         "i/export-clips" => export_clips(pool, body, token.as_deref()).await,
         "i/export-user-lists" => export_user_lists(pool, body, token.as_deref()).await,
+        "i/export-following" => export_following(pool, body, token.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
 }
@@ -130,7 +135,11 @@ async fn export_user_lists(
 pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
     mk_queue::spawn_worker(
         pool.clone(),
-        vec!["exportClips".to_string(), "exportUserLists".to_string()],
+        vec![
+            "exportClips".to_string(),
+            "exportUserLists".to_string(),
+            "exportFollowing".to_string(),
+        ],
         std::sync::Arc::new(move |_queue, job| {
             let pool = pool.clone();
             let base_url = base_url.clone();
@@ -147,6 +156,26 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
                 match job.kind.as_str() {
                     "exportClips" => run_export_job(&pool, &base_url, &uid).await,
                     "exportUserLists" => run_export_user_lists_job(&pool, &base_url, &uid).await,
+                    "exportFollowing" => {
+                        let exclude_muting = job
+                            .payload
+                            .get("excludeMuting")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let exclude_inactive = job
+                            .payload
+                            .get("excludeInactive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        run_export_following_job(
+                            &pool,
+                            &base_url,
+                            &uid,
+                            exclude_muting,
+                            exclude_inactive,
+                        )
+                        .await
+                    }
                     other => Err(format!("unknown export kind: {other}")),
                 }
             })
@@ -260,6 +289,103 @@ pub(crate) async fn run_export_user_lists_job(
     let file_name = format!("user-lists-{}.csv", filename_timestamp_ms(now_ms));
     add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
     tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportUserLists: exported");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// i/export-following — export-following.ts: enqueue and answer 204
+// ---------------------------------------------------------------------------
+
+async fn export_following(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let me_id = match super::require_credential_me_id(pool, token, "dbg_export").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    // QueueService.createExportFollowingJob(me, ps.excludeMuting,
+    // ps.excludeInactive): dbQueue.add('exportFollowing',
+    // { user: { id }, excludeMuting, excludeInactive }) — paramDef defaults
+    // both false (non-boolean junk would Ajv-400 upstream; unwrap_or keeps
+    // the lane's ignore-foreign-fields posture).
+    let exclude_muting = body
+        .get("excludeMuting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let exclude_inactive = body
+        .get("excludeInactive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let queue = mk_queue::QueueHandle::new(pool.clone());
+    let payload = json!({
+        "type": "exportFollowing",
+        "user": { "id": me_id },
+        "excludeMuting": exclude_muting,
+        "excludeInactive": exclude_inactive,
+    });
+    if let Err(e) = queue.enqueue("exportFollowing", &payload).await {
+        return db_err("export_following enqueue", e);
+    }
+    ok_empty()
+}
+
+/// The `exportFollowing` job (ExportFollowingProcessorService.process): CSV
+/// lines `${acct},withReplies=${following.withReplies}` per followee →
+/// addFile `following-…csv`. excludeMuting drops the muted followees; the
+/// excludeInactive arm skips followees untouched for 90 days (only when
+/// their updatedAt is set — the `u.updatedAt &&` short-circuit). The
+/// exportCompleted notification is NOT ported — the same documented
+/// divergence as exportClips.
+pub(crate) async fn run_export_following_job(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    uid: &str,
+    exclude_muting: bool,
+    exclude_inactive: bool,
+) -> Result<(), String> {
+    // `usersRepository.findOneBy({ id })` — a deleted user silently finishes.
+    let Some(_user) = mk_db::user::find_user_by_id(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        tracing::warn!(target: "dbg_export", user = %uid, "exportFollowing: user gone; job finished noop");
+        return Ok(());
+    };
+    let muting_ids: Option<Vec<String>> = if exclude_muting {
+        Some(
+            mk_db::export_blob::export_muting_ids(pool, uid)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let rows = mk_db::export_blob::export_following_asc(pool, uid, muting_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_host = url_host(base_url);
+    let now_ms = crate::api::now_ms() as i64;
+    let mut out = String::new();
+    for r in &rows {
+        if exclude_inactive {
+            if let Some(updated_ms) = r.updated_at_ms {
+                // `Date.now() - updatedAt.getTime() > 1000 * 60 * 60 * 24 * 90`
+                if now_ms - updated_ms > 90 * 86_400_000 {
+                    continue;
+                }
+            }
+        }
+        let acct = full_ap_account(&r.username, r.host.as_deref(), &local_host);
+        // `${userAcct},withReplies=${following.withReplies}`
+        out.push_str(&acct);
+        out.push_str(&format!(",withReplies={}\n", r.with_replies));
+    }
+    // DriveService.addFile({ name: 'following-...csv', force: true, ext: 'csv' })
+    let file_name = format!("following-{}.csv", filename_timestamp_ms(now_ms));
+    add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
+    tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportFollowing: exported");
     Ok(())
 }
 
