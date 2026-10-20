@@ -399,19 +399,19 @@ pub fn hex_of(data: &[u8]) -> String {
     out
 }
 
-// NIST P-256 domain parameters (FIPS 186-5 §G.1.2)
-/// p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+// NIST P-256 domain parameters (FIPS 186-5 §G.1.2; p = 2^256 − 2^224 + 2^192 + 2^96 − 1)
+/// p = 0xffffffff00000001 0000000000000000 00000000ffffffff ffffffffffffffff
 const P: U256 = [
     0xFFFF_FFFF_FFFF_FFFF,
     0x0000_0000_FFFF_FFFF,
-    0xFFFF_FFFF_0000_0000,
+    0x0000_0000_0000_0000,
     0xFFFF_FFFF_0000_0001,
 ];
 /// a = p - 3
 const A_P256: U256 = [
     0xFFFF_FFFF_FFFF_FFFC,
     0x0000_0000_FFFF_FFFF,
-    0xFFFF_FFFF_0000_0000,
+    0x0000_0000_0000_0000,
     0xFFFF_FFFF_0000_0001,
 ];
 /// the curve order n
