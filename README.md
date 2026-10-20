@@ -104,6 +104,30 @@ Per-arena census notes (fix history, error-ladder provenance, ×2 confirmations)
 [`e2e-harness/census.md`](e2e-harness/census.md) and the CI lane logs
 ([Actions](https://github.com/xiaocongyu66/misskey-rs/actions)).
 
+## Coverage scope (read before comparing to upstream)
+
+The green matrix above is scoped to the surfaces the pinned e2e suite exercises:
+the API dispatch layer (438 upstream endpoint names registered, paramDef/error-id
+parity), streaming (7 channels + Redis fanout), auth (TOTP, WebAuthn, OAuth2 PKCE),
+the web front door (apOrHtml negotiation, feeds, SSR metas), account migration,
+and the export-clips queue lane. Known substantive gaps vs upstream
+(misskey @ ea2c3aed), each verified by absence of the symbol:
+
+- **Federation transport** — no ActivityPub inbox POST handling, no HTTP-Signature
+  signer (`mk-ap` is a stub; only the GET-HTML side of `/inbox` exists).
+- **Queue processors** — only `exportClips` is ported; the BullMQ processor family
+  (email deliverer, export-* beyond clips, etc.) is absent (`mk-queue/src` is lib-only).
+- **Web push and email** — not implemented (no `web_push`/`sendEmail` symbols).
+- **Meilisearch** — a thin bridge (`search_bridge.rs`); upstream's full indexing
+  domain is not ported.
+- **Charts / stats aggregation** — absent; nodeinfo counts are direct queries.
+- **MFM rendering** — feeds use a minimal bold-fold renderer; the full MFM→HTML
+  pipeline is not ported (`mfm-rs` is a stub).
+
+These are roadmap items, not regressions: every claim in the verification matrix is
+backed by a GitHub Actions run log, and nothing in the table asserts federation,
+push, or mail behavior.
+
 ## License
 
 AGPL-3.0-only (same as upstream Misskey).
