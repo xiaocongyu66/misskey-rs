@@ -15311,3 +15311,82 @@ async fn charts_notes_shape_and_create_delete_commits() {
         "delete counts the dec leg: {chart}"
     );
 }
+
+// push-lane // — sw/register + sw/unregister (endpoints/sw/, requireCredential;
+// upstream PushNotificationService.isValidEndpoint = a parseable URL): the
+// register insert lands the sw_subscription row with the sendReadMessage
+// passthrough, the re-register probe answers already-subscribed echoing the
+// STORED flag (key = meta."swPublicKey", null while unset), an unparseable
+// endpoint hits INVALID_ENDPOINT, and unregister voids the row with a 204.
+#[tokio::test]
+async fn sw_register_row_already_subscribed_and_unregister_void() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_sw_register").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let base = json!({
+        "endpoint": "https://push.example.test/send/123",
+        "auth": "authkey123",
+        "publickey": "pubkey456",
+        "i": at,
+    });
+
+    // register → subscribed; meta."swPublicKey" unset → key renders null
+    let mut first = base.clone();
+    first["sendReadMessage"] = json!(true);
+    let (s, v) = post_json(app.clone(), "/api/sw/register", first).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["state"], "subscribed", "body: {v}");
+    assert_eq!(v["key"], Value::Null, "body: {v}");
+    assert_eq!(v["userId"], alice["id"], "body: {v}");
+    assert_eq!(v["endpoint"], base["endpoint"], "endpoint echoed: {v}");
+    assert_eq!(v["sendReadMessage"], true, "body: {v}");
+    // DB: exactly one row carrying the passthrough flag
+    let (rows, read): (i64, bool) = mk_db::sqlx::query_as::<_, (i64, bool)>(
+        r#"SELECT count(*), bool_or("sendReadMessage") FROM "sw_subscription" WHERE "userId" = $1"#,
+    )
+    .bind(alice["id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "register inserts the row: {rows}");
+    assert!(read, "sendReadMessage persisted: {read}");
+
+    // re-register with the same triple (NO sendReadMessage — the request
+    // default false) → already-subscribed echoes the STORED flag (true)
+    let (s, v) = post_json(app.clone(), "/api/sw/register", base.clone()).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["state"], "already-subscribed", "body: {v}");
+    assert_eq!(v["key"], Value::Null, "body: {v}");
+    assert_eq!(v["userId"], alice["id"], "body: {v}");
+    assert_eq!(v["sendReadMessage"], true, "stored flag echoed: {v}");
+
+    // unparseable endpoint → INVALID_ENDPOINT (isValidEndpoint 4432adbe)
+    let (s, e) = post_json(
+        app.clone(),
+        "/api/sw/register",
+        json!({ "endpoint": "not a url", "auth": "a", "publickey": "p", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], "INVALID_ENDPOINT", "body: {e}");
+    assert_eq!(
+        e["error"]["id"], "4432adbe-17c0-4f9f-b43c-9ceb2f8910fe",
+        "body: {e}"
+    );
+
+    // unregister → 204 void; DB: the row is gone
+    let (s, v) = post_json(app.clone(), "/api/sw/unregister", base.clone()).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let rows: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "sw_subscription" WHERE "userId" = $1"#)
+            .bind(alice["id"].as_str().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "unregister removed the row: {rows}");
+}

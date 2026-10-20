@@ -1375,3 +1375,112 @@ pub async fn authentication_options(
         "allowCredentials": allow_credentials,
     }))
 }
+
+// ==== ECDSA sign (the P-256/SHA-256 dual; VAPID lane) ====
+
+fn u256_to_be(x: &U256) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, limb) in x.iter().rev().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    out
+}
+
+/// Minimal DER `SEQUENCE { INTEGER r, INTEGER s }` (short/long form length,
+/// `0x00` prefix when the top bit is set).
+fn der_encode_ecdsa_sig(r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+    let strip = |v: &[u8; 32]| -> Vec<u8> {
+        let first = v.iter().position(|&b| b != 0).unwrap_or(31);
+        let mut body = v[first.min(31)..].to_vec();
+        if body.is_empty() {
+            body.push(0);
+        }
+        if body[0] & 0x80 != 0 {
+            body.insert(0, 0);
+        }
+        body
+    };
+    let rb = strip(r);
+    let sb = strip(s);
+    let body_len = 2 + rb.len() + 2 + sb.len();
+    let mut out = vec![0x30, body_len as u8, 0x02, rb.len() as u8];
+    out.extend_from_slice(&rb);
+    out.push(0x02);
+    out.push(sb.len() as u8);
+    out.extend_from_slice(&sb);
+    out
+}
+
+/// ECDSA P-256/SHA-256 **sign** — the dual of [`ecdsa_p256_sha256_verify`].
+/// `d` is the secret scalar, `k` the caller-supplied per-signature nonce
+/// (1 ≤ k < n; generate fresh randomness per call — reuse is fatal to the
+/// key). Returns the DER signature, or `None` when `k`/`d` are out of range
+/// or the arithmetic degenerates.
+pub fn ecdsa_p256_sha256_sign(msg: &[u8], d: &[u8; 32], k: &[u8; 32]) -> Option<Vec<u8>> {
+    let d = be32_to_u256(d);
+    let k = be32_to_u256(k);
+    if cmp256(&d, &ZERO) != std::cmp::Ordering::Greater
+        || cmp256(&d, &N_P256) != std::cmp::Ordering::Less
+        || cmp256(&k, &ZERO) != std::cmp::Ordering::Greater
+        || cmp256(&k, &N_P256) != std::cmp::Ordering::Less
+    {
+        return None;
+    }
+    let g = Point {
+        x: GX_P256,
+        y: GY_P256,
+        z: ONE,
+    };
+    let r_point = scalar_mult(&k, &g);
+    let x_aff = affine_x(&r_point)?;
+    let r = if cmp256(&x_aff, &N_P256) != std::cmp::Ordering::Less {
+        sub256(&x_aff, &N_P256).0
+    } else {
+        x_aff
+    };
+    if cmp256(&r, &ZERO) != std::cmp::Ordering::Greater {
+        return None;
+    }
+    let mut e = be32_to_u256(&sha256(msg));
+    if cmp256(&e, &N_P256) != std::cmp::Ordering::Less {
+        e = sub256(&e, &N_P256).0;
+    }
+    let k_inv = inv_mod(&k, &N_P256);
+    if k_inv == ZERO {
+        return None;
+    }
+    let s = mul_mod(
+        &k_inv,
+        &add_mod(&e, &mul_mod(&r, &d, &N_P256), &N_P256),
+        &N_P256,
+    );
+    if cmp256(&s, &ZERO) != std::cmp::Ordering::Greater {
+        return None;
+    }
+    Some(der_encode_ecdsa_sig(&u256_to_be(&r), &u256_to_be(&s)))
+}
+
+/// `Q = d·G` — the uncompressed public key `(x, y)` for the secret `d`.
+pub fn p256_pub_from_priv(d: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
+    let d = be32_to_u256(d);
+    if cmp256(&d, &ZERO) != std::cmp::Ordering::Greater
+        || cmp256(&d, &N_P256) != std::cmp::Ordering::Less
+    {
+        return None;
+    }
+    let g = Point {
+        x: GX_P256,
+        y: GY_P256,
+        z: ONE,
+    };
+    let q = scalar_mult(&d, &g);
+    let x = affine_x(&q)?;
+    // affine_y mirrors affine_x with the z^3 divisor
+    if q.z == ZERO {
+        return None;
+    }
+    let z3 = mul_mod(&mul_mod(&q.z, &q.z, &P), &q.z, &P);
+    let inv = inv_mod(&z3, &P);
+    let y = mul_mod(&q.y, &inv, &P);
+    Some((u256_to_be(&x), u256_to_be(&y)))
+}

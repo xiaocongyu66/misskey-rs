@@ -404,6 +404,11 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         if name == "notes/reactions" {
             return social::notes_reactions(&state, &body, token.as_deref()).await;
         }
+        // push lane: sw/register + sw/unregister (endpoints/sw/, requireCredential;
+        // upstream PushNotificationService.isValidEndpoint = a parseable URL)
+        if name == "sw/register" || name == "sw/unregister" {
+            return sw_register_unregister(&state, name.as_str(), &body, token.as_deref()).await;
+        }
         if name == "notes/reactions/create" || name == "notes/delete" {
             return social::note_credential_dispatch(
                 &state,
@@ -5050,6 +5055,105 @@ async fn notes_replies(state: &AppState, body: &Value, token: Option<String>) ->
 // no-Meili default (SearchService.searchNoteByLike); search_bridge stays
 // unwired this slice.
 // ---------------------------------------------------------------------------
+
+/// `POST /api/sw/register` + `sw/unregister` (endpoints/sw/, requireCredential).
+/// register: endpoint URL validity gate (INVALID_ENDPOINT 4432adbe), the
+/// already-subscribed probe → `{state: 'already-subscribed', key, userId,
+/// endpoint, sendReadMessage}`, else insert + `{state: 'subscribed', …}` with
+/// the request's sendReadMessage (default false). unregister: delete every
+/// row matching the (endpoint, auth, publickey) triple for this user → void.
+async fn sw_register_unregister(
+    state: &AppState,
+    name: &str,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let Some(me_id) = resolve_me(pool, token).await else {
+        return Err(authentication_failed()).unwrap_or_else(|r| r);
+    };
+    let endpoint = body.get("endpoint").and_then(Value::as_str);
+    let auth = body.get("auth").and_then(Value::as_str);
+    let publickey = body.get("publickey").and_then(Value::as_str);
+    let (Some(endpoint), Some(auth), Some(publickey)) = (endpoint, auth, publickey) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "endpoint",
+            "reason": "required",
+        })));
+    };
+    // PushNotificationService.isValidEndpoint: the endpoint must parse as a URL
+    if url::Url::parse(endpoint).is_err() {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "INVALID_ENDPOINT",
+            "4432adbe-17c0-4f9f-b43c-9ceb2f8910fe",
+            "Invalid push endpoint.",
+        ));
+    }
+    if name == "sw/register" {
+        // meta."swPublicKey" (serverSettings.swPublicKey) — Option renders
+        // null in the res when unset, mirroring upstream `key: string | null`.
+        let key = match mk_db::sw::meta_sw_public_key(pool).await {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(target: "dbg_sw", error = %e, "meta_sw_public_key");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        if let Ok(Some((_id, send_read))) =
+            mk_db::sw::find_subscription(pool, &me_id, endpoint, auth, publickey).await
+        {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "state": "already-subscribed",
+                    "key": key,
+                    "userId": me_id,
+                    "endpoint": endpoint,
+                    "sendReadMessage": send_read,
+                })),
+            )
+                .into_response();
+        }
+        let id = mk_types::id::gen_aid(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        let send_read = body
+            .get("sendReadMessage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Err(e) =
+            mk_db::sw::insert_subscription(pool, &id, &me_id, endpoint, auth, publickey, send_read)
+                .await
+        {
+            tracing::error!(target: "dbg_sw", error = %e, "insert_subscription");
+            return api_err(ApiError::internal_error());
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "state": "subscribed",
+                "key": key,
+                "userId": me_id,
+                "endpoint": endpoint,
+                "sendReadMessage": send_read,
+            })),
+        )
+            .into_response();
+    }
+    // sw/unregister
+    if let Err(e) = mk_db::sw::delete_subscription(pool, &me_id, endpoint, auth, publickey).await {
+        tracing::error!(target: "dbg_sw", error = %e, "delete_subscription");
+        return api_err(ApiError::internal_error());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
 
 /// Guest-ok credential resolution for the two search lanes: no token → None
 /// (guest); a PRESENTED token runs the full ApiCallService chain (16-char

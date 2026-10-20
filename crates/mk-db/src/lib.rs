@@ -88,6 +88,9 @@ pub mod webhook;
 // (0001 baseline — hour/day tables ship with the span split; `date` is the
 // span-normalized epoch second under a UNIQUE btree per table)
 pub mod charts;
+// push lane: sw_subscription rows (sw/register + sw/unregister writes; the
+// VAPID assembly lives in mk-core::services::web_push)
+pub mod sw;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await
