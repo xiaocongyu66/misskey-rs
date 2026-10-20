@@ -1848,10 +1848,32 @@ pub(crate) async fn notes_delete(
             json!({ "param": "noteId", "reason": "required" }),
         ));
     };
+    // meili-idx: SearchService.unindexNote's visibility gate
+    // (`!['home','public'].includes(note.visibility)` → skip) reads the row
+    // BEFORE the DELETE takes it — fetched only when a real engine is wired,
+    // so the Noop lane stays query-free (upstream fetched the note anyway).
+    let unindex_visibility = if state.search_engine.is_noop() {
+        None
+    } else {
+        mk_db::note::find_note_by_id(pool, note_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|n| n.visibility)
+    };
     match mk_db::note::delete_note(pool, note_id, me_id).await {
         Ok(1) => {
             if let Err(e) = mk_db::note::dec_note_count(pool, me_id).await {
                 tracing::error!(target: "dbg_notes", error = %e, "dec_note_count");
+            }
+            // meili-idx: NoteDeleteService.ts L111 searchService.unindexNote —
+            // public/home rows leave the index with the row (best-effort: a
+            // failed remove logs, it must not fail the already-committed
+            // delete).
+            if matches!(unindex_visibility.as_deref(), Some("public" | "home")) {
+                if let Err(e) = state.search_engine.remove(note_id).await {
+                    tracing::error!(target: "dbg_notes", error = %e, "search engine unindex");
+                }
             }
             axum::http::StatusCode::NO_CONTENT.into_response()
         }
