@@ -12851,7 +12851,10 @@ fn arena_move_local_uri_roundtrip() {
         None
     );
     // the alias admit scan: exact match and embedded match both pass (i/move
-    // L122-129 uses String.includes, not equality)
+    // L122-129 uses String.includes, not equality — a decorated entry still
+    // CONTAINS the full fromUrl; the bare `/users/o` needle 98ca83c pinned
+    // was unsatisfiable: no alias embeds that prefix, so the assert could
+    // never hold under either includes-direction).
     let aliases = vec![
         "http://127.0.0.1:3000/users/alice".to_string(),
         "http://127.0.0.1:3000/users/carol".to_string(),
@@ -12864,9 +12867,13 @@ fn arena_move_local_uri_roundtrip() {
         &aliases,
         "http://127.0.0.1:3000/users/eve"
     ));
+    // a decorated entry (`#main-key` style) embeds the full URI: includes()
+    // fires without the entry being EQUAL (equality would reject this row —
+    // upstream i/move L122-129 stays `includes`).
+    let decorated = vec!["http://127.0.0.1:3000/users/alice#main-key".to_string()];
     assert!(ma::aliases_admit_local_user(
-        &aliases,
-        "http://127.0.0.1:3000/users/o"
+        &decorated,
+        "http://127.0.0.1:3000/users/alice"
     ));
     // census rn39319126124: a bare acct hostname (`@bob@127.0.0.1`, like
     // new URL(config.url).hostname) must compare EQUAL to the port-suffixed
