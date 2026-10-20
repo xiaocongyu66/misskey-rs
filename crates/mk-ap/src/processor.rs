@@ -710,7 +710,10 @@ mod tests {
     fn get_visibility_pins_the_audience_half() {
         let public = "https://www.w3.org/ns/activitystreams#Public";
         let activity = json!({ "type": "Create", "to": [public] });
-        let note = json!({ "id": "n", "to": [public] });
+        // the note fixture stays audience-free: create()'s audience copy has
+        // already merged activity.to into object.to upstream, so a note-side
+        // Public here would leak into EVERY leg's merged `to`
+        let note = json!({ "id": "n" });
         assert_eq!(get_visibility(&activity, &note), "public");
         // Public in cc → home (the 'quiet post' leg)
         let home = json!({ "type": "Create", "to": ["https://a/users/1"], "cc": [public] });
@@ -721,6 +724,12 @@ mod tests {
         assert_eq!(
             get_visibility(&json!({ "type": "Create" }), &note),
             "followers"
+        );
+        // the merge itself: the NOTE's own to supplies Public after the copy
+        let from_note = json!({ "id": "n", "to": [public] });
+        assert_eq!(
+            get_visibility(&json!({ "type": "Create" }), &from_note),
+            "public"
         );
     }
 }
