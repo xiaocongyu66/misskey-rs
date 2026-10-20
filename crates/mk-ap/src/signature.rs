@@ -245,7 +245,7 @@ mod tests {
     use super::*;
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    use rsa::signature::Signer;
+    use rsa::signature::{SignatureEncoding, Signer};
 
     #[test]
     fn create_signed_post_round_trips_through_verify() {
@@ -313,16 +313,18 @@ mod tests {
             .is_err()
         );
 
-        // tampered signature: the RSA half fails
+        // tampered signature (digest + body still agree): the RSA half fails
+        let corrupted = signature_header.replace(&signature_b64[..8], "AAAAAAAA");
+        assert_ne!(corrupted, signature_header);
         assert!(
             verify_http_signature(
-                &signature_header,
+                &corrupted,
                 "POST",
                 "/inbox",
                 "example.com",
                 body,
                 "Tue, 20 Oct 2026 00:00:00 GMT",
-                &create_digest(br#"{"a":2}"#),
+                &create_digest(body),
                 &public_pem,
             )
             .is_err()
