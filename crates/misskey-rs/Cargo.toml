@@ -18,6 +18,9 @@ mk-queue = { workspace = true }
 # feed plane: MfmService.toHtml inline subset — mfm_lite_html rides
 # mfm_rs::parse + to_html (upstream MfmService.ts)
 mfm-rs = { workspace = true }
+# fed-min: the POST /inbox dispatcher + draft-cavage signature verify
+# (mk_ap::inbox::handle + mk_ap::signature).
+mk-ap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }

@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use tower_http::cors::CorsLayer;
 
 pub use config::Config;
@@ -112,6 +112,12 @@ pub fn build_router(state: AppState) -> Router {
         // files are fetched through (upstream FileServerService /files/*).
         .route("/files/{*rest}", get(api::exports::files_serve))
         .route("/healthz", get(healthz))
+        // fed-min: the inbox POST rows (upstream ActivityPubServerService.ts
+        // fastify.post '/inbox' + '/users/:user/inbox' — parse, enqueue, 202;
+        // the signature verify + per-type work run worker-side upstream, so
+        // both rows answer 202 unconditionally, unknown types included).
+        .route("/inbox", post(inbox_post))
+        .route("/users/{user}/inbox", post(inbox_post))
         // arena-fetchres: the fastify.get('*') renderBase tail (also the
         // POST-only /inbox + /users/:id/inbox GET rows — they fall through to
         // the client ' catch-all upstream).
@@ -208,4 +214,27 @@ async fn healthz(State(state): State<AppState>) -> (StatusCode, &'static str) {
             }
         },
     }
+}
+
+/// fed-min: both inbox POST rows in one handler — upstream
+/// ActivityPubServerService.ts fastify.post '/inbox' + '/users/:user/inbox'
+/// hand the body to InboxProcessorService (a queue job: signature verify in
+/// `verify_http_signature` terms + ApInboxService.performOneActivity) and
+/// answer 202. Unknown/unparseable bodies never become 4xx: the enqueue
+/// already happened, the failure modes are worker-side job reasons.
+async fn inbox_post(req: axum::extract::Request) -> (StatusCode, &'static str) {
+    let outcome = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(body) => Some(mk_ap::inbox::handle(&body)),
+        // oversized frame: DefaultBodyLimit rejects before this runs; a
+        // transport-level body error still rides the 202 (nothing upstream
+        // answers 4xx from this row — the queue took the job)
+        Err(err) => {
+            tracing::warn!(%err, "inbox body read failed");
+            None
+        }
+    };
+    if let Some(outcome) = outcome {
+        tracing::info!(kind = outcome.kind.as_str(), "inbox activity dispatched");
+    }
+    (StatusCode::ACCEPTED, "inbox")
 }
