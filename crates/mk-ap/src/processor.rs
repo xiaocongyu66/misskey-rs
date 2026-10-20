@@ -347,17 +347,17 @@ fn decode_entities_into(s: &str, out: &mut String) {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos..];
-        let (entity, len) = if let Some(t) = tail.strip_prefix("&amp;") {
+        let (entity, len) = if tail.starts_with("&amp;") {
             ("&", 5)
-        } else if let Some(t) = tail.strip_prefix("&lt;") {
+        } else if tail.starts_with("&lt;") {
             ("<", 4)
-        } else if let Some(t) = tail.strip_prefix("&gt;") {
+        } else if tail.starts_with("&gt;") {
             (">", 4)
-        } else if let Some(t) = tail.strip_prefix("&quot;") {
+        } else if tail.starts_with("&quot;") {
             ("\"", 6)
-        } else if let Some(t) = tail.strip_prefix("&apos;") {
+        } else if tail.starts_with("&apos;") {
             ("'", 6)
-        } else if let Some(t) = tail.strip_prefix("&#39;") {
+        } else if tail.starts_with("&#39;") {
             ("'", 5)
         } else {
             ("&", 1)
@@ -458,11 +458,13 @@ async fn local_user_id_from_object(
     let Some(id) = parse_local_ap_id(&uri, local_host, "users") else {
         return Ok(None);
     };
-    let host: Option<String> = sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
-        .bind(&id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| ())?;
+    // outer None = no such user; inner None = host NULL (local)
+    let host: Option<Option<String>> =
+        sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ())?;
     match host {
         Some(None) => Ok(Some(id)), // local user (host NULL)
         Some(Some(_)) => Ok(None),  // remote followee → the local-user gate
