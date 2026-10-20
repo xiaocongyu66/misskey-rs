@@ -5117,6 +5117,82 @@ async fn notes_search(state: &AppState, body: &Value, token: Option<String>) -> 
         return search_unavailable();
     }
 
+    // meili-2: SearchService.searchNote's provider switch — a CONFIGURED
+    // engine answers first (searchNoteByMeilisearch); the NoopEngine (no
+    // meilisearch config) keeps the SQL ILIKE branch below, which is also
+    // upstream's no-Meili default (provider 'sqlLike'). Upstream THROWS
+    // 'Meilisearch is not available' when the provider is meili without a
+    // client, so a configured engine whose request FAILS rides the same
+    // 500-internal path — it does not silently fall back to SQL.
+    if !state.search_engine.is_noop() {
+        let hits = match state.search_engine.search(query, limit as u64).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(target: "dbg_search", error = %e, "search engine query");
+                return api_err(ApiError::internal_error());
+            }
+        };
+        // searchNoteByMeilisearch compiles the userId/userHost (and since/
+        // until pagination) predicates INTO the meili filter; the minimal
+        // engine has no filter parameter, so the same predicates filter the
+        // raw hits here ('.' → userHost IS NULL, per the endpoint's host
+        // param contract). aid ordering == time ordering, so the untilId /
+        // sinceId bounds compare as id strings (the SQL branch uses the same
+        // gen_aid bounds).
+        let hits: Vec<Value> = hits
+            .into_iter()
+            .filter(|doc| {
+                if let Some(uid) = &user_id {
+                    if doc.get("userId").and_then(Value::as_str) != Some(uid.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(h) = &host {
+                    let doc_host = doc.get("userHost").and_then(Value::as_str);
+                    if h == "." {
+                        if doc_host.is_some() {
+                            return false;
+                        }
+                    } else if doc_host != Some(h.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(u) = &until_id {
+                    match doc.get("id").and_then(Value::as_str) {
+                        Some(id) if id < u.as_str() => {}
+                        _ => return false,
+                    }
+                }
+                if let Some(s) = &since_id {
+                    match doc.get("id").and_then(Value::as_str) {
+                        Some(id) if id > s.as_str() => {}
+                        _ => return false,
+                    }
+                }
+                true
+            })
+            .collect();
+        // upstream re-loads the hit ids from PG (blocked-host / suspended-user
+        // filters there) and sorts id-desc (`notes.sort((a, b) => a.id > b.id
+        // ? -1 : 1)`); a stale index hit (row gone) drops out instead of
+        // erroring, like the IN query leaves it behind.
+        let mut ids: Vec<&str> = hits
+            .iter()
+            .filter_map(|doc| doc.get("id").and_then(Value::as_str))
+            .collect();
+        ids.sort_unstable();
+        ids.reverse();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            match load_pack_note(state, pool, id, Some(&row.id), true, 0, true).await {
+                Ok(Some(v)) => out.push(v),
+                Ok(None) => {}
+                Err(r) => return *r,
+            }
+        }
+        return (StatusCode::OK, Json(json!(out))).into_response();
+    }
+
     let rows = match mk_db::note::search_notes(
         pool,
         &mk_db::note::escape_like(query),
