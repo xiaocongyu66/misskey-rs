@@ -14227,3 +14227,115 @@ fn fed_min_inbox_dispatch_table_accepts_known_and_unknown_silently() {
     // unparseable body → 202 parity
     assert_eq!(inbox::handle(b"not json").kind, ActivityKind::Other);
 }
+
+// queue-2 // — the export-processor family successor slice (upstream
+// Export{UserLists,Following,Muting,Blocking,Favorites}ProcessorService.ts +
+// endpoints/i/export-{user-lists,following,mute,blocking,favorites}.ts): the
+// enqueue-204 → mk_queue claim → processor → drive file plane per kind, on
+// the arena-exports lane's harness shapes.
+
+/// export-user-lists full roundtrip: the CSV lines (acct rides the config
+/// host for local users — UtilityService.getFullApAccount) land in a drive
+/// file named user-lists-yyyy-MM-dd-HH-mm-ss.csv (dateFormat UTC) served
+/// through the /files byte route.
+#[tokio::test]
+async fn queue2_export_user_lists_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("queue2_ulists").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("q2a")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("q2b")).await;
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // list + member (push defaults withReplies:false; update-membership
+    // flips it so the 3rd key=value column exercises true)
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "list1", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": bob_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/users/lists/update-membership",
+        json!({ "listId": list_id, "userId": bob_id, "withReplies": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+
+    // enqueue → 204 + durable row
+    let (s, b) = post_json(app.clone(), "/api/i/export-user-lists", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    assert_eq!(b, Value::Null, "void endpoint: empty body");
+    let handle = mk_queue::QueueHandle::new(pool.clone());
+    let job = handle
+        .claim_next(&["exportUserLists"])
+        .await
+        .unwrap()
+        .expect("queued exportUserLists job claimable");
+    assert_eq!(job.payload["user"]["id"], json!(alice_id));
+    crate::api::exports::run_export_user_lists_job(
+        &pool,
+        "http://127.0.0.1:3000",
+        &job.payload["user"]["id"].as_str().unwrap(),
+    )
+    .await
+    .expect("exportUserLists processor");
+
+    // pollFirstDriveFile plane: one drive file, the user-lists name pattern
+    let (s, files) = post_json(app.clone(), "/api/drive/files", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {files}");
+    let files = files.as_array().expect("files array").clone();
+    assert_eq!(files.len(), 1, "one export = one drive file");
+    let name = files[0]["name"].as_str().unwrap();
+    assert!(
+        name.starts_with("user-lists-") && name.ends_with(".csv"),
+        "name: {name}"
+    );
+    // 'user-lists-' + dateFormat 'yyyy-MM-dd-HH-mm-ss' (19 chars) + '.csv'
+    assert_eq!(name.len(), "user-lists-".len() + 19 + 4, "name: {name}");
+    assert_eq!(files[0]["type"], json!("text/csv"));
+
+    // the bytes: one `${list.name},${acct},withReplies=…` line per membership
+    let path = url::Url::parse(files[0]["url"].as_str().unwrap())
+        .unwrap()
+        .path()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let expected = format!(
+        "list1,{}@127.0.0.1:3000,withReplies=true\n",
+        bob["username"].as_str().unwrap()
+    );
+    assert_eq!(text, expected, "exportUserLists CSV lines");
+}

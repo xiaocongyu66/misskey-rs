@@ -206,6 +206,60 @@ pub async fn export_clip_notes(
     .await
 }
 
+// ==== export-processor reads (queue-2: Export{UserLists,...}ProcessorService) ====
+
+/// ExportUserListsProcessorService: the owner's lists (`userListsRepository.
+/// findBy({ userId })` — `id` ASC for determinism; the upstream find relies
+/// on the default db order).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExportUserListRow {
+    pub id: String,
+    pub name: String,
+}
+
+pub async fn export_user_lists_asc(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<ExportUserListRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportUserListRow>(
+        r#"SELECT "id", "name" FROM "user_list" WHERE "userId" = $1 ORDER BY "id" ASC"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One `user_list_membership` ⨝ member-user row — the upstream per-list
+/// `userListMembershipsRepository.findBy({ userListId })` +
+/// `usersRepository.findBy({ id: In(...) })` probe collapsed into a join
+/// (membership is unique per (list, user), so withReplies rides the row).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExportListMemberRow {
+    #[sqlx(rename = "member_user_id")]
+    pub member_user_id: String,
+    pub username: String,
+    pub host: Option<String>,
+    #[sqlx(rename = "with_replies")]
+    pub with_replies: bool,
+}
+
+pub async fn export_list_members_asc(
+    pool: &PgPool,
+    list_id: &str,
+) -> Result<Vec<ExportListMemberRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExportListMemberRow>(
+        r#"SELECT m."userId" AS "member_user_id", u."username", u."host",
+                  m."withReplies" AS "with_replies"
+           FROM "user_list_membership" m
+           INNER JOIN "user" u ON u."id" = m."userId"
+           WHERE m."userListId" = $1
+           ORDER BY m."userId" ASC"#,
+    )
+    .bind(list_id)
+    .fetch_all(pool)
+    .await
+}
+
 // ==== drive/files {list,show,delete} reads ==================================
 
 /// The `mk_db::drive::find_drive_file` projection — DriveFileRow's sqlx

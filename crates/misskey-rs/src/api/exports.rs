@@ -41,8 +41,11 @@ use crate::AppState;
 use crate::error::{ApiError, api_err};
 
 /// The endpoint names routed into this module (single source of truth for
-/// the arena-exports dispatch arm in mod.rs).
-pub(crate) const EXPORT_ENDPOINTS: &[&str] = &["i/export-clips"];
+/// the arena-exports dispatch arm in mod.rs). queue-2 extends the family:
+/// upstream endpoints/i/export-{user-lists,following,mute,blocking,
+/// favorites}.ts — all requireCredential, void handler → 204 after the
+/// `dbQueue.add` (QueueService.createExport*Job).
+pub(crate) const EXPORT_ENDPOINTS: &[&str] = &["i/export-clips", "i/export-user-lists"];
 
 pub(crate) fn handles(name: &str) -> bool {
     EXPORT_ENDPOINTS.contains(&name)
@@ -61,6 +64,7 @@ pub(crate) async fn handle(
     };
     match name {
         "i/export-clips" => export_clips(pool, body, token.as_deref()).await,
+        "i/export-user-lists" => export_user_lists(pool, body, token.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
 }
@@ -96,12 +100,37 @@ async fn export_clips(pool: &mk_db::sqlx::PgPool, body: &Value, token: Option<&s
     ok_empty()
 }
 
-/// Boot wiring (main.rs): the in-process worker for the `exportClips` kind —
-/// the PG-broker replacement for upstream's BullMQ db-queue consumer.
+// ---------------------------------------------------------------------------
+// i/export-user-lists — export-user-lists.ts: enqueue and answer 204
+// ---------------------------------------------------------------------------
+
+async fn export_user_lists(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let me_id = match super::require_credential_me_id(pool, token, "dbg_export").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    // QueueService.createExportUserListsJob: dbQueue.add('exportUserLists',
+    // { user: { id } }). paramDef {} — nothing else rides the params.
+    let _ = body;
+    let queue = mk_queue::QueueHandle::new(pool.clone());
+    let payload = json!({ "type": "exportUserLists", "user": { "id": me_id } });
+    if let Err(e) = queue.enqueue("exportUserLists", &payload).await {
+        return db_err("export_user_lists enqueue", e);
+    }
+    ok_empty()
+}
+
+/// Boot wiring (main.rs): the in-process worker for the export-* kinds —
+/// the PG-broker replacement for upstream's BullMQ db-queue consumer,
+/// dispatched by kind (the queue_processors::spawn_queue_workers shape).
 pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
     mk_queue::spawn_worker(
         pool.clone(),
-        vec!["exportClips".to_string()],
+        vec!["exportClips".to_string(), "exportUserLists".to_string()],
         std::sync::Arc::new(move |_queue, job| {
             let pool = pool.clone();
             let base_url = base_url.clone();
@@ -113,12 +142,125 @@ pub fn spawn_export_worker(pool: mk_db::sqlx::PgPool, base_url: String) {
                     .and_then(Value::as_str)
                     .map(|s| s.to_string());
                 let Some(uid) = uid else {
-                    return Err(format!("exportClips job {}: malformed payload", job.id));
+                    return Err(format!("{} job {}: malformed payload", job.kind, job.id));
                 };
-                run_export_job(&pool, &base_url, &uid).await
+                match job.kind.as_str() {
+                    "exportClips" => run_export_job(&pool, &base_url, &uid).await,
+                    "exportUserLists" => run_export_user_lists_job(&pool, &base_url, &uid).await,
+                    other => Err(format!("unknown export kind: {other}")),
+                }
             })
         }),
     );
+}
+
+/// `UtilityService.getFullApAccount`: `${username}@${toPuny(host)}` with
+/// LOCAL users riding the config host. toPuny is IDN punycode — identity for
+/// the ASCII hosts the db stores (mk-db/src/user.rs punycodes at insert).
+fn full_ap_account(username: &str, host: Option<&str>, local_host: &str) -> String {
+    format!("{}@{}", username, host.unwrap_or(local_host))
+}
+
+/// `new URL(config.url).host` — scheme stripped, port kept (config.ts L276;
+/// the same conversion config::Config::host does for the server config).
+fn url_host(base_url: &str) -> String {
+    let rest = base_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base_url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// `DriveService.addFile({ user, path, name, force: true, ext })` — the
+/// export tail shared by the queue-2 processors: the bytes under a fresh
+/// accessKey (the mk_export_blobs store) + the metadata row. `mime` mirrors
+/// FileInfoService's ext fallback for undetectable text payloads (csv →
+/// text/csv, json → application/json; FileInfoService.ts L81-99).
+pub(crate) async fn add_export_file(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    uid: &str,
+    file_name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let access_key = mk_core::services::signup::secure_rndstr(32);
+    let url = format!(
+        "{}/files/{}/{}",
+        base_url.trim_end_matches('/'),
+        access_key,
+        file_name
+    );
+    let row = mk_db::drive::DriveFileRow {
+        id: mk_types::id::gen_aid_now(),
+        user_id: Some(uid.to_string()),
+        md5: super::drive::md5_hex(bytes),
+        name: file_name.to_string(),
+        file_type: mime.to_string(),
+        size: bytes.len() as i32,
+        // non-image uploads carry no blurhash (DriveService only computes it
+        // on image mimes) and no webpublic transcode
+        blurhash: None,
+        url,
+        webpublic_url: None,
+        webpublic_type: None,
+        properties: json!({}),
+        comment: None,
+        is_sensitive: false,
+        folder_id: None,
+    };
+    mk_db::export_blob::put_blob(pool, &access_key, bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    mk_db::drive::insert_drive_file(pool, &row, &access_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The `exportUserLists` job (ExportUserListsProcessorService.process): CSV
+/// lines `${list.name},${acct},withReplies=${…}` per membership (the 3rd
+/// column and later are key=value pairs, per the upstream comment) → addFile
+/// `user-lists-…csv`. The exportCompleted notification is NOT ported — the
+/// same documented divergence as exportClips (the notification_type_enum
+/// predates the value and no acceptance leg reads it).
+pub(crate) async fn run_export_user_lists_job(
+    pool: &mk_db::sqlx::PgPool,
+    base_url: &str,
+    uid: &str,
+) -> Result<(), String> {
+    // `usersRepository.findOneBy({ id })` — a deleted user silently finishes.
+    let Some(_user) = mk_db::user::find_user_by_id(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        tracing::warn!(target: "dbg_export", user = %uid, "exportUserLists: user gone; job finished noop");
+        return Ok(());
+    };
+    let lists = mk_db::export_blob::export_user_lists_asc(pool, uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_host = url_host(base_url);
+    let mut out = String::new();
+    for list in &lists {
+        let members = mk_db::export_blob::export_list_members_asc(pool, &list.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        for m in members {
+            let acct = full_ap_account(&m.username, m.host.as_deref(), &local_host);
+            // `${list.name},${acct},withReplies=${usersWithReplies.has(u.id)}`
+            out.push_str(&list.name);
+            out.push(',');
+            out.push_str(&acct);
+            out.push_str(&format!(",withReplies={}\n", m.with_replies));
+        }
+    }
+    // DriveService.addFile({ name: 'user-lists-...csv', force: true, ext: 'csv' })
+    let now_ms = crate::api::now_ms() as i64;
+    let file_name = format!("user-lists-{}.csv", filename_timestamp_ms(now_ms));
+    add_export_file(pool, base_url, uid, &file_name, "text/csv", out.as_bytes()).await?;
+    tracing::info!(target: "dbg_export", user = %uid, file = %file_name, "exportUserLists: exported");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
