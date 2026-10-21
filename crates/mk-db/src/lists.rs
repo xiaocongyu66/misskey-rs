@@ -530,17 +530,18 @@ pub struct MembershipRow {
     pub with_replies: bool,
 }
 
-/// Membership page: exclusive id bounds; sinceId-only → ASC (the
-/// QueryService.makePaginationQuery branch order). Date bounds are converted
-/// to an aid by the caller.
+/// Membership page: exclusive id bounds; `desc` follows the
+/// QueryService.makePaginationQuery branch order (sinceId-only → ASC, every
+/// other branch → DESC). Date bounds are converted to an aid by the caller.
 pub async fn list_memberships(
     pool: &PgPool,
     list_id: &str,
     since_id: Option<&str>,
     until_id: Option<&str>,
+    desc: bool,
     limit: i64,
 ) -> Result<Vec<MembershipRow>, sqlx::Error> {
-    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
+    let dir = if desc { "DESC" } else { "ASC" };
     sqlx::query_as::<_, MembershipRow>(&format!(
         r#"
         SELECT "id", ("userId") AS "user_id", "withReplies" AS "with_replies"

@@ -105,7 +105,7 @@ fn opt_i64(body: &Value, key: &str) -> Result<Option<i64>, Response> {
 
 /// paramDef pager: limit 1..100 default `dflt`; id/date bounds with the
 /// QueryService.makePaginationQuery branch order (since-only → ASC).
-fn pager(body: &Value, dflt: i64) -> Result<(Option<String>, Option<String>), Response> {
+fn pager(body: &Value, dflt: i64) -> Result<(Option<String>, Option<String>, bool), Response> {
     let limit_ok = match body.get("limit") {
         None | Some(Value::Null) => true,
         Some(v) => matches!(v.as_i64(), Some(l) if (1..=100).contains(&l)),
@@ -128,9 +128,9 @@ fn pager(body: &Value, dflt: i64) -> Result<(Option<String>, Option<String>), Re
     };
     let since_date = opt_i64(body, "sinceDate")?;
     let until_date = opt_i64(body, "untilDate")?;
-    let (since, until, _desc) =
+    let (since, until, desc) =
         super::ff_vis::paginate_bounds(since_id, until_id, since_date, until_date);
-    Ok((since, until))
+    Ok((since, until, desc))
 }
 
 fn pager_limit(body: &Value, dflt: i64) -> i64 {
@@ -399,13 +399,14 @@ async fn lists_get_memberships(
         "7bc05c21-1d7a-41ae-88f1-66820f4dc686",
     )
     .await?;
-    let (since_id, until_id) = pager(body, 30)?;
+    let (since_id, until_id, desc) = pager(body, 30)?;
     let limit = pager_limit(body, 30);
     let memberships = mk_db::lists::list_memberships(
         pool,
         &row.id,
         since_id.as_deref(),
         until_id.as_deref(),
+        desc,
         limit,
     )
     .await
@@ -725,7 +726,7 @@ async fn users_reactions(
 ) -> Result<Response, Response> {
     let me = optional_me(pool, token).await?;
     let user_id = required_id(body, "userId")?;
-    let (since_id, until_id) = pager(body, 10)?;
+    let (since_id, until_id, desc) = pager(body, 10)?;
     let limit = pager_limit(body, 10);
 
     // cacheService.findUserById uses findOneByOrFail → an unknown id is an
@@ -781,6 +782,7 @@ async fn users_reactions(
         &followees,
         since_id.as_deref(),
         until_id.as_deref(),
+        desc,
         limit,
     )
     .await

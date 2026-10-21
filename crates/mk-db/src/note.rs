@@ -967,12 +967,14 @@ pub async fn insert_note_favorite(
     user_id: &str,
     note_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#)
-        .bind(id)
-        .bind(user_id)
-        .bind(note_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(note_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1052,11 +1054,13 @@ pub async fn find_renotes_by_user(
     user_id: &str,
     renote_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(r#"SELECT "id" FROM "note" WHERE "userId" = $1 AND "renoteId" = $2"#)
-        .bind(user_id)
-        .bind(renote_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_scalar(
+        r#"SELECT "id" FROM "note" WHERE "userId" = $1 AND "renoteId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(renote_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// notes/renotes db path: rows whose renoteId is the given note (the endpoint
@@ -1117,7 +1121,7 @@ pub struct UserReactionRow {
 /// onto the note + author for `generateVisibilityQuery` /
 /// `generateBlockedHostQueryForNote` / `generateSuspendedUserQueryForNote`
 /// (blocked-host has no storage in this port; suspended authors are gated).
-/// Exclusive id bounds; sinceId-only → ASC (makePaginationQuery order).
+/// Exclusive id bounds; `desc` follows the makePaginationQuery branch order.
 #[allow(clippy::too_many_arguments)]
 pub async fn user_reaction_rows(
     pool: &PgPool,
@@ -1126,10 +1130,10 @@ pub async fn user_reaction_rows(
     my_followees: &[String],
     since_id: Option<&str>,
     until_id: Option<&str>,
+    desc: bool,
     limit: i64,
 ) -> Result<Vec<UserReactionRow>, sqlx::Error> {
     let me_list = me_id.map(|m| vec![m.to_string()]).unwrap_or_default();
-    let asc = since_id.is_some();
 
     let mut sql = String::from(
         r#"SELECT r."id", r."userId" AS "user_id", r."reaction", r."noteId" AS "note_id"
@@ -1152,7 +1156,8 @@ pub async fn user_reaction_rows(
     );
 
     // $1 userId $2 me $3 [me] $4 followees $5 untilId $6 sinceId $7 limit
-    let sql = expand(&sql, 2, 3, 4, 5, 6, 7, dir_asc(since_id));
+    let dir = if desc { "DESC" } else { "ASC" };
+    let sql = expand(&sql, 2, 3, 4, 5, 6, 7, dir);
 
     sqlx::query_as::<_, UserReactionRow>(&sql)
         .bind(user_id)
