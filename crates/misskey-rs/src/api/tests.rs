@@ -16607,458 +16607,6 @@ async fn fed2_remote_activity_routing_persists_rows() {
     assert_eq!(rows, 0, "undo deleted the following row");
 }
 
-/// admin/roles: create → list → show → assign → unassign → delete
-/// (upstream endpoints/admin/roles/*.ts).
-#[tokio::test]
-async fn admin_roles_crud_roundtrip() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_roles_crud").await;
-    mk_db::run_migrations(&pool).await.unwrap();
-    let app = crate::build_router(test_state(pool));
-
-    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
-    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
-    let r_token = root["token"].as_str().unwrap().to_string();
-    let a_token = alice["token"].as_str().unwrap().to_string();
-
-    // create (only name is required; everything else keeps its default)
-    let (s, role) = post_json(
-        app.clone(),
-        "/api/admin/roles/create",
-        json!({ "name": "crud-role", "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {role}");
-    let role_id = role["id"].as_str().unwrap().to_string();
-    assert_eq!(role["name"], json!("crud-role"));
-    assert_eq!(role["isModerator"], json!(false));
-
-    // list sees it (moderator gate passes for the root)
-    let (s, list) = post_json(
-        app.clone(),
-        "/api/admin/roles/list",
-        json!({ "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {list}");
-    assert!(
-        list.as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["id"] == json!(role_id)),
-        "body: {list}"
-    );
-
-    // show packs the stored row
-    let (s, shown) = post_json(
-        app.clone(),
-        "/api/admin/roles/show",
-        json!({ "roleId": role_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["id"], json!(role_id));
-    assert_eq!(shown["name"], json!("crud-role"));
-    assert!(shown.get("policies").is_some());
-
-    // assign / unassign (void handlers → 204)
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/admin/roles/assign",
-        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/admin/roles/unassign",
-        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-
-    // a plain user is denied the moderator gate
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/admin/roles/list",
-        json!({ "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
-
-    // delete → show answers show.ts NO_SUCH_ROLE (07dc7d34)
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/admin/roles/delete",
-        json!({ "roleId": role_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/admin/roles/show",
-        json!({ "roleId": role_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("NO_SUCH_ROLE"));
-    assert_eq!(
-        err["error"]["id"],
-        json!("07dc7d34-c0d8-49b7-96c6-db3ce64ee0b3")
-    );
-}
-
-/// admin/ad: create → list → update → delete (upstream
-/// endpoints/admin/ad/*.ts).
-#[tokio::test]
-async fn admin_ad_crud_roundtrip() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_ad_crud").await;
-    mk_db::run_migrations(&pool).await.unwrap();
-    let app = crate::build_router(test_state(pool));
-
-    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
-    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
-    let r_token = root["token"].as_str().unwrap().to_string();
-    let a_token = alice["token"].as_str().unwrap().to_string();
-    let now = now_ms() as i64;
-
-    // create: every required paramDef field
-    let (s, ad) = post_json(
-        app.clone(),
-        "/api/admin/ad/create",
-        json!({
-            "url": "https://example.com/ad",
-            "memo": "first",
-            "place": "square",
-            "priority": "middle",
-            "ratio": 1,
-            "expiresAt": now + 3_600_000,
-            "startsAt": now - 1_000,
-            "imageUrl": "https://example.com/ad.png",
-            "dayOfWeek": 0,
-            "isSensitive": false,
-            "i": r_token,
-        }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {ad}");
-    let ad_id = ad["id"].as_str().unwrap().to_string();
-    assert_eq!(ad["url"], json!("https://example.com/ad"));
-    assert_eq!(ad["place"], json!("square"));
-    assert_eq!(ad["ratio"], json!(1));
-    assert!(ad["expiresAt"].is_string());
-    assert!(ad["startsAt"].is_string());
-
-    // list (default publishing = null → all rows, id DESC)
-    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {list}");
-    assert!(
-        list.as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"] == json!(ad_id)),
-        "body: {list}"
-    );
-    // publishing=true keeps the live ad
-    let (s, list) = post_json(
-        app.clone(),
-        "/api/admin/ad/list",
-        json!({ "publishing": true, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {list}");
-    assert!(
-        list.as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"] == json!(ad_id))
-    );
-
-    // update is partial (memo only) and answers 204
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/admin/ad/update",
-        json!({ "id": ad_id, "memo": "updated", "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
-    assert_eq!(s, StatusCode::OK);
-    let row = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["id"] == json!(ad_id))
-        .unwrap();
-    assert_eq!(row["memo"], json!("updated"));
-    assert_eq!(row["url"], json!("https://example.com/ad"));
-
-    // non-moderator is denied
-    let (s, err) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": a_token })).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
-
-    // missing rows answer the per-endpoint NO_SUCH_AD ids
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/admin/ad/update",
-        json!({ "id": "x".repeat(10), "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
-    assert_eq!(
-        err["error"]["id"],
-        json!("b7aa1727-1354-47bc-a182-3a9c3973d300")
-    );
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/admin/ad/delete",
-        json!({ "id": "x".repeat(10), "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
-    assert_eq!(
-        err["error"]["id"],
-        json!("ccac9863-3a03-416e-b899-8a64041118b1")
-    );
-
-    // delete → 204 → the list no longer carries it
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/admin/ad/delete",
-        json!({ "id": ad_id, "i": r_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(
-        !list
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"] == json!(ad_id))
-    );
-}
-
-// ==== i-more slice 1: i/favorites + i/gallery/likes + i/pages/likes ====
-
-/// `i/favorites`: the caller's note_favorite rows (id DESC), other users'
-/// rows excluded, cursors respected.
-#[tokio::test]
-async fn i_favorites_lists_only_callers_rows() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = fresh_pool("mki_more_favorites").await;
-    let app = crate::build_router(test_state(pool.clone()));
-    let alice = signup(&app, &format!("fava{}", mk_types::id::gen_aid_now())).await;
-    let bob = signup(&app, &format!("favb{}", mk_types::id::gen_aid_now())).await;
-    let at = alice["token"].as_str().unwrap().to_string();
-    let aid = alice["id"].as_str().unwrap();
-    let bid = bob["id"].as_str().unwrap();
-
-    let n1 = mk_types::id::gen_aid_now();
-    let n2 = mk_types::id::gen_aid_now();
-    for nid in [&n1, &n2] {
-        mk_db::sqlx::query(
-            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#,
-        )
-        .bind(nid)
-        .bind(aid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    let f1 = mk_types::id::gen_aid_now();
-    let f2 = mk_types::id::gen_aid_now();
-    mk_db::sqlx::query(
-        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
-    )
-    .bind(&f1)
-    .bind(aid)
-    .bind(&n1)
-    .execute(&pool)
-    .await
-    .unwrap();
-    mk_db::sqlx::query(
-        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
-    )
-    .bind(&f2)
-    .bind(bid)
-    .bind(&n2)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let (s, body) = post_json(app.clone(), "/api/i/favorites", json!({ "i": at })).await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {body}");
-    assert_eq!(arr[0]["id"], json!(f1));
-    assert_eq!(arr[0]["noteId"], json!(n1));
-    assert!(arr[0]["createdAt"].is_string());
-
-    // cursors: untilId=f1 is exclusive → empty; sinceId=f1 → empty (no newer)
-    let (_, b) = post_json(
-        app.clone(),
-        "/api/i/favorites",
-        json!({ "i": at, "untilId": f1 }),
-    )
-    .await;
-    assert_eq!(b, json!([]));
-    let (_, b) = post_json(
-        app.clone(),
-        "/api/i/favorites",
-        json!({ "i": at, "sinceId": f1 }),
-    )
-    .await;
-    assert_eq!(b, json!([]));
-
-    // other user's token only sees their own row
-    let (_, b) = post_json(
-        app.clone(),
-        "/api/i/favorites",
-        json!({ "i": bob["token"] }),
-    )
-    .await;
-    assert_eq!(b.as_array().unwrap().len(), 1);
-    assert_eq!(b[0]["id"], json!(f2));
-
-    // requireCredential: no token → CREDENTIAL_REQUIRED
-    let (s, b) = post_json(app, "/api/i/favorites", json!({})).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
-    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
-}
-
-/// `i/gallery/likes`: the caller's gallery_like rows joined to gallery_post.
-#[tokio::test]
-async fn i_gallery_likes_lists_only_callers_rows() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = fresh_pool("mki_more_gallery").await;
-    let app = crate::build_router(test_state(pool.clone()));
-    let alice = signup(&app, &format!("gala{}", mk_types::id::gen_aid_now())).await;
-    let bob = signup(&app, &format!("galb{}", mk_types::id::gen_aid_now())).await;
-    let at = alice["token"].as_str().unwrap().to_string();
-    let aid = alice["id"].as_str().unwrap();
-    let bid = bob["id"].as_str().unwrap();
-
-    let p1 = mk_types::id::gen_aid_now();
-    let p2 = mk_types::id::gen_aid_now();
-    for (pid, uid, title) in [(&p1, aid, "alice post"), (&p2, bid, "bob post")] {
-        mk_db::sqlx::query(
-            r#"INSERT INTO "gallery_post" ("id", "updatedAt", "title", "userId")
-               VALUES ($1, now(), $2, $3)"#,
-        )
-        .bind(pid)
-        .bind(title)
-        .bind(uid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    let l1 = mk_types::id::gen_aid_now();
-    let l2 = mk_types::id::gen_aid_now();
-    for (lid, uid, pid) in [(&l1, aid, &p1), (&l2, bid, &p2)] {
-        mk_db::sqlx::query(
-            r#"INSERT INTO "gallery_like" ("id", "userId", "postId") VALUES ($1, $2, $3)"#,
-        )
-        .bind(lid)
-        .bind(uid)
-        .bind(pid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    let (s, body) = post_json(app.clone(), "/api/i/gallery/likes", json!({ "i": at })).await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {body}");
-    assert_eq!(arr[0]["id"], json!(l1));
-    assert_eq!(arr[0]["post"]["id"], json!(p1));
-    assert_eq!(arr[0]["post"]["title"], json!("alice post"));
-    assert!(arr[0]["createdAt"].is_string());
-
-    // other user sees only their own like
-    let (_, b) = post_json(app, "/api/i/gallery/likes", json!({ "i": bob["token"] })).await;
-    assert_eq!(b.as_array().unwrap().len(), 1);
-    assert_eq!(b[0]["post"]["id"], json!(p2));
-}
-
-/// `i/pages/likes`: the caller's page_like rows joined to page.
-#[tokio::test]
-async fn i_pages_likes_lists_only_callers_rows() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = fresh_pool("mki_more_pages").await;
-    let app = crate::build_router(test_state(pool.clone()));
-    let alice = signup(&app, &format!("pga{}", mk_types::id::gen_aid_now())).await;
-    let bob = signup(&app, &format!("pgb{}", mk_types::id::gen_aid_now())).await;
-    let at = alice["token"].as_str().unwrap().to_string();
-    let aid = alice["id"].as_str().unwrap();
-    let bid = bob["id"].as_str().unwrap();
-
-    let q1 = mk_types::id::gen_aid_now();
-    let q2 = mk_types::id::gen_aid_now();
-    for (pid, uid, title) in [(&q1, aid, "alice page"), (&q2, bid, "bob page")] {
-        mk_db::sqlx::query(
-            r#"INSERT INTO "page"
-                 ("id", "updatedAt", "title", "name", "alignCenter", "font",
-                  "userId", "visibility")
-               VALUES ($1, now(), $2, $2, false, 'sans-serif', $3, 'public')"#,
-        )
-        .bind(pid)
-        .bind(title)
-        .bind(uid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    let m1 = mk_types::id::gen_aid_now();
-    let m2 = mk_types::id::gen_aid_now();
-    for (lid, uid, pid) in [(&m1, aid, &q1), (&m2, bid, &q2)] {
-        mk_db::sqlx::query(
-            r#"INSERT INTO "page_like" ("id", "userId", "pageId") VALUES ($1, $2, $3)"#,
-        )
-        .bind(lid)
-        .bind(uid)
-        .bind(pid)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    let (s, body) = post_json(app.clone(), "/api/i/pages/likes", json!({ "i": at })).await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {body}");
-    assert_eq!(arr[0]["id"], json!(m1));
-    assert_eq!(arr[0]["page"]["id"], json!(q1));
-    assert_eq!(arr[0]["page"]["title"], json!("alice page"));
-    assert_eq!(arr[0]["page"]["visibility"], json!("public"));
-    assert!(arr[0]["createdAt"].is_string());
-
-    // other user sees only their own like
-    let (_, b) = post_json(app, "/api/i/pages/likes", json!({ "i": bob["token"] })).await;
-    assert_eq!(b.as_array().unwrap().len(), 1);
-    assert_eq!(b[0]["page"]["id"], json!(q2));
-}
-
 // ---------------------------------------------------------------------------
 // admin/emoji/* (admin emoji management) — add→list→update→delete round trip,
 // bulk alias/category/license/delete legs and the requireAdmin gate.
@@ -17428,6 +16976,471 @@ async fn admin_emoji_bulk_roundtrip() {
     assert_eq!(list, json!([]));
 }
 
+/// admin/roles: create → list → show → assign → unassign → delete
+/// (upstream endpoints/admin/roles/*.ts).
+#[tokio::test]
+async fn admin_roles_crud_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_roles_crud").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // create (only name is required; everything else keeps its default)
+    let (s, role) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({ "name": "crud-role", "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    assert_eq!(role["name"], json!("crud-role"));
+    assert_eq!(role["isModerator"], json!(false));
+
+    // list sees it (moderator gate passes for the root)
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/roles/list",
+        json!({ "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array().unwrap().iter().any(|r| r["id"] == json!(role_id)),
+        "body: {list}"
+    );
+
+    // show packs the stored row
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/admin/roles/show",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["id"], json!(role_id));
+    assert_eq!(shown["name"], json!("crud-role"));
+    assert!(shown.get("policies").is_some());
+
+    // assign / unassign (void handlers → 204)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/unassign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // a plain user is denied the moderator gate
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/roles/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // delete → show answers show.ts NO_SUCH_ROLE (07dc7d34)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/delete",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/roles/show",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_ROLE"));
+    assert_eq!(
+        err["error"]["id"],
+        json!("07dc7d34-c0d8-49b7-96c6-db3ce64ee0b3")
+    );
+}
+
+/// admin/ad: create → list → update → delete (upstream
+/// endpoints/admin/ad/*.ts).
+#[tokio::test]
+async fn admin_ad_crud_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_ad_crud").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let now = now_ms() as i64;
+
+    // create: every required paramDef field
+    let (s, ad) = post_json(
+        app.clone(),
+        "/api/admin/ad/create",
+        json!({
+            "url": "https://example.com/ad",
+            "memo": "first",
+            "place": "square",
+            "priority": "middle",
+            "ratio": 1,
+            "expiresAt": now + 3_600_000,
+            "startsAt": now - 1_000,
+            "imageUrl": "https://example.com/ad.png",
+            "dayOfWeek": 0,
+            "isSensitive": false,
+            "i": r_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ad}");
+    let ad_id = ad["id"].as_str().unwrap().to_string();
+    assert_eq!(ad["url"], json!("https://example.com/ad"));
+    assert_eq!(ad["place"], json!("square"));
+    assert_eq!(ad["ratio"], json!(1));
+    assert!(ad["expiresAt"].is_string());
+    assert!(ad["startsAt"].is_string());
+
+    // list (default publishing = null → all rows, id DESC)
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)),
+        "body: {list}"
+    );
+    // publishing=true keeps the live ad
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "publishing": true, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)));
+
+    // update is partial (memo only) and answers 204
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/ad/update",
+        json!({ "id": ad_id, "memo": "updated", "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(ad_id))
+        .unwrap();
+    assert_eq!(row["memo"], json!("updated"));
+    assert_eq!(row["url"], json!("https://example.com/ad"));
+
+    // non-moderator is denied
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // missing rows answer the per-endpoint NO_SUCH_AD ids
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/ad/update",
+        json!({ "id": "x".repeat(10), "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(
+        err["error"]["id"],
+        json!("b7aa1727-1354-47bc-a182-3a9c3973d300")
+    );
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/ad/delete",
+        json!({ "id": "x".repeat(10), "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(
+        err["error"]["id"],
+        json!("ccac9863-3a03-416e-b899-8a64041118b1")
+    );
+
+    // delete → 204 → the list no longer carries it
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/ad/delete",
+        json!({ "id": ad_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)));
+}
+
+// ==== i-more slice 1: i/favorites + i/gallery/likes + i/pages/likes ====
+
+/// `i/favorites`: the caller's note_favorite rows (id DESC), other users'
+/// rows excluded, cursors respected.
+#[tokio::test]
+async fn i_favorites_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_favorites").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("fava{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("favb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let n1 = mk_types::id::gen_aid_now();
+    let n2 = mk_types::id::gen_aid_now();
+    for nid in [&n1, &n2] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#,
+        )
+        .bind(nid)
+        .bind(aid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let f1 = mk_types::id::gen_aid_now();
+    let f2 = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(&f1)
+    .bind(aid)
+    .bind(&n1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(&f2)
+    .bind(bid)
+    .bind(&n2)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(app.clone(), "/api/i/favorites", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(f1));
+    assert_eq!(arr[0]["noteId"], json!(n1));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // cursors: untilId=f1 is exclusive → empty; sinceId=f1 → empty (no newer)
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": at, "untilId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": at, "sinceId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // other user's token only sees their own row
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(f2));
+
+    // requireCredential: no token → CREDENTIAL_REQUIRED
+    let (s, b) = post_json(app, "/api/i/favorites", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
+/// `i/gallery/likes`: the caller's gallery_like rows joined to gallery_post.
+#[tokio::test]
+async fn i_gallery_likes_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_gallery").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("gala{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("galb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let p1 = mk_types::id::gen_aid_now();
+    let p2 = mk_types::id::gen_aid_now();
+    for (pid, uid, title) in [(&p1, aid, "alice post"), (&p2, bid, "bob post")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "gallery_post" ("id", "updatedAt", "title", "userId")
+               VALUES ($1, now(), $2, $3)"#,
+        )
+        .bind(pid)
+        .bind(title)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let l1 = mk_types::id::gen_aid_now();
+    let l2 = mk_types::id::gen_aid_now();
+    for (lid, uid, pid) in [(&l1, aid, &p1), (&l2, bid, &p2)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "gallery_like" ("id", "userId", "postId") VALUES ($1, $2, $3)"#,
+        )
+        .bind(lid)
+        .bind(uid)
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/gallery/likes",
+        json!({ "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(l1));
+    assert_eq!(arr[0]["post"]["id"], json!(p1));
+    assert_eq!(arr[0]["post"]["title"], json!("alice post"));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // other user sees only their own like
+    let (_, b) = post_json(
+        app,
+        "/api/i/gallery/likes",
+        json!({ "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["post"]["id"], json!(p2));
+}
+
+/// `i/pages/likes`: the caller's page_like rows joined to page.
+#[tokio::test]
+async fn i_pages_likes_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_pages").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("pga{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("pgb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let q1 = mk_types::id::gen_aid_now();
+    let q2 = mk_types::id::gen_aid_now();
+    for (pid, uid, title) in [(&q1, aid, "alice page"), (&q2, bid, "bob page")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "page"
+                 ("id", "updatedAt", "title", "name", "alignCenter", "font",
+                  "userId", "visibility")
+               VALUES ($1, now(), $2, $2, false, 'sans-serif', $3, 'public')"#,
+        )
+        .bind(pid)
+        .bind(title)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let m1 = mk_types::id::gen_aid_now();
+    let m2 = mk_types::id::gen_aid_now();
+    for (lid, uid, pid) in [(&m1, aid, &q1), (&m2, bid, &q2)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "page_like" ("id", "userId", "pageId") VALUES ($1, $2, $3)"#,
+        )
+        .bind(lid)
+        .bind(uid)
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(app.clone(), "/api/i/pages/likes", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(m1));
+    assert_eq!(arr[0]["page"]["id"], json!(q1));
+    assert_eq!(arr[0]["page"]["title"], json!("alice page"));
+    assert_eq!(arr[0]["page"]["visibility"], json!("public"));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // other user sees only their own like
+    let (_, b) = post_json(app, "/api/i/pages/likes", json!({ "i": bob["token"] })).await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["page"]["id"], json!(q2));
+}
+
 // ---------------------------------------------------------------------------
 // admin-queue slice — admin/queue/* over mk-queue (appended at file end so
 // co-agent appends rebase trivially).
@@ -17657,4 +17670,618 @@ async fn admin_queue_enqueue_jobs_remove_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+}
+
+// ===== chat: rooms + invitations ===========================================
+//
+// upstream endpoints/chat/rooms/{create,show,update,join,leave,joining,
+// members}.ts + rooms/invitations/{create,ignore,inbox}.ts on the
+// ChatService/ChatEntityService packs (owner is not a membership row; join
+// consumes the invitation; only owner/member/invited can show).
+
+#[tokio::test]
+async fn chat_rooms_membership_invitation_flow() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_rooms").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("cha")).await;
+    let bob = signup(&app, &uname("chb")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // -- create: ChatRoom pack { id, createdAt, name, description, ownerId,
+    //    owner: UserLite, isMuted, invitationExists } ---------------------
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "room", "description": "desc", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    assert_eq!(room["name"], json!("room"));
+    assert_eq!(room["description"], json!("desc"));
+    assert_eq!(room["ownerId"], json!(a));
+    assert_eq!(room["owner"]["id"], json!(a));
+    assert_eq!(room["isMuted"], json!(false));
+    assert_eq!(room["invitationExists"], json!(false));
+    assert!(room["createdAt"].as_str().is_some());
+    let room_id = room["id"].as_str().unwrap().to_string();
+
+    // -- show by owner + non-owner without invitation → NO_SUCH_ROOM ------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/show",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["id"], json!(room_id));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/show",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+
+    // -- update (owner only) ----------------------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/update",
+        json!({ "roomId": room_id, "name": "renamed", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["name"], json!("renamed"));
+    assert_eq!(v["description"], json!("desc"));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/update",
+        json!({ "roomId": room_id, "name": "nope", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+
+    // -- invitation create → bob's inbox + show sees invitationExists -----
+    let (s, inv) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/create",
+        json!({ "roomId": room_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {inv}");
+    assert_eq!(inv["roomId"], json!(room_id));
+    assert_eq!(inv["userId"], json!(b));
+    assert_eq!(inv["user"]["id"], json!(b));
+    assert_eq!(inv["room"]["id"], json!(room_id));
+    let (s, inbox) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/inbox",
+        json!({ "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {inbox}");
+    assert_eq!(inbox.as_array().unwrap().len(), 1);
+    assert_eq!(inbox[0]["roomId"], json!(room_id));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/show",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["invitationExists"], json!(true));
+
+    // -- join consumes the invitation; joining lists the membership -------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/join",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, inbox) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/inbox",
+        json!({ "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {inbox}");
+    assert_eq!(inbox, json!([]));
+    let (s, joining) = post_json(
+        app.clone(),
+        "/api/chat/rooms/joining",
+        json!({ "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {joining}");
+    assert_eq!(joining.as_array().unwrap().len(), 1);
+    assert_eq!(joining[0]["roomId"], json!(room_id));
+    assert_eq!(joining[0]["userId"], json!(b));
+    assert_eq!(joining[0]["room"]["id"], json!(room_id));
+    assert!(joining[0].get("user").is_none(), "populateUser: false");
+
+    // -- members: bob only (the owner has no membership row) --------------
+    let (s, members) = post_json(
+        app.clone(),
+        "/api/chat/rooms/members",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {members}");
+    let members = members.as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["userId"], json!(b));
+    assert_eq!(members[0]["user"]["id"], json!(b));
+    assert!(members[0].get("room").is_none(), "populateRoom: false");
+
+    // -- leave → joining empty again --------------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/leave",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, joining) = post_json(
+        app.clone(),
+        "/api/chat/rooms/joining",
+        json!({ "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {joining}");
+    assert_eq!(joining, json!([]));
+}
+
+// ============================================================================
+// notes-more batch (endpoints/notes/*): favorites create/delete (via
+// i/favorites), reactions/delete, renotes, children, conversation, state and
+// unrenote. Tables: note_favorite / note_reaction / note (0001 baseline).
+// ============================================================================
+
+#[tokio::test]
+async fn notes_more_batch_flow() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotes_more_batch").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let ua = format!("notesmorea{}", mk_types::id::gen_aid_now());
+    let ub = format!("notesmoreb{}", mk_types::id::gen_aid_now());
+    let a = signup(&app, &ua).await;
+    let b = signup(&app, &ub).await;
+    let a_token = a["token"].as_str().unwrap().to_string();
+    let b_token = b["token"].as_str().unwrap().to_string();
+
+    // b writes the target note
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "target", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let target = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // --- favorites create → i/favorites → state → duplicate → delete ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/favorites/create",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "favorite create: {v}");
+    let (s, v) = post_json(app.clone(), "/api/i/favorites", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "i/favorites: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["noteId"], json!(target), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/state",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "state: {v}");
+    assert_eq!(v["isFavorited"], json!(true), "{v}");
+    assert_eq!(v["isMutedThread"], json!(false), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/favorites/create",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "duplicate favorite: {v}");
+    assert_eq!(v["error"]["code"], json!("ALREADY_FAVORITED"), "{v}");
+
+    // --- reaction add → list → delete → list empty → NOT_REACTED ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": target, "reaction": "👍", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "reaction delete: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], json!("NOT_REACTED"), "{v}");
+
+    // --- renote list ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let renote_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    assert_eq!(s, StatusCode::OK, "renotes: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["id"], json!(renote_id), "{v}");
+
+    // --- children: direct reply in, pure renote out ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "reply", "replyId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reply_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/children",
+        json!({ "noteId": target }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "children: {v}");
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .collect();
+    assert!(ids.contains(&reply_id.as_str()), "children: {v}");
+    assert!(!ids.contains(&renote_id.as_str()), "pure renote excluded: {v}");
+
+    // --- conversation walks the reply chain upward ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/conversation",
+        json!({ "noteId": reply_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "conversation: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["id"], json!(target), "{v}");
+
+    // --- unrenote removes a's renote ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/unrenote",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+
+    // --- favorites delete → list empty → NOT_FAVORITED ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/favorites/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(app.clone(), "/api/i/favorites", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+    let (s, v) = post_json(
+        app,
+        "/api/notes/favorites/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], json!("NOT_FAVORITED"), "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// users-more: users/relation + the remaining users/lists/* endpoints
+// (upstream endpoints/users/relation.ts + endpoints/users/lists/*.ts)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn users_relation_flags_on_following_row() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkusers_more_relation").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("rela")).await;
+    let bob = signup(&app, &uname("relb")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // alice → bob follow edge seeds isFollowing / isFollowed.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // scalar form still returns a one-element ARRAY (getRelation → [it]).
+    let (s, rel) = post_json(
+        app.clone(),
+        "/api/users/relation",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {rel}");
+    let arr = rel.as_array().expect("relation response is an array");
+    assert_eq!(arr.len(), 1);
+    let r = &arr[0];
+    assert_eq!(r["id"], json!(b));
+    assert_eq!(r["isFollowing"], json!(true));
+    assert_eq!(r["isFollowed"], json!(false));
+    assert_eq!(r["hasPendingFollowRequestFromYou"], json!(false));
+    assert_eq!(r["hasPendingFollowRequestToYou"], json!(false));
+    assert_eq!(r["isBlocking"], json!(false));
+    assert_eq!(r["isBlocked"], json!(false));
+    assert_eq!(r["isMuted"], json!(false));
+    assert_eq!(r["isRenoteMuted"], json!(false));
+
+    // reverse view: isFollowed flips.
+    let (s, rel) = post_json(
+        app.clone(),
+        "/api/users/relation",
+        json!({ "userId": a, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {rel}");
+    assert_eq!(rel[0]["isFollowing"], json!(false));
+    assert_eq!(rel[0]["isFollowed"], json!(true));
+
+    // array form returns one entry per target (insertion order).
+    let (s, rel) = post_json(
+        app.clone(),
+        "/api/users/relation",
+        json!({ "userId": [b, a], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {rel}");
+    let arr = rel.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], json!(b));
+    assert_eq!(arr[1]["id"], json!(a));
+
+    // requireCredential.
+    let (s, err) = post_json(app, "/api/users/relation", json!({ "userId": b })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
+#[tokio::test]
+async fn users_lists_more_create_push_show_membership_update_pull_delete() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkusers_more_lists").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("lsa")).await;
+    let bob = signup(&app, &uname("lsb")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // create → push
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "orig", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/push",
+        json!({ "listId": list_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+
+    // show (owner scope) carries the membership
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/users/lists/show",
+        json!({ "listId": list_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["userIds"], json!([b]));
+    assert_eq!(shown["isPublic"], json!(false));
+
+    // get-memberships: { id, createdAt, userId, user (UserLite), withReplies }
+    let (s, members) = post_json(
+        app.clone(),
+        "/api/users/lists/get-memberships",
+        json!({ "listId": list_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {members}");
+    let arr = members.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["userId"], json!(b));
+    assert_eq!(arr[0]["user"]["id"], json!(b));
+    assert_eq!(arr[0]["withReplies"], json!(false));
+    assert!(arr[0]["createdAt"].as_str().is_some());
+
+    // update: rename + make public
+    let (s, updated) = post_json(
+        app.clone(),
+        "/api/users/lists/update",
+        json!({ "listId": list_id, "name": "renamed", "isPublic": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {updated}");
+    assert_eq!(updated["name"], json!("renamed"));
+    assert_eq!(updated["isPublic"], json!(true));
+
+    // forPublic show (guest) exposes likedCount/isLiked
+    let (s, public_show) = post_json(
+        app.clone(),
+        "/api/users/lists/show",
+        json!({ "listId": list_id, "forPublic": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {public_show}");
+    assert_eq!(public_show["likedCount"], json!(0));
+    assert_eq!(public_show["isLiked"], json!(false));
+
+    // favorite → likedCount 1 / isLiked true for the favoriter
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/favorite",
+        json!({ "listId": list_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, public_show) = post_json(
+        app.clone(),
+        "/api/users/lists/show",
+        json!({ "listId": list_id, "forPublic": true, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {public_show}");
+    assert_eq!(public_show["likedCount"], json!(1));
+    assert_eq!(public_show["isLiked"], json!(true));
+
+    // duplicate favorite → ALREADY_FAVORITED
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/lists/favorite",
+        json!({ "listId": list_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ALREADY_FAVORITED"));
+
+    // unfavorite → back to zero
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/unfavorite",
+        json!({ "listId": list_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+
+    // create-from-public copies the members into a new list
+    let (s, copied) = post_json(
+        app.clone(),
+        "/api/users/lists/create-from-public",
+        json!({ "name": "copy", "listId": list_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {copied}");
+    assert_eq!(copied["name"], json!("copy"));
+    assert_eq!(copied["userIds"], json!([b]));
+
+    // pull removes the membership from the original list
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/pull",
+        json!({ "listId": list_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/users/lists/show",
+        json!({ "listId": list_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["userIds"], json!([]));
+
+    // delete → subsequent show is NO_SUCH_LIST
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/delete",
+        json!({ "listId": list_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/lists/show",
+        json!({ "listId": list_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_LIST"));
+
+    // unknown list → NO_SUCH_LIST (owner-scoped lookup)
+    let (s, err) = post_json(
+        app,
+        "/api/users/lists/delete",
+        json!({ "listId": "9zzzzzzzzz", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_LIST"));
 }

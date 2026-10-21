@@ -18,9 +18,16 @@ pub mod announcement;
 // channels-agent: channels/* domain (channel/channel_following/channel_favorite
 // tables + the channels/timeline note db path)
 pub mod channel;
+// chat-agent: chat/rooms/* + chat/messages/* + chat/history (chat_room /
+// chat_message / chat_room_membership / chat_room_invitation / chat_approval
+// all ship in the 0001 baseline)
+pub mod chat;
 // clips-agent: clips/* + users/clips domain (clip/clip_note/clip_favorite
 // tables ship in the 0001 baseline; CRUD + notes + favorites db paths)
 pub mod clips;
+// flash-agent: flash/* domain (flash/flash_like tables ship in the 0001
+// baseline; CRUD + likes + featured/search/my-likes db paths)
+pub mod flash;
 // delete-account: i/delete-account + admin/delete-account soft-delete flag
 pub mod delete_account;
 // two-factor arena: the TOTP lane (vendored std-only SHA-1/HMAC-SHA1/

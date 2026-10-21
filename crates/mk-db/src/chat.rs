@@ -1,0 +1,588 @@
+//! chat: rooms / memberships / invitations / messages
+//! (upstream core/ChatService.ts + endpoints/chat/*).
+//!
+//! Tables ship in the 0001 baseline — no migration here:
+//! - `chat_room` (id, name, ownerId, description, isArchived)
+//! - `chat_message` (id, fromUserId, toUserId, toRoomId, text, uri, reads,
+//!   fileId, reactions) — 1on1 rows carry `toUserId`, room rows `toRoomId`
+//! - `chat_room_membership` (id, userId, roomId, isMuted) — the owner is NOT
+//!   a membership row upstream (ChatService concatenates the owner manually)
+//! - `chat_room_invitation` (id, userId, roomId, ignored)
+//! - `chat_approval` (id, userId, otherId) — the "I approved this 1on1
+//!   partner" row ChatService.createMessageToUser inserts
+//!
+//! Aid ids sort monotonically as plain strings, so sinceId/untilId paging is
+//! a string compare; bounds are EXCLUSIVE (`makePaginationQuery`), sinceId-only
+//! → oldest-first ASC, otherwise newest-first DESC. `createdAt` is derived
+//! from the aid prefix by the api layer (no column upstream).
+
+use sqlx::PgPool;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChatRoomRow {
+    pub id: String,
+    pub name: String,
+    #[sqlx(rename = "ownerId")]
+    pub owner_id: String,
+    pub description: String,
+    #[sqlx(rename = "isArchived")]
+    pub is_archived: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChatMessageRow {
+    pub id: String,
+    #[sqlx(rename = "fromUserId")]
+    pub from_user_id: String,
+    #[sqlx(rename = "toUserId")]
+    pub to_user_id: Option<String>,
+    #[sqlx(rename = "toRoomId")]
+    pub to_room_id: Option<String>,
+    pub text: Option<String>,
+    pub uri: Option<String>,
+    pub reads: Vec<String>,
+    #[sqlx(rename = "fileId")]
+    pub file_id: Option<String>,
+    pub reactions: Vec<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChatMembershipRow {
+    pub id: String,
+    #[sqlx(rename = "userId")]
+    pub user_id: String,
+    #[sqlx(rename = "roomId")]
+    pub room_id: String,
+    #[sqlx(rename = "isMuted")]
+    pub is_muted: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChatInvitationRow {
+    pub id: String,
+    #[sqlx(rename = "userId")]
+    pub user_id: String,
+    #[sqlx(rename = "roomId")]
+    pub room_id: String,
+    pub ignored: bool,
+}
+
+const ROOM_COLS: &str = r#""id", "name", "ownerId", "description", "isArchived""#;
+
+const MESSAGE_COLS: &str =
+    r#""id", "fromUserId", "toUserId", "toRoomId", "text", "uri", "reads", "fileId", "reactions""#;
+
+const MEMBERSHIP_COLS: &str = r#""id", "userId", "roomId", "isMuted""#;
+
+const INVITATION_COLS: &str = r#""id", "userId", "roomId", "ignored""#;
+
+/// Upstream `MAX_ROOM_MEMBERS` (ChatService.ts).
+pub const MAX_ROOM_MEMBERS: i64 = 50;
+
+// ==== rooms ================================================================
+
+/// `chatRoomsRepository.findOne({ where: { id }, relations: { owner: true } })`
+/// — the owner relation is packed from the user table by the api layer.
+pub async fn find_room(pool: &PgPool, room_id: &str) -> Result<Option<ChatRoomRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatRoomRow>(&format!(
+        r#"SELECT {ROOM_COLS} FROM "chat_room" WHERE "id" = $1"#
+    ))
+    .bind(room_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `chatRoomsRepository.findOneBy({ id, ownerId })` (findMyRoomById).
+pub async fn find_owned_room(
+    pool: &PgPool,
+    room_id: &str,
+    owner_id: &str,
+) -> Result<Option<ChatRoomRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatRoomRow>(&format!(
+        r#"SELECT {ROOM_COLS} FROM "chat_room" WHERE "id" = $1 AND "ownerId" = $2"#
+    ))
+    .bind(room_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// ChatService.createRoom — description defaults to '' upstream.
+pub async fn insert_room(
+    pool: &PgPool,
+    id: &str,
+    owner_id: &str,
+    name: &str,
+    description: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "chat_room" ("id", "name", "ownerId", "description")
+           VALUES ($1, $2, $3, $4)"#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(owner_id)
+    .bind(description)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// ChatService.updateRoom — `UPDATE ... SET params WHERE id` (undefined keys
+/// are omitted upstream; NULL binds leave the column untouched here).
+pub async fn update_room(
+    pool: &PgPool,
+    room_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<Option<ChatRoomRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatRoomRow>(&format!(
+        r#"UPDATE "chat_room"
+           SET "name" = COALESCE($2, "name"),
+               "description" = COALESCE($3, "description")
+           WHERE "id" = $1
+           RETURNING {ROOM_COLS}"#
+    ))
+    .bind(room_id)
+    .bind(name)
+    .bind(description)
+    .fetch_optional(pool)
+    .await
+}
+
+// ==== memberships ==========================================================
+
+/// `chatRoomMembershipsRepository.findOneBy({ roomId, userId })`.
+pub async fn find_membership(
+    pool: &PgPool,
+    room_id: &str,
+    user_id: &str,
+) -> Result<Option<ChatMembershipRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMembershipRow>(&format!(
+        r#"SELECT {MEMBERSHIP_COLS} FROM "chat_room_membership"
+           WHERE "roomId" = $1 AND "userId" = $2"#
+    ))
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn membership_exists(
+    pool: &PgPool,
+    room_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM "chat_room_membership"
+           WHERE "roomId" = $1 AND "userId" = $2"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// `chatRoomMembershipsRepository.countBy({ roomId })` (MAX_ROOM_MEMBERS gate).
+pub async fn count_memberships(pool: &PgPool, room_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "chat_room_membership" WHERE "roomId" = $1"#)
+        .bind(room_id)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn insert_membership(
+    pool: &PgPool,
+    id: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "chat_room_membership" ("id", "roomId", "userId")
+           VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(room_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+pub async fn delete_membership(
+    pool: &PgPool,
+    room_id: &str,
+    user_id: &str,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "chat_room_membership" WHERE "roomId" = $1 AND "userId" = $2"#)
+        .bind(room_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected())
+}
+
+/// ChatService.getMyMemberships (paged).
+pub async fn memberships_for_user(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMembershipRow>, sqlx::Error> {
+    let base =
+        format!(r#"SELECT {MEMBERSHIP_COLS} FROM "chat_room_membership" WHERE "userId" = $1"#);
+    paged(pool, &base, user_id, limit, since_id, until_id).await
+}
+
+/// ChatService.getRoomMembershipsWithPagination (paged).
+pub async fn memberships_for_room(
+    pool: &PgPool,
+    room_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMembershipRow>, sqlx::Error> {
+    let base =
+        format!(r#"SELECT {MEMBERSHIP_COLS} FROM "chat_room_membership" WHERE "roomId" = $1"#);
+    paged(pool, &base, room_id, limit, since_id, until_id).await
+}
+
+/// Shared `makePaginationQuery` shape: 4 exclusive-bound branches.
+async fn paged(
+    pool: &PgPool,
+    base: &str,
+    key: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMembershipRow>, sqlx::Error> {
+    let sql = match (since_id, until_id) {
+        (Some(_), Some(_)) => {
+            format!(r#"{base} AND "id" > $2 AND "id" < $3 ORDER BY "id" DESC LIMIT $4"#)
+        }
+        (Some(_), None) => format!(r#"{base} AND "id" > $2 ORDER BY "id" ASC LIMIT $3"#),
+        (None, Some(_)) => format!(r#"{base} AND "id" < $2 ORDER BY "id" DESC LIMIT $3"#),
+        (None, None) => format!(r#"{base} ORDER BY "id" DESC LIMIT $2"#),
+    };
+    let mut q = sqlx::query_as::<_, ChatMembershipRow>(&sql).bind(key);
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q = q.bind(s).bind(u).bind(limit);
+        }
+        (Some(s), None) | (None, Some(s)) => {
+            q = q.bind(s).bind(limit);
+        }
+        (None, None) => {
+            q = q.bind(limit);
+        }
+    }
+    q.fetch_all(pool).await
+}
+
+// ==== invitations ==========================================================
+
+/// `chatRoomInvitationsRepository.findOneBy({ roomId, userId })`.
+pub async fn find_invitation(
+    pool: &PgPool,
+    room_id: &str,
+    user_id: &str,
+) -> Result<Option<ChatInvitationRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatInvitationRow>(&format!(
+        r#"SELECT {INVITATION_COLS} FROM "chat_room_invitation"
+           WHERE "roomId" = $1 AND "userId" = $2"#
+    ))
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn insert_invitation(
+    pool: &PgPool,
+    id: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "chat_room_invitation" ("id", "roomId", "userId")
+           VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(room_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+pub async fn delete_invitation(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "chat_room_invitation" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// ChatService.ignoreRoomInvitation — `update(id, { ignored: true })`.
+pub async fn ignore_invitation(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "chat_room_invitation" SET "ignored" = TRUE WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// ChatService.getReceivedRoomInvitationsWithPagination (ignored = FALSE).
+pub async fn invitations_received(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatInvitationRow>, sqlx::Error> {
+    let base = format!(
+        r#"SELECT {INVITATION_COLS} FROM "chat_room_invitation"
+           WHERE "userId" = $1 AND "ignored" = FALSE"#
+    );
+    paged_invitations(pool, &base, user_id, limit, since_id, until_id).await
+}
+
+/// ChatService.getSentRoomInvitationsWithPagination.
+pub async fn invitations_sent(
+    pool: &PgPool,
+    room_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatInvitationRow>, sqlx::Error> {
+    let base =
+        format!(r#"SELECT {INVITATION_COLS} FROM "chat_room_invitation" WHERE "roomId" = $1"#);
+    paged_invitations(pool, &base, room_id, limit, since_id, until_id).await
+}
+
+async fn paged_invitations(
+    pool: &PgPool,
+    base: &str,
+    key: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatInvitationRow>, sqlx::Error> {
+    let sql = match (since_id, until_id) {
+        (Some(_), Some(_)) => {
+            format!(r#"{base} AND "id" > $2 AND "id" < $3 ORDER BY "id" DESC LIMIT $4"#)
+        }
+        (Some(_), None) => format!(r#"{base} AND "id" > $2 ORDER BY "id" ASC LIMIT $3"#),
+        (None, Some(_)) => format!(r#"{base} AND "id" < $2 ORDER BY "id" DESC LIMIT $3"#),
+        (None, None) => format!(r#"{base} ORDER BY "id" DESC LIMIT $2"#),
+    };
+    let mut q = sqlx::query_as::<_, ChatInvitationRow>(&sql).bind(key);
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q = q.bind(s).bind(u).bind(limit);
+        }
+        (Some(s), None) | (None, Some(s)) => {
+            q = q.bind(s).bind(limit);
+        }
+        (None, None) => {
+            q = q.bind(limit);
+        }
+    }
+    q.fetch_all(pool).await
+}
+
+// ==== approvals ============================================================
+
+/// The `(userId, otherId)` pair probe ChatService.createMessageToUser uses to
+/// decide whether either side already approved the 1on1 conversation.
+pub async fn approval_exists(
+    pool: &PgPool,
+    user_id: &str,
+    other_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM "chat_approval"
+           WHERE "userId" = $1 AND "otherId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(other_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+pub async fn insert_approval(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    other_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "chat_approval" ("id", "userId", "otherId")
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(other_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+// ==== messages =============================================================
+
+pub struct NewChatMessage<'a> {
+    pub id: &'a str,
+    pub from_user_id: &'a str,
+    pub to_user_id: Option<&'a str>,
+    pub to_room_id: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub file_id: Option<&'a str>,
+}
+
+pub async fn insert_message(pool: &PgPool, m: &NewChatMessage<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "chat_message"
+             ("id", "fromUserId", "toUserId", "toRoomId", "text", "fileId")
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    )
+    .bind(m.id)
+    .bind(m.from_user_id)
+    .bind(m.to_user_id)
+    .bind(m.to_room_id)
+    .bind(m.text)
+    .bind(m.file_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+pub async fn find_message(
+    pool: &PgPool,
+    message_id: &str,
+) -> Result<Option<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT {MESSAGE_COLS} FROM "chat_message" WHERE "id" = $1"#
+    ))
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `findMyMessageById` — messages/delete only deletes the sender's rows.
+pub async fn find_message_from_user(
+    pool: &PgPool,
+    message_id: &str,
+    from_user_id: &str,
+) -> Result<Option<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT {MESSAGE_COLS} FROM "chat_message"
+           WHERE "id" = $1 AND "fromUserId" = $2"#
+    ))
+    .bind(message_id)
+    .bind(from_user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_message(pool: &PgPool, message_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "chat_message" WHERE "id" = $1"#)
+        .bind(message_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// ChatService.roomTimeline (paged, newest-first default).
+pub async fn room_messages(
+    pool: &PgPool,
+    room_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    let base = format!(r#"SELECT {MESSAGE_COLS} FROM "chat_message" WHERE "toRoomId" = $1"#);
+    paged_messages(pool, &base, room_id, limit, since_id, until_id).await
+}
+
+async fn paged_messages(
+    pool: &PgPool,
+    base: &str,
+    key: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    let sql = match (since_id, until_id) {
+        (Some(_), Some(_)) => {
+            format!(r#"{base} AND "id" > $2 AND "id" < $3 ORDER BY "id" DESC LIMIT $4"#)
+        }
+        (Some(_), None) => format!(r#"{base} AND "id" > $2 ORDER BY "id" ASC LIMIT $3"#),
+        (None, Some(_)) => format!(r#"{base} AND "id" < $2 ORDER BY "id" DESC LIMIT $3"#),
+        (None, None) => format!(r#"{base} ORDER BY "id" DESC LIMIT $2"#),
+    };
+    let mut q = sqlx::query_as::<_, ChatMessageRow>(&sql).bind(key);
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q = q.bind(s).bind(u).bind(limit);
+        }
+        (Some(s), None) | (None, Some(s)) => {
+            q = q.bind(s).bind(limit);
+        }
+        (None, None) => {
+            q = q.bind(limit);
+        }
+    }
+    q.fetch_all(pool).await
+}
+
+/// ChatService.userHistory — newest message per distinct 1on1 counterpart,
+/// muted users excluded, then the whole set ordered newest-first.
+pub async fn user_history(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT * FROM (
+             SELECT DISTINCT ON (CASE WHEN "fromUserId" = $1 THEN "toUserId" ELSE "fromUserId" END)
+               {MESSAGE_COLS}
+             FROM "chat_message"
+             WHERE ("fromUserId" = $1 OR "toUserId" = $1)
+               AND "toRoomId" IS NULL
+               AND "fromUserId" NOT IN (SELECT "muteeId" FROM "muting" WHERE "muterId" = $1)
+               AND ("toUserId" IS NULL OR "toUserId" NOT IN (SELECT "muteeId" FROM "muting" WHERE "muterId" = $1))
+             ORDER BY CASE WHEN "fromUserId" = $1 THEN "toUserId" ELSE "fromUserId" END, "id" DESC
+           ) t ORDER BY "id" DESC LIMIT $2"#
+    ))
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// ChatService.roomHistory — newest message per joined/owned room.
+pub async fn room_history(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT * FROM (
+             SELECT DISTINCT ON ("toRoomId") {MESSAGE_COLS}
+             FROM "chat_message"
+             WHERE "toRoomId" IN (
+               SELECT "roomId" FROM "chat_room_membership" WHERE "userId" = $1
+               UNION
+               SELECT "id" FROM "chat_room" WHERE "ownerId" = $1
+             )
+             ORDER BY "toRoomId", "id" DESC
+           ) t ORDER BY "id" DESC LIMIT $2"#
+    ))
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}

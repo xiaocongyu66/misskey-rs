@@ -47,11 +47,21 @@ mod two_factor;
 // channels-agent: channels/* domain (channels/create ../favorite slice of
 // upstream endpoints/channels/*) — db paths in mk-db/src/channel.rs
 mod channel;
+// chat-agent: the chat domain (upstream endpoints/chat/* — rooms create/
+// show/update/join/leave/joining/members + invitations create/ignore/inbox +
+// messages create-to-user/create-to-room/room-timeline/show/delete + history)
+// — db paths in mk-db/src/chat.rs (all five chat tables ship in the 0001
+// baseline). react/unreact stay out of this slice.
+mod chat;
 // clips-agent: the clips family (clips/{create,list,show,update,delete,
 // favorite,unfavorite,my-favorites,notes,add-note,remove-note} +
 // users/clips) — db paths in mk-db/src/clips.rs (clip/clip_note/
 // clip_favorite tables ship in the 0001 baseline).
 mod clips;
+// flash-agent: the flash (Misskey Play) family (flash/{create,update,delete,
+// show,my,my-likes,like,unlike,featured,search}) — db paths in
+// mk-db/src/flash.rs (flash/flash_like tables ship in the 0001 baseline).
+mod flash_more;
 // i-more-agent: i/* remainder slice 1 (i/favorites, i/gallery/likes,
 // i/pages/likes) — db paths inline in api/i_more.rs (tables ship in 0001).
 mod i_more;
@@ -64,6 +74,10 @@ mod announcement;
 // notes/polls/vote, notes/translate + the admin/update-meta
 // sensitiveWords/prohibitedWords patch (db paths in mk-db meta.rs).
 mod note_extras;
+// notes-more: notes/* remainder batch — favorites create/delete,
+// reactions/delete, renotes, conversation, children, state, unrenote
+// (tables: note_favorite / note_reaction / note ship in 0001).
+mod notes_more;
 // note-agent: drive/files/update (drive/files/update.ts semantics; db part
 // in mk-db/src/drive_note.rs)
 mod drive_note;
@@ -73,6 +87,10 @@ mod drive_note;
 // paths in mk-db/src/lists.rs (user_list / user_list_membership ship in the
 // 0001 baseline).
 mod lists;
+// users-more: the users/* remainder (users/relation, the rest of
+// users/lists/*, users/reactions) — api::users_more; db paths in
+// mk-db/src/lists.rs + mk-db/src/note.rs (0001 baseline).
+mod users_more;
 // antennas-v2: antennas/* (upstream endpoints/antennas/{create,delete,list,
 // show,update,notes,remove-note}.ts; requireCredential + owner-scoped
 // NO_SUCH_ANTENNA ids per endpoint) — db paths in mk-db/src/antennas.rs (0001
@@ -308,6 +326,16 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "notes/reactions"
         || name == "notes/reactions/create"
         || name == "notes/delete"
+        // notes-more batch: favorites / reactions-delete / renotes /
+        // conversation / children / state / unrenote
+        || name == "notes/favorites/create"
+        || name == "notes/favorites/delete"
+        || name == "notes/reactions/delete"
+        || name == "notes/renotes"
+        || name == "notes/conversation"
+        || name == "notes/children"
+        || name == "notes/state"
+        || name == "notes/unrenote"
         // note-agent notes.ts slice (global list + polls/vote + translate)
         || name == "notes"
         || name == "notes/polls/vote"
@@ -460,6 +488,10 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
                 token.as_deref(),
             )
             .await;
+        }
+        // notes-more batch arm
+        if notes_more::handles(name.as_str()) {
+            return notes_more::handle(&state, name.as_str(), &body, token).await;
         }
         // freq-agent arms: users/get-frequently-replied-users slice; the
         // admin/update-meta arm shadows the admin/* arm below for that name.
@@ -925,6 +957,39 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END channels DISPATCH ARM ====
 
+    // ==== chat DISPATCH ARM (chat/rooms/* + chat/messages/* + chat/history) ====
+    // chat-agent: every routed name is requireCredential + POST; method
+    // check, body parsing, token extraction and the credential-declared probe
+    // live here, the endpoint bodies in api::chat (db paths in
+    // mk-db/src/chat.rs). None of the names collide with an earlier arm.
+    if chat::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return chat::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END chat DISPATCH ARM ====
+
     // ==== ul-tl-agent DISPATCH ARM (users/lists/* + notes/user-list-timeline
     // + channels/mute/create) ====
     // Self-contained block on the channels-arm pattern: method check, body
@@ -960,6 +1025,42 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return lists::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END ul-tl-agent DISPATCH ARM ====
+
+    // ==== users-more DISPATCH ARM (users/relation + the rest of
+    // users/lists/* + users/reactions) ====
+    // Self-contained block on the ul-tl-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential split (relation + list writes require, show/
+    // get-memberships/reactions optional) + endpoint bodies in api::users_more
+    // (db paths in mk-db/src/lists.rs + mk-db/src/note.rs). None of the 10
+    // names collide with an earlier arm.
+    if users_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return users_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END users-more DISPATCH ARM ====
 
     // ==== clips-agent DISPATCH ARM (clips/* + users/clips) ====
     // Self-contained block on the channels/ul-tl arm pattern: method check,
@@ -1053,6 +1154,42 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return antennas::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END antennas-v2 DISPATCH ARM ====
+
+    // ==== flash-agent DISPATCH ARM (flash/*) ====
+    // Self-contained block on the clips-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential gates (all but flash/show, flash/featured,
+    // flash/search) + endpoint bodies in api::flash_more (db paths in
+    // mk-db/src/flash.rs). Sits ahead of the arena-fetchres arm, which also
+    // lists flash/create: the full upstream handler below shadows that
+    // beforeAll fixture (same contract, wider params).
+    if flash_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return flash_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END flash-agent DISPATCH ARM ====
 
     // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
     // gallery/posts/create) ====
@@ -6239,7 +6376,6 @@ mod admin;
 /// admin/* catch-all). pause/resume are documented skips (no pause
 /// primitive in mk-queue).
 mod admin_queue;
-
 
 /// `admin/emoji/*` family (admin emoji management). Module file
 /// `api/admin_emoji.rs` owns the endpoint table + handlers, the shared
