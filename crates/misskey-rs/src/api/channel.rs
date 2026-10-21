@@ -35,6 +35,10 @@ pub(crate) const CHANNEL_ENDPOINTS: &[&str] = &[
     "channels/unfollow",
     "channels/favorite",
     "channels/unfavorite",
+    // channels/mute/create is owned by the lists arm (list-TL requisite);
+    // delete/list complete the trio here.
+    "channels/mute/delete",
+    "channels/mute/list",
 ];
 
 pub(crate) fn handles(name: &str) -> bool {
@@ -52,6 +56,8 @@ const REQUIRES_CREDENTIAL: &[&str] = &[
     "channels/unfollow",
     "channels/favorite",
     "channels/unfavorite",
+    "channels/mute/delete",
+    "channels/mute/list",
 ];
 
 fn db_err(context: &str, e: mk_db::sqlx::Error) -> Response {
@@ -152,6 +158,8 @@ pub(crate) async fn handle(
         "channels/featured" => featured(state, pool, me_id.as_deref()).await,
         "channels/show" => show(state, pool, body, me_id.as_deref()).await,
         "channels/timeline" => timeline(state, pool, body, me_id.as_deref()).await,
+        "channels/mute/delete" => mute_delete(pool, body, me_id.as_deref().unwrap()).await,
+        "channels/mute/list" => mute_list(state, pool, me_id.as_deref().unwrap()).await,
         _ => Ok(api_err(ApiError::unknown_endpoint())),
     };
     match result {
@@ -725,6 +733,62 @@ async fn unfavorite(
         .await
         .map_err(|e| db_err("unfavorite", e))?;
     Ok(ok_empty())
+}
+
+// ---------------------------------------------------------------------------
+// channels/mute/{delete,list} — ChannelMutingService
+// ---------------------------------------------------------------------------
+
+/// `POST /api/channels/mute/delete` — NOT_MUTING_CHANNEL when no row.
+async fn mute_delete(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let Some(channel_id) = opt_id(body, "channelId") else {
+        return Err(invalid_param("channelId", "required (misskey:id format)"));
+    };
+    let exists = mk_db::channel::find_channel(pool, channel_id)
+        .await
+        .map_err(|e| db_err("mute_delete find_channel", e))?;
+    if exists.is_none() {
+        return Err(meta_err(
+            "NO_SUCH_CHANNEL",
+            "e7998769-6e94-d9c2-6b8f-94a527314aba",
+            "No such Channel.",
+        ));
+    }
+    // ChannelMutingService.isMuted reads the unfiltered cache (expired rows
+    // still count), matching mk_db::channel::is_muting.
+    if !mk_db::channel::is_muting(pool, me_id, channel_id)
+        .await
+        .map_err(|e| db_err("mute_delete is_muting", e))?
+    {
+        return Err(meta_err(
+            "NOT_MUTING_CHANNEL",
+            "14d55962-6ea8-d990-1333-d6bef78dc2ab",
+            "You are not muting that channel.",
+        ));
+    }
+    mk_db::channel::delete_muting(pool, me_id, channel_id)
+        .await
+        .map_err(|e| db_err("mute_delete delete_muting", e))?;
+    Ok(ok_empty())
+}
+
+/// `POST /api/channels/mute/list` — non-expired muted channels, packed with
+/// me (ChannelEntityService.packMany).
+async fn mute_list(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let rows = mk_db::channel::list_muted(pool, me_id)
+        .await
+        .map_err(|e| db_err("mute_list list_muted", e))?;
+    pack_many(state, pool, &rows, Some(me_id), false)
+        .await
+        .map(ok_json)
 }
 
 // ---------------------------------------------------------------------------

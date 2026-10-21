@@ -580,6 +580,39 @@ pub async fn pinned_notes(
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// channels/mute/* — channel_muting rows (ChannelMutingService)
+// ---------------------------------------------------------------------------
+
+/// `ChannelMutingService.list({ requestUserId })` — the non-expired muted
+/// channels joined to their `channel` rows (expiry filtered at read time,
+/// unlike `is_muting`'s pack flag which mirrors the unfiltered cache).
+pub async fn list_muted(pool: &PgPool, me_id: &str) -> Result<Vec<ChannelRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChannelRow>(&format!(
+        r#"SELECT {JOIN_CHANNEL_COLS} FROM "channel" c
+           INNER JOIN "channel_muting" cm ON cm."channelId" = c."id"
+           WHERE cm."userId" = $1
+             AND (cm."expiresAt" IS NULL OR cm."expiresAt" > now())"#
+    ))
+    .bind(me_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// `ChannelMutingService.unmute` — no-op when not muting.
+pub async fn delete_muting(
+    pool: &PgPool,
+    me_id: &str,
+    channel_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "channel_muting" WHERE "userId" = $1 AND "channelId" = $2"#)
+        .bind(me_id)
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
