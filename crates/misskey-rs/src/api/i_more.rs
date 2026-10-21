@@ -57,19 +57,38 @@ pub(crate) async fn handle(
     };
     let result: Check<Response> = async {
         // requireCredential (upstream meta on all three names).
-        let me_id =
-            super::social::require_checked_user(pool, token.as_deref(), false).await?;
+        let me_id = super::social::require_checked_user(pool, token.as_deref(), false).await?;
         let (limit, since_id, until_id) = paging(body)?;
         match name {
             "i/favorites" => {
-                favorites(pool, &me_id, limit, since_id.as_deref(), until_id.as_deref()).await
+                favorites(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
             }
             "i/gallery/likes" => {
-                gallery_likes(pool, &me_id, limit, since_id.as_deref(), until_id.as_deref())
-                    .await
+                gallery_likes(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
             }
             "i/pages/likes" => {
-                pages_likes(pool, &me_id, limit, since_id.as_deref(), until_id.as_deref()).await
+                pages_likes(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
             }
             _ => Ok(api_err(ApiError::unknown_endpoint())),
         }
@@ -131,9 +150,7 @@ fn limit_param(body: &Value) -> Result<i64, Response> {
 fn opt_id_param(body: &Value, key: &str) -> Result<Option<String>, Response> {
     match body.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s))
-            if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
+        Some(Value::String(s)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
             Ok(Some(s.clone()))
         }
         Some(Value::String(_)) => Err(schema_invalid(key, "must be a misskey:id (alnum)")),

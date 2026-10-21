@@ -16983,12 +16983,7 @@ async fn i_gallery_likes_lists_only_callers_rows() {
         .unwrap();
     }
 
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/i/gallery/likes",
-        json!({ "i": at }),
-    )
-    .await;
+    let (s, body) = post_json(app.clone(), "/api/i/gallery/likes", json!({ "i": at })).await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1, "body: {body}");
@@ -16998,12 +16993,7 @@ async fn i_gallery_likes_lists_only_callers_rows() {
     assert!(arr[0]["createdAt"].is_string());
 
     // other user sees only their own like
-    let (_, b) = post_json(
-        app,
-        "/api/i/gallery/likes",
-        json!({ "i": bob["token"] }),
-    )
-    .await;
+    let (_, b) = post_json(app, "/api/i/gallery/likes", json!({ "i": bob["token"] })).await;
     assert_eq!(b.as_array().unwrap().len(), 1);
     assert_eq!(b[0]["post"]["id"], json!(p2));
 }
