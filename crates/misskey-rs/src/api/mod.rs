@@ -314,6 +314,20 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "charts/users"
         // charts-fed: same guest-ok shape (endpoints/charts/federation.ts)
         || name == "charts/federation"
+        // charts-rest: the remaining site-wide counters + the per-user charts
+        // (endpoints/charts/{active-users,ap-request,drive,hashtag,instance,
+        // network}.ts and endpoints/charts/user/*.ts — all guest-ok, POST)
+        || name == "charts/active-users"
+        || name == "charts/ap-request"
+        || name == "charts/drive"
+        || name == "charts/hashtag"
+        || name == "charts/instance"
+        || name == "charts/network"
+        || name == "charts/user/drive"
+        || name == "charts/user/following"
+        || name == "charts/user/notes"
+        || name == "charts/user/pv"
+        || name == "charts/user/reactions"
         // freq-agent: users/get-frequently-replied-users slice + requisites
         // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
         || name == "users/get-frequently-replied-users"
@@ -466,6 +480,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // (FederationChart.getChart port) in charts_federation below.
         if name == "charts/federation" {
             return charts_federation(&state, &body).await;
+        }
+        // charts-rest: per-user reads. `userId` is required upstream and is
+        // the table's "group" key; the read is mk-db per_user_chart (same
+        // zero-fill + latest-known extrapolation as charts/users).
+        if let Some(kind) = name.strip_prefix("charts/user/") {
+            return charts_user(&state, &body, kind).await;
+        }
+        // charts-rest: the site-wide counters. hashtag keys its rows by {tag}
+        // and instance by {host} (both required upstream); the rest are
+        // global.
+        if matches!(
+            name.as_str(),
+            "charts/active-users"
+                | "charts/ap-request"
+                | "charts/drive"
+                | "charts/hashtag"
+                | "charts/instance"
+                | "charts/network"
+        ) {
+            return charts_site(&state, &body, name.as_str()).await;
         }
         // ff-arena: persist meta."federation" on admin/update-meta BEFORE the
         // note/freq lane arms — those `return` on the name, so an arm placed
@@ -4443,6 +4477,112 @@ async fn charts_federation(state: &AppState, body: &Value) -> Response {
         Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
         Err(e) => {
             tracing::error!(target: "dbg_notes", error = %e, "federation_chart");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// The endpoint-base INVALID_PARAM response the ajv paramDef failures carry
+/// (endpoint-base.ts L63), shared by the charts-rest arms.
+fn chart_invalid() -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        "INVALID_PARAM",
+        "3d81ceae-475f-4600-b2a8-2bc116157532",
+        "Invalid param.",
+    ))
+}
+
+/// The shared chart paramDef: span REQUIRED enum day|hour, limit 1..=500
+/// default 30, offset nullable integer ms (falsy 0 → null).
+fn chart_params(body: &Value) -> Result<(&str, usize, Option<i64>), Response> {
+    let span = match body.get("span").and_then(|v| v.as_str()) {
+        Some(s @ ("day" | "hour")) => s,
+        _ => return Err(chart_invalid()),
+    };
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 30usize,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=500) => n as usize,
+            _ => return Err(chart_invalid()),
+        },
+    };
+    let offset = match body.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(0) => None,
+            Some(ms) => Some(ms),
+            None => return Err(chart_invalid()),
+        },
+    };
+    Ok((span, limit, offset))
+}
+
+/// `POST /api/charts/user/{notes,drive,following,pv,reactions}` — the
+/// per-user chart read (endpoints/charts/user/*.ts). `userId` is required
+/// upstream and picks the table's "group" row; the read is mk-db
+/// per_user_chart.
+async fn charts_user(state: &AppState, body: &Value, kind: &str) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let (span, limit, offset) = match chart_params(body) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let Some(user_id) = body.get("userId").and_then(|v| v.as_str()) else {
+        return chart_invalid();
+    };
+    // upstream file is reactions.ts; the chart kind is per_user_reaction.
+    let kind = if kind == "reactions" {
+        "reaction"
+    } else {
+        kind
+    };
+    match mk_db::charts::per_user_chart(pool, kind, span, limit, offset, user_id).await {
+        Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "per_user_chart");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// `POST /api/charts/{active-users,ap-request,drive,hashtag,instance,network}`
+/// — the site-wide counters. `hashtag` keys its rows by {tag}, `instance` by
+/// {host}; both are required upstream. The reads mirror the 0001 columns as
+/// nested arrays (underscores nest: `local_incCount` → local.incCount).
+async fn charts_site(state: &AppState, body: &Value, name: &str) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let (span, limit, offset) = match chart_params(body) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let read = match name {
+        "charts/active-users" => mk_db::charts::active_users_chart(pool, span, limit, offset).await,
+        "charts/ap-request" => mk_db::charts::ap_request_chart(pool, span, limit, offset).await,
+        "charts/drive" => mk_db::charts::drive_chart(pool, span, limit, offset).await,
+        "charts/hashtag" => {
+            let Some(tag) = body.get("tag").and_then(|v| v.as_str()) else {
+                return chart_invalid();
+            };
+            mk_db::charts::hashtag_chart(pool, span, limit, offset, tag).await
+        }
+        "charts/instance" => {
+            let Some(host) = body.get("host").and_then(|v| v.as_str()) else {
+                return chart_invalid();
+            };
+            mk_db::charts::instance_chart(pool, span, limit, offset, host).await
+        }
+        _ => mk_db::charts::network_chart(pool, span, limit, offset).await,
+    };
+    match read {
+        Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "site chart");
             api_err(ApiError::internal_error())
         }
     }

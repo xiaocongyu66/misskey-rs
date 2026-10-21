@@ -16,7 +16,7 @@
 //! the flat `local.total` keys nest into `{local: {total: [...]}, ...}` the
 //! way `nestedProperty.set` does for the endpoint response.
 
-use sqlx::PgPool;
+use sqlx::{Column, PgPool, Row, TypeInfo};
 
 /// Epoch second normalized to the span bucket (`Chart.dateToTimestamp`).
 pub fn bucket(span: &str, at_ms: i64) -> i64 {
@@ -520,4 +520,445 @@ pub async fn federation_chart(
         );
     }
     Ok(serde_json::Value::Object(out))
+}
+
+// ==== shared grouped-chart plumbing ====
+//
+// Every chart table in the 0001 baseline stores one row per (date[, group])
+// with flat `___`-prefixed counter columns. The read walks the same slot
+// window as [`notes_chart`], zero-fills, extrapolates the latest known row
+// over leading empty slots, and nests each column by splitting its name on
+// `_` (`___local_incCount` → local.incCount, `___diffs_withFile` →
+// diffs.withFile). `unique_temp___*` columns are the unique-count scratch
+// arrays and are never part of the response.
+
+/// Chart span step in seconds.
+fn span_step(span: &str) -> i64 {
+    match span {
+        "hour" => 3600,
+        _ => 86_400,
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// One row's non-unique `___` counters as (column base, value) pairs.
+/// Decodes INT2 (smallint) as i16 — the baseline mixes INT2/INT4 columns.
+async fn flat_counts(
+    pool: &PgPool,
+    table: &str,
+    date: i64,
+    group: Option<&str>,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let sql = match group {
+        Some(_) => format!(r#"SELECT * FROM "{table}" WHERE "date" = $1 AND "group" = $2"#),
+        None => format!(r#"SELECT * FROM "{table}" WHERE "date" = $1"#),
+    };
+    let mut q = sqlx::query(&sql).bind(date as i32);
+    if let Some(group) = group {
+        q = q.bind(group);
+    }
+    let Some(row) = q.fetch_optional(pool).await? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (idx, col) in row.columns().iter().enumerate() {
+        // id/date/group and unique_temp___* all fail the `___` prefix strip.
+        let Some(key) = col.name().strip_prefix("___") else {
+            continue;
+        };
+        let value = match col.type_info().name() {
+            "INT2" => row.try_get::<i16, _>(idx)? as i64,
+            "INT8" => row.try_get::<i64, _>(idx)?,
+            _ => row.try_get::<i32, _>(idx)? as i64,
+        };
+        out.push((key.to_string(), value));
+    }
+    Ok(out)
+}
+
+/// Insert a leaf value at its nested path (`["local", "incCount"]`).
+fn insert_nested(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[&str],
+    value: serde_json::Value,
+) {
+    if path.len() == 1 {
+        map.insert(path[0].to_string(), value);
+        return;
+    }
+    let entry = map
+        .entry(path[0].to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(child) = entry {
+        insert_nested(child, &path[1..], value);
+    }
+}
+
+/// Transpose per-slot counters into the endpoint's nested arrays. Every key
+/// gets an array of exactly `slots.len()` entries (missing → 0).
+fn chart_object(keys: &[&str], slots: &[Vec<(String, i64)>]) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    for key in keys {
+        let arr: Vec<i64> = slots
+            .iter()
+            .map(|slot| {
+                slot.iter()
+                    .find(|(k, _)| k.as_str() == *key)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let path: Vec<&str> = key.split('_').collect();
+        insert_nested(&mut root, &path, serde_json::json!(arr));
+    }
+    serde_json::Value::Object(root)
+}
+
+/// Latest-known extrapolation over leading empty slots (upstream getChart's
+/// "fetch the latest log" step), matching [`users_chart`].
+fn extrapolate(slots: &mut [Vec<(String, i64)>]) {
+    let known = slots
+        .iter()
+        .rposition(|slot| slot.iter().any(|(_, v)| *v != 0));
+    if let Some(last_known) = known {
+        let base = slots[slots.len() - 1 - last_known].clone();
+        let cut = slots.len() - 1 - last_known;
+        for slot in slots.iter_mut().take(cut) {
+            *slot = base.clone();
+        }
+    }
+}
+
+/// `getChart` over one grouped table: `limit` slots ending at `until_ms`
+/// (now when null), oldest→newest, zero-filled + extrapolated, nested.
+async fn grouped_chart(
+    pool: &PgPool,
+    table: &str,
+    keys: &[&str],
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+    group: Option<&str>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let step = span_step(span);
+    let end = bucket(span, until_ms.unwrap_or_else(now_ms));
+    let mut slots: Vec<Vec<(String, i64)>> = Vec::with_capacity(limit);
+    for k in (0..limit as i64).rev() {
+        let date = end - k * step;
+        slots.push(flat_counts(pool, table, date, group).await?);
+    }
+    extrapolate(&mut slots);
+    Ok(chart_object(keys, &slots))
+}
+
+// ==== per-user charts (upstream `core/chart/charts/per-user-*.ts`) ====
+
+/// `__chart[_day]__per_user_{kind}` (0001:570+). `kind` is one of notes,
+/// drive, following, pv, reaction; every table keys rows by (date, "group")
+/// where "group" carries the userId.
+fn per_user_table(kind: &str, span: &str) -> String {
+    let prefix = if span == "hour" {
+        "__chart"
+    } else {
+        "__chart_day"
+    };
+    format!("{prefix}__per_user_{kind}")
+}
+
+/// The non-unique counter columns of each per-user table (0001:570-754).
+fn per_user_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "notes" => &[
+            "total",
+            "inc",
+            "dec",
+            "diffs_normal",
+            "diffs_reply",
+            "diffs_renote",
+            "diffs_withFile",
+        ],
+        "drive" => &[
+            "totalCount",
+            "totalSize",
+            "incCount",
+            "incSize",
+            "decCount",
+            "decSize",
+        ],
+        "following" => &[
+            "local_followings_total",
+            "local_followings_inc",
+            "local_followings_dec",
+            "local_followers_total",
+            "local_followers_inc",
+            "local_followers_dec",
+            "remote_followings_total",
+            "remote_followings_inc",
+            "remote_followings_dec",
+            "remote_followers_total",
+            "remote_followers_inc",
+            "remote_followers_dec",
+        ],
+        "pv" => &["upv_user", "pv_user", "upv_visitor", "pv_visitor"],
+        "reaction" => &["local_count", "remote_count"],
+        _ => &[],
+    }
+}
+
+/// Per-user chart commit — one UPSERT per (date, userId) adding `deltas`.
+/// `deltas` carries only the counters this event moves.
+pub async fn update_per_user(
+    pool: &PgPool,
+    kind: &str,
+    span: &str,
+    date: i64,
+    user_id: &str,
+    deltas: &[(&str, i32)],
+) -> Result<(), sqlx::Error> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+    let table = per_user_table(kind, span);
+    let mut cols = String::new();
+    let mut placeholders = String::new();
+    let mut sets = String::new();
+    for (n, (col, _)) in deltas.iter().enumerate() {
+        cols.push_str(&format!(", \"___{col}\""));
+        placeholders.push_str(&format!(", ${}", n + 3));
+        sets.push_str(&format!(
+            ", \"___{col}\" = \"{table}\".\"___{col}\" + EXCLUDED.\"___{col}\""
+        ));
+    }
+    let sql = format!(
+        "INSERT INTO \"{table}\" (\"date\", \"group\"{cols}) VALUES ($1, $2{placeholders}) \
+         ON CONFLICT (\"date\", \"group\") DO UPDATE SET {sets}"
+    );
+    let mut q = sqlx::query(&sql).bind(date as i32).bind(user_id);
+    for (_, delta) in deltas {
+        q = q.bind(*delta);
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
+/// `getChart` for a per-user chart — the `group` row for `user_id`, same
+/// slot walk/extrapolation as [`users_chart`].
+pub async fn per_user_chart(
+    pool: &PgPool,
+    kind: &str,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+    user_id: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let table = per_user_table(kind, span);
+    grouped_chart(
+        pool,
+        &table,
+        per_user_keys(kind),
+        span,
+        limit,
+        until_ms,
+        Some(user_id),
+    )
+    .await
+}
+
+// ==== remaining site-wide charts (upstream `core/chart/charts/*.ts`) ====
+
+/// `__chart[_day]__{kind}` for the ungrouped site-wide tables.
+fn site_table(kind: &str, span: &str) -> String {
+    let prefix = if span == "hour" {
+        "__chart"
+    } else {
+        "__chart_day"
+    };
+    format!("{prefix}__{kind}")
+}
+
+/// The non-unique counter columns of each site-wide table (0001:242-522).
+fn site_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "active_users" => &[
+            "registeredWithinWeek",
+            "registeredWithinMonth",
+            "registeredWithinYear",
+            "registeredOutsideWeek",
+            "registeredOutsideMonth",
+            "registeredOutsideYear",
+            "readWrite",
+            "read",
+            "write",
+        ],
+        "ap_request" => &["deliverFailed", "deliverSucceeded", "inboxReceived"],
+        "drive" => &[
+            "local_incCount",
+            "local_incSize",
+            "local_decCount",
+            "local_decSize",
+            "remote_incCount",
+            "remote_incSize",
+            "remote_decCount",
+            "remote_decSize",
+        ],
+        "hashtag" => &["local_users", "remote_users"],
+        "instance" => &[
+            "requests_failed",
+            "requests_succeeded",
+            "requests_received",
+            "notes_total",
+            "notes_inc",
+            "notes_dec",
+            "notes_diffs_normal",
+            "notes_diffs_reply",
+            "notes_diffs_renote",
+            "users_total",
+            "users_inc",
+            "users_dec",
+            "following_total",
+            "following_inc",
+            "following_dec",
+            "followers_total",
+            "followers_inc",
+            "followers_dec",
+            "drive_totalFiles",
+            "drive_incFiles",
+            "drive_incUsage",
+            "drive_decFiles",
+            "drive_decUsage",
+            "notes_diffs_withFile",
+        ],
+        "network" => &[
+            "incomingRequests",
+            "outgoingRequests",
+            "totalTime",
+            "incomingBytes",
+            "outgoingBytes",
+        ],
+        _ => &[],
+    }
+}
+
+/// `charts/active-users` — flat `registeredWithin*`/`readWrite`/`read`/`write`.
+pub async fn active_users_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("active_users", span),
+        site_keys("active_users"),
+        span,
+        limit,
+        until_ms,
+        None,
+    )
+    .await
+}
+
+/// `charts/ap-request` — flat deliver/inbox counters.
+pub async fn ap_request_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("ap_request", span),
+        site_keys("ap_request"),
+        span,
+        limit,
+        until_ms,
+        None,
+    )
+    .await
+}
+
+/// `charts/drive` — `local`/`remote` inc/dec count+size.
+pub async fn drive_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("drive", span),
+        site_keys("drive"),
+        span,
+        limit,
+        until_ms,
+        None,
+    )
+    .await
+}
+
+/// `charts/hashtag` — `local`/`remote` user counts for one tag ("group").
+pub async fn hashtag_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+    tag: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("hashtag", span),
+        site_keys("hashtag"),
+        span,
+        limit,
+        until_ms,
+        Some(tag),
+    )
+    .await
+}
+
+/// `charts/instance` — the per-host request/note/user/follow/drive counters
+/// for one host ("group"). Requests are fed by the AP transport upstream;
+/// this lane only ships the read side.
+pub async fn instance_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+    host: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("instance", span),
+        site_keys("instance"),
+        span,
+        limit,
+        until_ms,
+        Some(host),
+    )
+    .await
+}
+
+/// `charts/network` — flat request/byte/time counters.
+pub async fn network_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    grouped_chart(
+        pool,
+        &site_table("network", span),
+        site_keys("network"),
+        span,
+        limit,
+        until_ms,
+        None,
+    )
+    .await
 }

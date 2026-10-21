@@ -15900,3 +15900,443 @@ async fn push_fanout_mention_reply_renote_reaction_invokes_send() {
         );
     }
 }
+
+// ===== charts-rest: per-user + site-wide charts =====
+
+/// Walk a nested chart object (`chart["diffs"]["normal"]`).
+fn chart_at<'a>(chart: &'a Value, path: &[&str]) -> &'a Value {
+    let mut v = chart;
+    for key in path {
+        v = &v[*key];
+    }
+    v
+}
+
+fn chart_len(chart: &Value, path: &[&str]) -> Option<usize> {
+    chart_at(chart, path).as_array().map(Vec::len)
+}
+
+fn chart_last(chart: &Value, path: &[&str]) -> Value {
+    chart_at(chart, path)
+        .as_array()
+        .and_then(|a| a.last().cloned())
+        .unwrap()
+}
+
+// the five charts/user/* reads: arrays of len=limit, and a direct
+// update_per_user commit lands in the newest bucket (hour + day twins).
+#[tokio::test]
+async fn charts_user_shape_and_update_commits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_charts_user").await;
+    let user_id = mk_types::id::gen_aid_now();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for span in ["hour", "day"] {
+        let date = mk_db::charts::bucket(span, now);
+        for (kind, deltas) in [
+            ("notes", vec![("total", 1), ("inc", 1), ("diffs_normal", 1)]),
+            (
+                "drive",
+                vec![
+                    ("totalCount", 1),
+                    ("totalSize", 10),
+                    ("incCount", 1),
+                    ("incSize", 10),
+                ],
+            ),
+            (
+                "following",
+                vec![("local_followings_total", 1), ("local_followings_inc", 1)],
+            ),
+            ("pv", vec![("upv_user", 1), ("pv_user", 1)]),
+            ("reaction", vec![("local_count", 1)]),
+        ] {
+            mk_db::charts::update_per_user(&pool, kind, span, date, &user_id, &deltas)
+                .await
+                .unwrap();
+        }
+    }
+
+    for (span, limit) in [("hour", 4usize), ("day", 3)] {
+        let app = crate::build_router(test_state(pool.clone()));
+
+        // notes: total/inc/dec + diffs.{normal,reply,renote,withFile}
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/user/notes",
+            json!({ "span": span, "limit": limit, "userId": user_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for path in [
+            &["total"][..],
+            &["inc"][..],
+            &["dec"][..],
+            &["diffs", "normal"][..],
+            &["diffs", "reply"][..],
+            &["diffs", "renote"][..],
+            &["diffs", "withFile"][..],
+        ] {
+            assert_eq!(
+                chart_len(&chart, path),
+                Some(limit),
+                "{span} notes {path:?}: {chart}"
+            );
+        }
+        assert_eq!(
+            chart_last(&chart, &["total"]),
+            json!(1),
+            "{span} notes total: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["diffs", "normal"]),
+            json!(1),
+            "{span} notes normal: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["diffs", "renote"]),
+            json!(0),
+            "{span} notes renote: {chart}"
+        );
+
+        // drive: totals + inc/dec count/size (all flat)
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/user/drive",
+            json!({ "span": span, "limit": limit, "userId": user_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for key in [
+            "totalCount",
+            "totalSize",
+            "incCount",
+            "incSize",
+            "decCount",
+            "decSize",
+        ] {
+            assert_eq!(
+                chart_len(&chart, &[key]),
+                Some(limit),
+                "{span} drive {key}: {chart}"
+            );
+        }
+        assert_eq!(
+            chart_last(&chart, &["totalCount"]),
+            json!(1),
+            "{span} drive totalCount: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["totalSize"]),
+            json!(10),
+            "{span} drive totalSize: {chart}"
+        );
+
+        // following: local/remote × followings/followers × total/inc/dec
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/user/following",
+            json!({ "span": span, "limit": limit, "userId": user_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for side in ["local", "remote"] {
+            for edge in ["followings", "followers"] {
+                for key in ["total", "inc", "dec"] {
+                    assert_eq!(
+                        chart_len(&chart, &[side, edge, key]),
+                        Some(limit),
+                        "{span} following {side}.{edge}.{key}: {chart}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            chart_last(&chart, &["local", "followings", "total"]),
+            json!(1),
+            "{span} following local total: {chart}"
+        );
+
+        // pv: upv/pv × user/visitor
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/user/pv",
+            json!({ "span": span, "limit": limit, "userId": user_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for kind in ["upv", "pv"] {
+            for who in ["user", "visitor"] {
+                assert_eq!(
+                    chart_len(&chart, &[kind, who]),
+                    Some(limit),
+                    "{span} pv {kind}.{who}: {chart}"
+                );
+            }
+        }
+        assert_eq!(
+            chart_last(&chart, &["upv", "user"]),
+            json!(1),
+            "{span} pv upv.user: {chart}"
+        );
+
+        // reactions: local/remote × count
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/user/reactions",
+            json!({ "span": span, "limit": limit, "userId": user_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for side in ["local", "remote"] {
+            assert_eq!(
+                chart_len(&chart, &[side, "count"]),
+                Some(limit),
+                "{span} reactions {side}.count: {chart}"
+            );
+        }
+        assert_eq!(
+            chart_last(&chart, &["local", "count"]),
+            json!(1),
+            "{span} reactions local.count: {chart}"
+        );
+
+        // userId is required upstream → INVALID_PARAM
+        let (s, e) = post_json(
+            app.clone(),
+            "/api/charts/user/notes",
+            json!({ "span": span }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{span} body: {e}");
+        assert_eq!(e["error"]["code"], "INVALID_PARAM", "{span} body: {e}");
+    }
+}
+
+// the remaining site-wide reads: shapes for all six; instance + hashtag also
+// get a direct row (their AP/hashtag drivers are not wired in this lane).
+#[tokio::test]
+async fn charts_site_shape_and_instance_update_commits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_charts_site").await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    for span in ["hour", "day"] {
+        let date = mk_db::charts::bucket(span, now);
+        let table = if span == "hour" {
+            "__chart__instance"
+        } else {
+            "__chart_day__instance"
+        };
+        mk_db::sqlx::query(&format!(
+            r#"INSERT INTO "{table}"
+               ("date", "group", "___requests_failed", "___requests_succeeded",
+                "___notes_total", "___notes_inc", "___notes_diffs_withFile",
+                "___users_total", "___following_total", "___drive_totalFiles")
+               VALUES ($1, $2, 2, 5, 3, 1, 1, 4, 6, 7)"#
+        ))
+        .bind(date as i32)
+        .bind("remote.example")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let table = if span == "hour" {
+            "__chart__hashtag"
+        } else {
+            "__chart_day__hashtag"
+        };
+        mk_db::sqlx::query(&format!(
+            r#"INSERT INTO "{table}" ("date", "group", "___local_users", "___remote_users")
+               VALUES ($1, $2, 2, 3)"#
+        ))
+        .bind(date as i32)
+        .bind("tag1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for (span, limit) in [("hour", 4usize), ("day", 3)] {
+        let app = crate::build_router(test_state(pool.clone()));
+
+        // active-users: nine flat counters
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/active-users",
+            json!({ "span": span, "limit": limit }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for key in [
+            "registeredWithinWeek",
+            "registeredWithinMonth",
+            "registeredWithinYear",
+            "registeredOutsideWeek",
+            "registeredOutsideMonth",
+            "registeredOutsideYear",
+            "readWrite",
+            "read",
+            "write",
+        ] {
+            assert_eq!(
+                chart_len(&chart, &[key]),
+                Some(limit),
+                "{span} active-users {key}: {chart}"
+            );
+        }
+
+        // ap-request: three flat counters
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/ap-request",
+            json!({ "span": span, "limit": limit }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for key in ["deliverFailed", "deliverSucceeded", "inboxReceived"] {
+            assert_eq!(
+                chart_len(&chart, &[key]),
+                Some(limit),
+                "{span} ap-request {key}: {chart}"
+            );
+        }
+
+        // drive: local/remote × inc/dec count/size
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/drive",
+            json!({ "span": span, "limit": limit }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for side in ["local", "remote"] {
+            for key in ["incCount", "incSize", "decCount", "decSize"] {
+                assert_eq!(
+                    chart_len(&chart, &[side, key]),
+                    Some(limit),
+                    "{span} drive {side}.{key}: {chart}"
+                );
+            }
+        }
+
+        // hashtag: local/remote user counts for {tag}
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/hashtag",
+            json!({ "span": span, "limit": limit, "tag": "tag1" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for side in ["local", "remote"] {
+            assert_eq!(
+                chart_len(&chart, &[side, "users"]),
+                Some(limit),
+                "{span} hashtag {side}.users: {chart}"
+            );
+        }
+        assert_eq!(
+            chart_last(&chart, &["local", "users"]),
+            json!(2),
+            "{span} hashtag local.users: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["remote", "users"]),
+            json!(3),
+            "{span} hashtag remote.users: {chart}"
+        );
+
+        // instance: requests/notes/users/following/followers/drive for {host}
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/instance",
+            json!({ "span": span, "limit": limit, "host": "remote.example" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for path in [
+            &["requests", "failed"][..],
+            &["requests", "succeeded"][..],
+            &["requests", "received"][..],
+            &["notes", "total"][..],
+            &["notes", "inc"][..],
+            &["notes", "dec"][..],
+            &["notes", "diffs", "normal"][..],
+            &["notes", "diffs", "reply"][..],
+            &["notes", "diffs", "renote"][..],
+            &["notes", "diffs", "withFile"][..],
+            &["users", "total"][..],
+            &["users", "inc"][..],
+            &["users", "dec"][..],
+            &["following", "total"][..],
+            &["followers", "total"][..],
+            &["drive", "totalFiles"][..],
+            &["drive", "incFiles"][..],
+            &["drive", "incUsage"][..],
+            &["drive", "decFiles"][..],
+            &["drive", "decUsage"][..],
+        ] {
+            assert_eq!(
+                chart_len(&chart, path),
+                Some(limit),
+                "{span} instance {path:?}: {chart}"
+            );
+        }
+        assert_eq!(
+            chart_last(&chart, &["requests", "succeeded"]),
+            json!(5),
+            "{span} instance requests.succeeded: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["notes", "diffs", "withFile"]),
+            json!(1),
+            "{span} instance notes.diffs.withFile: {chart}"
+        );
+        assert_eq!(
+            chart_last(&chart, &["drive", "totalFiles"]),
+            json!(7),
+            "{span} instance drive.totalFiles: {chart}"
+        );
+
+        // network: five flat counters
+        let (s, chart) = post_json(
+            app.clone(),
+            "/api/charts/network",
+            json!({ "span": span, "limit": limit }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for key in [
+            "incomingRequests",
+            "outgoingRequests",
+            "totalTime",
+            "incomingBytes",
+            "outgoingBytes",
+        ] {
+            assert_eq!(
+                chart_len(&chart, &[key]),
+                Some(limit),
+                "{span} network {key}: {chart}"
+            );
+        }
+
+        // tag/host are required upstream → INVALID_PARAM
+        let (s, e) = post_json(app.clone(), "/api/charts/hashtag", json!({ "span": span })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{span} body: {e}");
+        assert_eq!(e["error"]["code"], "INVALID_PARAM", "{span} body: {e}");
+        let (s, e) = post_json(app.clone(), "/api/charts/instance", json!({ "span": span })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{span} body: {e}");
+        assert_eq!(e["error"]["code"], "INVALID_PARAM", "{span} body: {e}");
+    }
+}
