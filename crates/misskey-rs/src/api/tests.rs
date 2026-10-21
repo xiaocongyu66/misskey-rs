@@ -18285,3 +18285,586 @@ async fn users_lists_more_create_push_show_membership_update_pull_delete() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("NO_SUCH_LIST"));
 }
+
+// ---------------------------------------------------------------------------
+// channels/mute/{delete,list} — the remaining channels/* trio members
+// (channels/mute/create rides the lists arm; upstream ChannelMutingService).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn channels_mute_delete_list_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkchannels_mute").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, _) = channels_signup(app.clone(), "alice").await;
+    let (s, ch) = post_json(
+        app.clone(),
+        "/api/channels/create",
+        json!({ "name": "mute-channel", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ch}");
+    let channel_id = ch["id"].as_str().unwrap().to_string();
+
+    // mute/create → list shows the channel with the me flags
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/mute/create",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/channels/mute/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "list: {list:?}");
+    assert_eq!(list[0]["id"], json!(channel_id));
+    assert_eq!(list[0]["isMuting"], json!(true));
+
+    // delete → 204, list empty; a second delete is NOT_MUTING_CHANNEL
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/channels/mute/delete",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/channels/mute/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert_eq!(list.as_array().unwrap().len(), 0);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/channels/mute/delete",
+        json!({ "channelId": channel_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NOT_MUTING_CHANNEL"));
+
+    // unknown channel → NO_SUCH_CHANNEL
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/channels/mute/delete",
+        json!({ "channelId": "x".repeat(32), "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_CHANNEL"));
+}
+
+// ---------------------------------------------------------------------------
+// clips/remove-note — create → add-note → show → remove (ClipService)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn clips_remove_note_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkclips_remove_note").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, _) = channels_signup(app.clone(), "alice").await;
+    let (s, clip) = post_json(
+        app.clone(),
+        "/api/clips/create",
+        json!({ "name": "remove-test", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {clip}");
+    let clip_id = clip["id"].as_str().unwrap().to_string();
+    let (s, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "remove me", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {note}");
+    let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/clips/add-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, notes) = post_json(
+        app.clone(),
+        "/api/clips/notes",
+        json!({ "clipId": clip_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {notes}");
+    assert_eq!(notes.as_array().unwrap().len(), 1, "notes: {notes}");
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/clips/remove-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, notes) = post_json(
+        app.clone(),
+        "/api/clips/notes",
+        json!({ "clipId": clip_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {notes}");
+    assert_eq!(notes.as_array().unwrap().len(), 0, "notes: {notes}");
+
+    // removing again → NO_SUCH_NOTE
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/clips/remove-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_NOTE"));
+}
+
+// ---------------------------------------------------------------------------
+// flash/* — create → like → list (upstream FlashService + entity packs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn flash_arena_crud_like_list() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkflash_arena").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
+    let (b_token, _) = channels_signup(app.clone(), "bobby").await;
+
+    // create (title/summary/script/permissions required; visibility defaults
+    // public; upstream packs without me → no isLiked key)
+    let (s, flash) = post_json(
+        app.clone(),
+        "/api/flash/create",
+        json!({
+            "title": "test play",
+            "summary": "summary",
+            "script": "console.log('hi');",
+            "permissions": [],
+            "i": a_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {flash}");
+    assert_eq!(flash["title"], json!("test play"));
+    assert_eq!(flash["visibility"], json!("public"));
+    assert_eq!(flash["likedCount"], json!(0));
+    assert_eq!(flash["userId"], json!(a_id));
+    assert!(flash.get("isLiked").is_none(), "create pack: {flash}");
+    let flash_id = flash["id"].as_str().unwrap().to_string();
+
+    // show guest → no isLiked; show with bob → isLiked false
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["isLiked"], json!(false));
+
+    // owner cannot like their own flash
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/like",
+        json!({ "flashId": flash_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("YOUR_FLASH"));
+
+    // bob likes → 204; duplicate → ALREADY_LIKED
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/flash/like",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/like",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_LIKED"));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(1));
+    assert_eq!(shown["isLiked"], json!(true));
+
+    // flash/my (owner, no isLiked) + flash/my-likes (bob, {id, flash})
+    let (s, mine) = post_json(app.clone(), "/api/flash/my", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    let mine = mine.as_array().unwrap();
+    assert_eq!(mine.len(), 1, "my: {mine:?}");
+    assert_eq!(mine[0]["id"], json!(flash_id));
+    assert!(mine[0].get("isLiked").is_none(), "my pack: {}", mine[0]);
+    let (s, likes) = post_json(app.clone(), "/api/flash/my-likes", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {likes}");
+    let likes = likes.as_array().unwrap();
+    assert_eq!(likes.len(), 1, "my-likes: {likes:?}");
+    assert!(likes[0]["id"].is_string());
+    assert_eq!(likes[0]["flash"]["id"], json!(flash_id));
+    assert_eq!(likes[0]["flash"]["isLiked"], json!(true));
+
+    // featured + search only surface public liked flashes
+    let (s, featured) = post_json(app.clone(), "/api/flash/featured", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {featured}");
+    let featured = featured.as_array().unwrap();
+    assert_eq!(featured.len(), 1, "featured: {featured:?}");
+    assert_eq!(featured[0]["id"], json!(flash_id));
+    let (s, found) = post_json(app.clone(), "/api/flash/search", json!({ "query": "test" })).await;
+    assert_eq!(s, StatusCode::OK, "body: {found}");
+    let found = found.as_array().unwrap();
+    assert_eq!(found.len(), 1, "search: {found:?}");
+    assert_eq!(found[0]["id"], json!(flash_id));
+
+    // update is owner-only and returns 204
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/update",
+        json!({ "flashId": flash_id, "title": "nope", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/flash/update",
+        json!({ "flashId": flash_id, "title": "renamed", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["title"], json!("renamed"));
+
+    // unlike → 204; a second unlike → NOT_LIKED; count back to 0
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/flash/unlike",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/unlike",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NOT_LIKED"));
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(0));
+
+    // non-owner delete → ACCESS_DENIED; owner delete → 204; show → NO_SUCH_FLASH
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/delete",
+        json!({ "flashId": flash_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/flash/delete",
+        json!({ "flashId": flash_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/flash/show",
+        json!({ "flashId": flash_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FLASH"));
+}
+
+// ===== chat: messages =====================================================
+//
+// upstream endpoints/chat/messages/{create-to-room,create-to-user,
+// room-timeline,show,delete}.ts + chat/history.ts. Room sends/reads are
+// member-only; history packs detailed messages with isRead (no Redis marker
+// store here); direct messages pass the chatScope mutual gate.
+
+#[tokio::test]
+async fn chat_room_and_direct_messages() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_messages").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("cma")).await;
+    let bob = signup(&app, &uname("cmb")).await;
+    let carol = signup(&app, &uname("cmc")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+    let ct = carol["token"].as_str().unwrap();
+
+    // room + invitation + join
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "msgroom", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/create",
+        json!({ "roomId": room_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/join",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // -- create-to-room: ChatMessageLiteForRoom ---------------------------
+    let (s, msg) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-room",
+        json!({ "toRoomId": room_id, "text": "hello room", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {msg}");
+    assert_eq!(msg["text"], json!("hello room"));
+    assert_eq!(msg["fromUserId"], json!(b));
+    assert_eq!(msg["fromUser"]["id"], json!(b));
+    assert_eq!(msg["toRoomId"], json!(room_id));
+    assert_eq!(msg["reactions"], json!([]));
+    assert!(msg["createdAt"].as_str().is_some());
+    let msg_id = msg["id"].as_str().unwrap().to_string();
+
+    // content required
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-room",
+        json!({ "toRoomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("CONTENT_REQUIRED"));
+
+    // non-member cannot send or read
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-room",
+        json!({ "toRoomId": room_id, "text": "nope", "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/room-timeline",
+        json!({ "roomId": room_id, "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+
+    // -- room-timeline for a member ---------------------------------------
+    let (s, tl) = post_json(
+        app.clone(),
+        "/api/chat/messages/room-timeline",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {tl}");
+    let tl = tl.as_array().unwrap();
+    assert_eq!(tl.len(), 1);
+    assert_eq!(tl[0]["id"], json!(msg_id));
+    assert_eq!(tl[0]["text"], json!("hello room"));
+
+    // -- show: sender only (no room-member fallback upstream) -------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/show",
+        json!({ "messageId": msg_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["toRoomId"], json!(room_id));
+    assert_eq!(v["fromUser"]["id"], json!(b));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/show",
+        json!({ "messageId": msg_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_MESSAGE"));
+
+    // -- room history: one room row ---------------------------------------
+    let (s, h) = post_json(
+        app.clone(),
+        "/api/chat/history",
+        json!({ "room": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {h}");
+    let h = h.as_array().unwrap();
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0]["id"], json!(msg_id));
+    assert_eq!(h[0]["isRead"], json!(true));
+
+    // -- delete (sender) --------------------------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/delete",
+        json!({ "messageId": msg_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, tl) = post_json(
+        app.clone(),
+        "/api/chat/messages/room-timeline",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {tl}");
+    assert_eq!(tl, json!([]));
+
+    // -- direct: mutual follow opens the default chatScope 'mutual' gate --
+    for (tok, uid) in [(at, b), (bt, a)] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/following/create",
+            json!({ "userId": uid, "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+    let (s, dm) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-user",
+        json!({ "toUserId": b, "text": "hi bob", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {dm}");
+    assert_eq!(dm["text"], json!("hi bob"));
+    assert_eq!(dm["fromUserId"], json!(a));
+    assert_eq!(dm["toUserId"], json!(b));
+    assert_eq!(dm["reactions"], json!([]));
+    let dm_id = dm["id"].as_str().unwrap().to_string();
+
+    // self-send rejected
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-user",
+        json!({ "toUserId": a, "text": "me", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("RECIPIENT_IS_YOURSELF"));
+
+    // -- direct history (both sides see the row) --------------------------
+    let (s, h) = post_json(app.clone(), "/api/chat/history", json!({ "i": bt })).await;
+    assert_eq!(s, StatusCode::OK, "body: {h}");
+    let h = h.as_array().unwrap();
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0]["id"], json!(dm_id));
+    assert_eq!(h[0]["fromUser"]["id"], json!(a));
+    assert_eq!(h[0]["toUser"]["id"], json!(b));
+    assert_eq!(h[0]["isRead"], json!(true));
+
+    // -- show: recipient may read the direct message ----------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/show",
+        json!({ "messageId": dm_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["toUser"]["id"], json!(b));
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/show",
+        json!({ "messageId": dm_id, "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_MESSAGE"));
+
+    // -- delete direct + history empties ----------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/delete",
+        json!({ "messageId": dm_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, h) = post_json(app.clone(), "/api/chat/history", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {h}");
+    assert_eq!(h, json!([]));
+}

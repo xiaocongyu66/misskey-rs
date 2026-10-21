@@ -426,6 +426,12 @@ pub(crate) async fn handle(
         "chat/rooms/invitations/create" => invitations_create(state, pool, body, &me_id).await,
         "chat/rooms/invitations/ignore" => invitations_ignore(pool, body, &me_id).await,
         "chat/rooms/invitations/inbox" => invitations_inbox(state, pool, body, &me_id).await,
+        "chat/messages/create-to-user" => messages_create_to_user(state, pool, body, &me_id).await,
+        "chat/messages/create-to-room" => messages_create_to_room(state, pool, body, &me_id).await,
+        "chat/messages/room-timeline" => messages_room_timeline(state, pool, body, &me_id).await,
+        "chat/messages/show" => messages_show(state, pool, body, &me_id).await,
+        "chat/messages/delete" => messages_delete(pool, body, &me_id).await,
+        "chat/history" => chat_history(state, pool, body, &me_id).await,
         _ => Ok(api_err(ApiError::unknown_endpoint())),
     };
     match result {
@@ -752,6 +758,306 @@ async fn invitations_inbox(
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         out.push(pack_invitation(state, pool, row, me_id).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
+}
+
+// ==== messages =============================================================
+
+/// `text` paramDef: nullable string maxLength 2000 (absent/null → None).
+fn text_param(body: &Value) -> Result<Option<&str>, Response> {
+    match body.get("text") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            if s.chars().count() > 2000 {
+                Err(invalid_param("text", "too long"))
+            } else {
+                Ok(Some(s.as_str()))
+            }
+        }
+        Some(_) => Err(invalid_param("text", "expected a string")),
+    }
+}
+
+/// `driveFilesRepository.findOneBy({ id, userId: me.id })` for `fileId`.
+async fn checked_file(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+    no_such_file_id: &str,
+) -> Result<Option<String>, Response> {
+    let Some(file_id) = opt_str(body, "fileId") else {
+        return Ok(None);
+    };
+    let file = mk_db::drive::find_drive_file(pool, file_id)
+        .await
+        .map_err(|e| db_err("checked_file", e))?;
+    match file {
+        Some(row) if row.user_id.as_deref() == Some(me_id) => Ok(Some(file_id.to_string())),
+        _ => Err(meta_err("NO_SUCH_FILE", no_such_file_id, "No such file.")),
+    }
+}
+
+fn content_required(id: &str) -> Response {
+    meta_err(
+        "CONTENT_REQUIRED",
+        id,
+        "Content required. You need to set text or fileId.",
+    )
+}
+
+/// ChatService.createMessageToUser — approvals / chatScope / block gates,
+/// then the 1on1 row + the approval row ChatService inserts on send.
+async fn messages_create_to_user(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let text = text_param(body)?;
+    let file_id = checked_file(pool, body, me_id, "4372b8e2-185d-4146-8749-2f68864a3e5f").await?;
+    if text.is_none() && file_id.is_none() {
+        return Err(content_required("25587321-b0e6-449c-9239-f8925092942c"));
+    }
+    let to_user_id = required_id(body, "toUserId")?;
+    if to_user_id == me_id {
+        return Err(meta_err(
+            "RECIPIENT_IS_YOURSELF",
+            "17e2ba79-e22a-4cbc-bf91-d327643f4a7e",
+            "You can not send a message to yourself.",
+        ));
+    }
+    let to_user = mk_db::user::find_user_by_id(pool, to_user_id)
+        .await
+        .map_err(|e| db_err("create_to_user find_user", e))?
+        .ok_or_else(|| {
+            meta_err(
+                "NO_SUCH_USER",
+                "11795c64-40ea-4198-b06e-3c873ed9039d",
+                "No such user.",
+            )
+        })?;
+
+    let other_approved_me = mk_db::chat::approval_exists(pool, to_user_id, me_id)
+        .await
+        .map_err(|e| db_err("create_to_user approval other", e))?;
+    let i_approved_other = mk_db::chat::approval_exists(pool, me_id, to_user_id)
+        .await
+        .map_err(|e| db_err("create_to_user approval me", e))?;
+    if !other_approved_me {
+        let allowed = match to_user.chat_scope.as_str() {
+            "none" => false,
+            // upstream names the follower direction from the sender side
+            "followers" => mk_db::social::following_exists(pool, me_id, to_user_id)
+                .await
+                .map_err(|e| db_err("create_to_user followers", e))?,
+            "following" => mk_db::social::following_exists(pool, to_user_id, me_id)
+                .await
+                .map_err(|e| db_err("create_to_user following", e))?,
+            "mutual" => {
+                mk_db::social::following_exists(pool, me_id, to_user_id)
+                    .await
+                    .map_err(|e| db_err("create_to_user mutual a", e))?
+                    && mk_db::social::following_exists(pool, to_user_id, me_id)
+                        .await
+                        .map_err(|e| db_err("create_to_user mutual b", e))?
+            }
+            _ => true,
+        };
+        if !allowed {
+            return Err(meta_err(
+                "CANNOT_CHAT",
+                "6f7d3a90-6d8b-4c7e-b1a2-3c4d5e6f7a8b",
+                "You cannot chat with this user.",
+            ));
+        }
+    }
+    if mk_db::social::blocking_exists(pool, to_user_id, me_id)
+        .await
+        .map_err(|e| db_err("create_to_user blocked", e))?
+    {
+        return Err(meta_err(
+            "YOU_HAVE_BEEN_BLOCKED",
+            "c15a5199-7422-4968-941a-2a462c478f7d",
+            "You cannot send a message because you have been blocked by this user.",
+        ));
+    }
+
+    // `params.text ? trim : null` — empty strings collapse to null.
+    let text = text.map(|t| t.trim()).filter(|t| !t.is_empty());
+    let id = mk_types::id::gen_aid_now();
+    mk_db::chat::insert_message(
+        pool,
+        &mk_db::chat::NewChatMessage {
+            id: &id,
+            from_user_id: me_id,
+            to_user_id: Some(to_user_id),
+            to_room_id: None,
+            text,
+            file_id: file_id.as_deref(),
+        },
+    )
+    .await
+    .map_err(|e| db_err("create_to_user insert", e))?;
+    if !i_approved_other {
+        mk_db::chat::insert_approval(pool, &mk_types::id::gen_aid_now(), me_id, to_user_id)
+            .await
+            .map_err(|e| db_err("create_to_user approval insert", e))?;
+    }
+    let message = mk_db::chat::find_message(pool, &id)
+        .await
+        .map_err(|e| db_err("create_to_user refetch", e))?
+        .ok_or_else(|| api_err(ApiError::internal_error()))?;
+    Ok(ok_json(
+        pack_message_lite_1on1(state, pool, &message).await?,
+    ))
+}
+
+/// ChatService.createMessageToRoom — membership gate + room message row.
+async fn messages_create_to_room(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let to_room_id = required_id(body, "toRoomId")?;
+    let room = mk_db::chat::find_room(pool, to_room_id)
+        .await
+        .map_err(|e| db_err("create_to_room find_room", e))?
+        .ok_or_else(|| no_such_room("8098520d-2da5-4e8f-8ee1-df78b55a4ec6"))?;
+    let text = text_param(body)?;
+    let file_id = checked_file(pool, body, me_id, "b6accbd3-1d7b-4d9f-bdb7-eb185bac06db").await?;
+    if text.is_none() && file_id.is_none() {
+        return Err(content_required("340517b7-6d04-42c0-bac1-37ee804e3594"));
+    }
+    let is_member = room.owner_id == me_id
+        || mk_db::chat::membership_exists(pool, to_room_id, me_id)
+            .await
+            .map_err(|e| db_err("create_to_room membership", e))?;
+    if !is_member {
+        return Err(no_such_room("8098520d-2da5-4e8f-8ee1-df78b55a4ec6"));
+    }
+    let text = text.map(|t| t.trim()).filter(|t| !t.is_empty());
+    let id = mk_types::id::gen_aid_now();
+    mk_db::chat::insert_message(
+        pool,
+        &mk_db::chat::NewChatMessage {
+            id: &id,
+            from_user_id: me_id,
+            to_user_id: None,
+            to_room_id: Some(to_room_id),
+            text,
+            file_id: file_id.as_deref(),
+        },
+    )
+    .await
+    .map_err(|e| db_err("create_to_room insert", e))?;
+    let message = mk_db::chat::find_message(pool, &id)
+        .await
+        .map_err(|e| db_err("create_to_room refetch", e))?
+        .ok_or_else(|| api_err(ApiError::internal_error()))?;
+    Ok(ok_json(
+        pack_message_lite_room(state, pool, &message).await?,
+    ))
+}
+
+/// chat/messages/room-timeline — member-scoped paged timeline.
+async fn messages_room_timeline(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let room_id = required_id(body, "roomId")?;
+    let limit = limit_param(body, 10)?;
+    let (since_id, until_id) = page_ids(body)?;
+    let room = mk_db::chat::find_room(pool, room_id)
+        .await
+        .map_err(|e| db_err("room_timeline find_room", e))?
+        .ok_or_else(|| no_such_room("c4d9f88c-9270-4632-b032-6ed8cee36f7f"))?;
+    let is_member = room.owner_id == me_id
+        || mk_db::chat::membership_exists(pool, room_id, me_id)
+            .await
+            .map_err(|e| db_err("room_timeline membership", e))?;
+    if !is_member {
+        return Err(no_such_room("c4d9f88c-9270-4632-b032-6ed8cee36f7f"));
+    }
+    let rows = mk_db::chat::room_messages(
+        pool,
+        room_id,
+        limit,
+        since_id.as_deref(),
+        until_id.as_deref(),
+    )
+    .await
+    .map_err(|e| db_err("room_timeline", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(pack_message_lite_room(state, pool, row).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// chat/messages/show — sender/recipient only (upstream has no room-member
+/// fallback on this endpoint).
+async fn messages_show(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let message_id = required_id(body, "messageId")?;
+    let message = mk_db::chat::find_message(pool, message_id)
+        .await
+        .map_err(|e| db_err("messages_show find", e))?
+        .ok_or_else(|| no_such_message("3710865b-1848-4da9-8d61-cfed15510b93"))?;
+    if message.from_user_id != me_id && message.to_user_id.as_deref() != Some(me_id) {
+        return Err(no_such_message("3710865b-1848-4da9-8d61-cfed15510b93"));
+    }
+    Ok(ok_json(
+        pack_message_detailed(state, pool, &message, me_id).await?,
+    ))
+}
+
+/// chat/messages/delete — sender-scoped.
+async fn messages_delete(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let message_id = required_id(body, "messageId")?;
+    let message = mk_db::chat::find_message_from_user(pool, message_id, me_id)
+        .await
+        .map_err(|e| db_err("messages_delete find", e))?
+        .ok_or_else(|| no_such_message("36b67f0e-66a6-414b-83df-992a55294f17"))?;
+    mk_db::chat::delete_message(pool, &message.id)
+        .await
+        .map_err(|e| db_err("messages_delete", e))?;
+    Ok(ok_empty())
+}
+
+/// chat/history — latest per 1on1 counterpart (room: false) or per joined
+/// room (room: true), packed detailed. `isRead` is true because the Redis
+/// unread markers have no port-side store.
+async fn chat_history(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let limit = limit_param(body, 10)?;
+    let room = opt_bool(body, "room", false)?;
+    let rows = if room {
+        mk_db::chat::room_history(pool, me_id, limit).await
+    } else {
+        mk_db::chat::user_history(pool, me_id, limit).await
+    }
+    .map_err(|e| db_err("chat_history", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut packed = pack_message_detailed(state, pool, row, me_id).await?;
+        packed["isRead"] = json!(true);
+        out.push(packed);
     }
     Ok(ok_json(Value::Array(out)))
 }
