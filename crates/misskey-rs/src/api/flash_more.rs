@@ -310,7 +310,11 @@ async fn flash_create(
         },
     )
     .await
-    .map_err(|e| db_err("flash_create insert", e))?;
+    .map_err(|e| {
+        // diagnostic: the Debug form carries the FK detail (key + table)
+        tracing::error!(target: "dbg_flash", error = ?e, user = %me_id, "flash_create insert");
+        internal()
+    })?;
     let row = mk_db::flash::find_flash(pool, &id)
         .await
         .map_err(|e| db_err("flash_create refetch", e))?
