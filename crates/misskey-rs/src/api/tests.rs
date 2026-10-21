@@ -15724,10 +15724,8 @@ async fn ap_keys_fetch_rejects_https_and_surfaces_http_errors() {
     assert_eq!(out.unwrap_err(), "non-http keyId (TLS pending)");
     // an http keyId whose host is unroutable → connect error string, no panic
     let out = mk_ap::fetch::fetch_actor_key("http://127.0.0.1:9/users/u").await;
-    assert!(
-        out.unwrap_err().contains("actor fetch connect"),
-        "err: {out:?}"
-    );
+    let err = out.unwrap_err();
+    assert!(err.contains("actor fetch connect"), "err: {err}");
 }
 
 // the remote cache probe: a stored remote user row (host NOT NULL + uri)
