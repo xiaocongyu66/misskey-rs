@@ -389,3 +389,190 @@ mod tests {
         assert!(EXCLUDE_MY_RENOTES.contains("n.\"userId\" != $2"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// users/lists/{show,get-memberships,update,delete,favorite,unfavorite,pull,
+// create-from-public} — the remaining users/lists/* read/write paths
+// (UserListsRepository / UserListFavoritesRepository / UserListMemberships
+// Repository ports). All tables ship in the 0001 baseline.
+// ---------------------------------------------------------------------------
+
+/// `UserListsRepository.findOneBy({ id, isPublic: true })` — the public-list
+/// scope users/lists/show (forPublic / anonymous), get-memberships,
+/// favorite/unfavorite and create-from-public resolve against.
+pub async fn find_public_list(
+    pool: &PgPool,
+    list_id: &str,
+) -> Result<Option<UserListRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserListRow>(
+        r#"SELECT "id", "userId" AS "user_id", "name", "isPublic" AS "is_public"
+           FROM "user_list" WHERE "id" = $1 AND "isPublic" = TRUE"#,
+    )
+    .bind(list_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `UserListsRepository.update(id, { name, isPublic })` — TypeORM skips
+/// `undefined` fields, so only the provided columns change (users/lists/update
+/// sends both as optional).
+pub async fn update_list_fields(
+    pool: &PgPool,
+    list_id: &str,
+    name: Option<&str>,
+    is_public: Option<bool>,
+) -> Result<(), sqlx::Error> {
+    if let Some(name) = name {
+        sqlx::query(r#"UPDATE "user_list" SET "name" = $2 WHERE "id" = $1"#)
+            .bind(list_id)
+            .bind(name)
+            .execute(pool)
+            .await?;
+    }
+    if let Some(is_public) = is_public {
+        sqlx::query(r#"UPDATE "user_list" SET "isPublic" = $2 WHERE "id" = $1"#)
+            .bind(list_id)
+            .bind(is_public)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `UserListsRepository.delete(id)` — memberships/favorites cascade via the
+/// 0001 FKs (ON DELETE CASCADE).
+pub async fn delete_list(pool: &PgPool, list_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "user_list" WHERE "id" = $1"#)
+        .bind(list_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `UserListFavoritesRepository.exists({ userId, userListId })`.
+pub async fn favorite_exists(
+    pool: &PgPool,
+    user_id: &str,
+    list_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM "user_list_favorite"
+           WHERE "userId" = $1 AND "userListId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(list_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// `UserListFavoritesRepository.insert({ id, userId, userListId })`.
+pub async fn insert_favorite(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    list_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "user_list_favorite" ("id", "userId", "userListId")
+           VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(list_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `UserListFavoritesRepository.findOneBy({ userId, userListId })` — the
+/// unfavorite delete target (None → NOT_FAVORITED error).
+pub async fn find_favorite_id(
+    pool: &PgPool,
+    user_id: &str,
+    list_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT "id" FROM "user_list_favorite"
+           WHERE "userId" = $1 AND "userListId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(list_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_favorite(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "user_list_favorite" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `UserListFavoritesRepository.countBy({ userListId })` — the
+/// users/lists/show `likedCount`.
+pub async fn count_favorites(pool: &PgPool, list_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "user_list_favorite" WHERE "userListId" = $1"#)
+        .bind(list_id)
+        .fetch_one(pool)
+        .await
+}
+
+/// users/lists/get-memberships row (the membership id is the pager key,
+/// upstream `makePaginationQuery(membership)`).
+#[derive(Debug, sqlx::FromRow)]
+pub struct MembershipRow {
+    pub id: String,
+    #[sqlx(rename = "user_id")]
+    pub user_id: String,
+    #[sqlx(rename = "with_replies")]
+    pub with_replies: bool,
+}
+
+/// Membership page: exclusive id bounds; sinceId-only → ASC (the
+/// QueryService.makePaginationQuery branch order). Date bounds are converted
+/// to an aid by the caller.
+pub async fn list_memberships(
+    pool: &PgPool,
+    list_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MembershipRow>, sqlx::Error> {
+    let dir = if since_id.is_some() { "ASC" } else { "DESC" };
+    sqlx::query_as::<_, MembershipRow>(&format!(
+        r#"
+        SELECT "id", ("userId") AS "user_id", "withReplies" AS "with_replies"
+        FROM "user_list_membership"
+        WHERE "userListId" = $1
+          AND ($2::varchar IS NULL OR "id" < $2)
+          AND ($3::varchar IS NULL OR "id" > $3)
+        ORDER BY "id" {dir} LIMIT $4
+        "#,
+    ))
+    .bind(list_id)
+    .bind(until_id)
+    .bind(since_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// `UserListService.removeMember` — `delete({ userId, userListId })`
+/// (users/lists/pull); a missing row is a silent no-op upstream.
+pub async fn delete_membership(
+    pool: &PgPool,
+    list_id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"DELETE FROM "user_list_membership"
+           WHERE "userListId" = $1 AND "userId" = $2"#,
+    )
+    .bind(list_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

@@ -938,6 +938,131 @@ pub async fn search_notes_by_tag(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// notes-more batch (endpoints/notes/*): favorites create/delete, children,
+// state and unrenote. `note_favorite` ships in the 0001 baseline.
+// ---------------------------------------------------------------------------
+
+/// `noteFavoritesRepository.exists({ noteId, userId })`.
+pub async fn favorite_exists(
+    pool: &PgPool,
+    user_id: &str,
+    note_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM "note_favorite" WHERE "userId" = $1 AND "noteId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(note_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// `noteFavoritesRepository.insert({ id, noteId, userId })` (no createdAt —
+/// the timestamp is recovered from the aid).
+pub async fn insert_note_favorite(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    note_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(note_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `findOneBy({ noteId, userId })` — the favorite row id (delete key).
+pub async fn find_note_favorite_id(
+    pool: &PgPool,
+    user_id: &str,
+    note_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        r#"SELECT "id" FROM "note_favorite" WHERE "userId" = $1 AND "noteId" = $2 LIMIT 1"#,
+    )
+    .bind(user_id)
+    .bind(note_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `noteFavoritesRepository.delete(exist.id)` — affected-row count.
+pub async fn delete_note_favorite(pool: &PgPool, id: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(r#"DELETE FROM "note_favorite" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// notes/children db path (endpoints/notes/children.ts): direct replies plus
+/// quote/renotes (`renoteId = target AND (text IS NOT NULL OR files/poll)`),
+/// visibility + base filtering per viewer, aid paging.
+#[allow(clippy::too_many_arguments)]
+pub async fn children_of_note(
+    pool: &PgPool,
+    note_id: &str,
+    me_id: Option<&str>,
+    my_followees: &[String],
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let me_list = me_id.map(|m| vec![m.to_string()]).unwrap_or_default();
+    let asc = since_id.is_some();
+
+    let mut inner = String::from(INNER_JOIN_USER);
+    inner.push_str(
+        r#"(n."replyId" = $1 OR (n."renoteId" = $1
+              AND (n."text" IS NOT NULL OR n."fileIds" != '{}' OR n."hasPoll" = TRUE)))"#,
+    );
+    if me_id.is_some() {
+        inner.push_str(VISIBILITY_ME);
+        inner.push_str(BASE_ME);
+    } else {
+        inner.push_str(VISIBILITY_GUEST);
+        inner.push_str(BASE_GUEST);
+    }
+    inner.push_str(PAGER);
+
+    // $1 noteId $2 me $3 [me] $4 myFollowees $5 untilId $6 sinceId $7 limit
+    let inner = expand(&inner, 2, 3, 4, 5, 6, 7, dir_asc(since_id));
+
+    sqlx::query_as::<_, NoteRow>(&wrap_outer(&inner, asc))
+        .bind(note_id)
+        .bind(me_id)
+        .bind(me_list)
+        .bind(my_followees)
+        .bind(until_id)
+        .bind(since_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// notes/unrenote db path: every renote row authored by `user_id` targeting
+/// `renote_id` (upstream `findBy({ userId: me.id, renoteId: note.id })`).
+pub async fn find_renotes_by_user(
+    pool: &PgPool,
+    user_id: &str,
+    renote_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT "id" FROM "note" WHERE "userId" = $1 AND "renoteId" = $2"#,
+    )
+    .bind(user_id)
+    .bind(renote_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// notes/renotes db path: rows whose renoteId is the given note (the endpoint
 /// raises NO_SUCH_NOTE on the target before the query).
 #[allow(clippy::too_many_arguments)]
@@ -969,6 +1094,72 @@ pub async fn renotes_of_note(
 
     sqlx::query_as::<_, NoteRow>(&wrap_outer(&inner, asc))
         .bind(renote_id)
+        .bind(me_id)
+        .bind(me_list)
+        .bind(my_followees)
+        .bind(until_id)
+        .bind(since_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// users/reactions — the reactions a user made, joined onto their notes and
+// filtered by the viewer's note visibility (endpoints/users/reactions.ts).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct UserReactionRow {
+    pub id: String,
+    pub user_id: String,
+    pub reaction: String,
+    pub note_id: String,
+}
+
+/// `noteReactionsRepository` page scoped to `reaction.userId`, inner-joined
+/// onto the note + author for `generateVisibilityQuery` /
+/// `generateBlockedHostQueryForNote` / `generateSuspendedUserQueryForNote`
+/// (blocked-host has no storage in this port; suspended authors are gated).
+/// Exclusive id bounds; sinceId-only → ASC (makePaginationQuery order).
+#[allow(clippy::too_many_arguments)]
+pub async fn user_reaction_rows(
+    pool: &PgPool,
+    user_id: &str,
+    me_id: Option<&str>,
+    my_followees: &[String],
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<UserReactionRow>, sqlx::Error> {
+    let me_list = me_id.map(|m| vec![m.to_string()]).unwrap_or_default();
+    let asc = since_id.is_some();
+
+    let mut sql = String::from(
+        r#"SELECT r."id", r."userId" AS "user_id", r."reaction", r."noteId" AS "note_id"
+           FROM "note_reaction" r
+           INNER JOIN "note" n ON n."id" = r."noteId"
+           INNER JOIN "user" u ON u."id" = n."userId"
+           WHERE r."userId" = $1"#,
+    );
+    if me_id.is_some() {
+        sql.push_str(VISIBILITY_ME);
+        sql.push_str(BASE_ME);
+    } else {
+        sql.push_str(VISIBILITY_GUEST);
+        sql.push_str(BASE_GUEST);
+    }
+    sql.push_str(
+        r#" AND ($UNTIL::varchar IS NULL OR r."id" < $UNTIL)
+            AND ($SINCE::varchar IS NULL OR r."id" > $SINCE)
+            ORDER BY r."id" {DIR} LIMIT $LIMIT"#,
+    );
+
+    // $1 userId $2 me $3 [me] $4 followees $5 untilId $6 sinceId $7 limit
+    let sql = expand(&sql, 2, 3, 4, 5, 6, 7, dir_asc(since_id));
+
+    sqlx::query_as::<_, UserReactionRow>(&sql)
+        .bind(user_id)
         .bind(me_id)
         .bind(me_list)
         .bind(my_followees)
