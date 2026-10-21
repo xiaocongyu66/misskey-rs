@@ -17,7 +17,7 @@ pub const DEFAULT_EMAIL_FROM: &str = "no-reply@mk-rs";
 /// `None` when the row/column is unset or the value is not base64url-encoded
 /// 32 bytes; callers keep their random fallback and log.
 pub async fn push_vapid_key(pool: &PgPool) -> Option<[u8; 32]> {
-    let raw: Option<String> = sqlx::query_scalar(
+    let raw: Option<String> = mk_db::sqlx::query_scalar(
         r#"SELECT (SELECT "swPrivateKey" FROM "meta" ORDER BY "id" DESC LIMIT 1)"#,
     )
     .fetch_one(pool)
@@ -31,12 +31,13 @@ pub async fn push_vapid_key(pool: &PgPool) -> Option<[u8; 32]> {
 /// `meta.email` (the configured noreply address), trimmed; `None` when the
 /// row/column is absent or blank.
 async fn meta_email(pool: &PgPool) -> Option<String> {
-    let raw: Option<String> =
-        sqlx::query_scalar(r#"SELECT (SELECT "email" FROM "meta" ORDER BY "id" DESC LIMIT 1)"#)
-            .fetch_one(pool)
-            .await
-            .ok()
-            .flatten();
+    let raw: Option<String> = mk_db::sqlx::query_scalar(
+        r#"SELECT (SELECT "email" FROM "meta" ORDER BY "id" DESC LIMIT 1)"#,
+    )
+    .fetch_one(pool)
+    .await
+    .ok()
+    .flatten();
     raw.map(|e| e.trim().to_string()).filter(|e| !e.is_empty())
 }
 
