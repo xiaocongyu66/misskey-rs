@@ -17014,7 +17014,10 @@ async fn admin_roles_crud_roundtrip() {
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list}");
     assert!(
-        list.as_array().unwrap().iter().any(|r| r["id"] == json!(role_id)),
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == json!(role_id)),
         "body: {list}"
     );
 
@@ -17124,15 +17127,13 @@ async fn admin_ad_crud_roundtrip() {
     assert!(ad["startsAt"].is_string());
 
     // list (default publishing = null → all rows, id DESC)
-    let (s, list) = post_json(
-        app.clone(),
-        "/api/admin/ad/list",
-        json!({ "i": r_token }),
-    )
-    .await;
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
     assert_eq!(s, StatusCode::OK, "body: {list}");
     assert!(
-        list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)),
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id)),
         "body: {list}"
     );
     // publishing=true keeps the live ad
@@ -17143,7 +17144,12 @@ async fn admin_ad_crud_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {list}");
-    assert!(list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)));
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id))
+    );
 
     // update is partial (memo only) and answers 204
     let (s, _) = post_json(
@@ -17153,12 +17159,7 @@ async fn admin_ad_crud_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, list) = post_json(
-        app.clone(),
-        "/api/admin/ad/list",
-        json!({ "i": r_token }),
-    )
-    .await;
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
     assert_eq!(s, StatusCode::OK);
     let row = list
         .as_array()
@@ -17170,12 +17171,7 @@ async fn admin_ad_crud_roundtrip() {
     assert_eq!(row["url"], json!("https://example.com/ad"));
 
     // non-moderator is denied
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/admin/ad/list",
-        json!({ "i": a_token }),
-    )
-    .await;
+    let (s, err) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": a_token })).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
     assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
 
@@ -17211,14 +17207,15 @@ async fn admin_ad_crud_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, list) = post_json(
-        app.clone(),
-        "/api/admin/ad/list",
-        json!({ "i": r_token }),
-    )
-    .await;
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(!list.as_array().unwrap().iter().any(|a| a["id"] == json!(ad_id)));
+    assert!(
+        !list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id))
+    );
 }
 
 // ==== i-more slice 1: i/favorites + i/gallery/likes + i/pages/likes ====
@@ -17355,12 +17352,7 @@ async fn i_gallery_likes_lists_only_callers_rows() {
         .unwrap();
     }
 
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/i/gallery/likes",
-        json!({ "i": at }),
-    )
-    .await;
+    let (s, body) = post_json(app.clone(), "/api/i/gallery/likes", json!({ "i": at })).await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1, "body: {body}");
@@ -17370,12 +17362,7 @@ async fn i_gallery_likes_lists_only_callers_rows() {
     assert!(arr[0]["createdAt"].is_string());
 
     // other user sees only their own like
-    let (_, b) = post_json(
-        app,
-        "/api/i/gallery/likes",
-        json!({ "i": bob["token"] }),
-    )
-    .await;
+    let (_, b) = post_json(app, "/api/i/gallery/likes", json!({ "i": bob["token"] })).await;
     assert_eq!(b.as_array().unwrap().len(), 1);
     assert_eq!(b[0]["post"]["id"], json!(p2));
 }
@@ -17797,12 +17784,7 @@ async fn chat_rooms_membership_invitation_flow() {
     .await;
     assert_eq!(s, StatusCode::OK, "body: {inbox}");
     assert_eq!(inbox, json!([]));
-    let (s, joining) = post_json(
-        app.clone(),
-        "/api/chat/rooms/joining",
-        json!({ "i": bt }),
-    )
-    .await;
+    let (s, joining) = post_json(app.clone(), "/api/chat/rooms/joining", json!({ "i": bt })).await;
     assert_eq!(s, StatusCode::OK, "body: {joining}");
     assert_eq!(joining.as_array().unwrap().len(), 1);
     assert_eq!(joining[0]["roomId"], json!(room_id));
@@ -17832,12 +17814,7 @@ async fn chat_rooms_membership_invitation_flow() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
-    let (s, joining) = post_json(
-        app.clone(),
-        "/api/chat/rooms/joining",
-        json!({ "i": bt }),
-    )
-    .await;
+    let (s, joining) = post_json(app.clone(), "/api/chat/rooms/joining", json!({ "i": bt })).await;
     assert_eq!(s, StatusCode::OK, "body: {joining}");
     assert_eq!(joining, json!([]));
 }
