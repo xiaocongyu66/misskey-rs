@@ -33,6 +33,9 @@ pub mod two_factor;
 pub mod webauthn;
 // i/update tail wave: drive files (upload), note pinings, personal memos
 pub mod drive;
+// admin-emoji: emoji table paths for the admin/emoji/* family (0001 baseline;
+// no migration — the zip-import storage lane is not ported)
+pub mod emoji;
 // note-agent: drive-file SQL for the note.ts slice (owned by-ids fetch +
 // drive/files/update write), kept separate from the drive-arena agent's
 // drive.rs

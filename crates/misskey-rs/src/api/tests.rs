@@ -17058,3 +17058,372 @@ async fn i_pages_likes_lists_only_callers_rows() {
     assert_eq!(b.as_array().unwrap().len(), 1);
     assert_eq!(b[0]["page"]["id"], json!(q2));
 }
+
+// ---------------------------------------------------------------------------
+// admin/emoji/* (admin emoji management) — add→list→update→delete round trip,
+// bulk alias/category/license/delete legs and the requireAdmin gate.
+// ---------------------------------------------------------------------------
+
+/// Find one emoji in an admin/emoji/list response by id.
+fn emoji_by_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
+    list.as_array()
+        .and_then(|rows| rows.iter().find(|e| e["id"] == json!(id)))
+}
+
+#[tokio::test]
+async fn admin_emoji_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_emoji").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // first signup = root (admin), second = plain user.
+    let admin = signup(&app, "root").await;
+    let token = admin["token"].as_str().unwrap().to_string();
+    let admin_id = admin["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, "bob").await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    // gate: non-admin → 403 ROLE_PERMISSION_DENIED; no credential → 401.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/list",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    let (s, body) = post_json(app.clone(), "/api/admin/emoji/list", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    let file_id = seed_drive_file(&pool, &admin_id, "image/jpeg").await;
+
+    // add → EmojiDetailed
+    let (s, added) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({
+            "name": "smile",
+            "fileId": file_id,
+            "aliases": ["happy"],
+            "category": "faces",
+            "license": "MIT",
+            "isSensitive": true,
+            "localOnly": true,
+            "roleIdsThatCanBeUsedThisEmojiAsReaction": [],
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {added}");
+    let emoji_id = added["id"].as_str().unwrap().to_string();
+    assert_eq!(emoji_id.len(), 10);
+    assert_eq!(added["name"], json!("smile"));
+    assert_eq!(added["host"], Value::Null);
+    assert_eq!(
+        added["url"],
+        json!("http://127.0.0.1:3000/files/accesskey123/192.jpg")
+    );
+    assert_eq!(added["aliases"], json!(["happy"]));
+    assert_eq!(added["category"], json!("faces"));
+    assert_eq!(added["license"], json!("MIT"));
+    assert_eq!(added["isSensitive"], json!(true));
+    assert_eq!(added["localOnly"], json!(true));
+    assert_eq!(added["roleIdsThatCanBeUsedThisEmojiAsReaction"], json!([]));
+
+    // duplicate name → 400 DUPLICATE_NAME
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "smile", "fileId": file_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("DUPLICATE_NAME"));
+
+    // non-image file → 400 UNSUPPORTED_FILE_TYPE
+    let pdf = seed_drive_file(&pool, &admin_id, "application/pdf").await;
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "doc", "fileId": pdf, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("UNSUPPORTED_FILE_TYPE"));
+
+    // unknown drive file → 400 NO_SUCH_FILE
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "ghost", "fileId": "0000000000", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // list + query modes (alias substring, :name: token, miss)
+    let (s, all) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {all}");
+    assert!(emoji_by_id(&all, &emoji_id).is_some());
+    let (_, by_alias) = post_json(
+        app.clone(),
+        "/api/admin/emoji/list",
+        json!({ "query": "happy", "i": token }),
+    )
+    .await;
+    assert!(emoji_by_id(&by_alias, &emoji_id).is_some());
+    let (_, by_token) = post_json(
+        app.clone(),
+        "/api/admin/emoji/list",
+        json!({ "query": ":smile:", "i": token }),
+    )
+    .await;
+    assert!(emoji_by_id(&by_token, &emoji_id).is_some());
+    let (_, miss) = post_json(
+        app.clone(),
+        "/api/admin/emoji/list",
+        json!({ "query": "zzzz", "i": token }),
+    )
+    .await;
+    assert!(emoji_by_id(&miss, &emoji_id).is_none());
+
+    // update (rename + category reset + aliases replace) → 204
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/update",
+        json!({
+            "id": emoji_id,
+            "name": "smile2",
+            "category": null,
+            "aliases": ["joy"],
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, updated) = post_json(
+        app.clone(),
+        "/api/admin/emoji/list",
+        json!({ "query": "smile2", "i": token }),
+    )
+    .await;
+    let row = emoji_by_id(&updated, &emoji_id).expect("renamed emoji listed");
+    assert_eq!(row["name"], json!("smile2"));
+    assert_eq!(row["category"], Value::Null);
+    assert_eq!(row["aliases"], json!(["joy"]));
+
+    // update with neither id nor name → 400 INVALID_PARAM
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/update",
+        json!({ "category": "x", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
+
+    // update unknown id → 400 NO_SUCH_EMOJI
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/update",
+        json!({ "id": "0000000000", "category": "x", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_EMOJI"));
+
+    // rename onto an existing name → 400 SAME_NAME_EMOJI_EXISTS
+    let (_, wave) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "wave", "fileId": file_id, "i": token }),
+    )
+    .await;
+    let wave_id = wave["id"].as_str().unwrap().to_string();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/update",
+        json!({ "id": emoji_id, "name": "wave", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("SAME_NAME_EMOJI_EXISTS"));
+
+    // delete → 204, then gone from the list
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/delete",
+        json!({ "id": emoji_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, after) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert!(emoji_by_id(&after, &emoji_id).is_none());
+    assert!(emoji_by_id(&after, &wave_id).is_some());
+
+    // delete unknown id → findOneByOrFail → 500 INTERNAL_ERROR
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/delete",
+        json!({ "id": "0000000000", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INTERNAL_ERROR"));
+}
+
+#[tokio::test]
+async fn admin_emoji_bulk_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_emoji_bulk").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let admin = signup(&app, "root").await;
+    let token = admin["token"].as_str().unwrap().to_string();
+    let admin_id = admin["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, "bob").await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    let file_a = seed_drive_file(&pool, &admin_id, "image/png").await;
+    let file_b = seed_drive_file(&pool, &admin_id, "image/gif").await;
+    let (_, one) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "one", "fileId": file_a, "aliases": ["a"], "i": token }),
+    )
+    .await;
+    let (_, two) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add",
+        json!({ "name": "two", "fileId": file_b, "aliases": ["a"], "i": token }),
+    )
+    .await;
+    let id_one = one["id"].as_str().unwrap().to_string();
+    let id_two = two["id"].as_str().unwrap().to_string();
+    let ids = json!([id_one, id_two]);
+
+    // non-admin bulk write → 403
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add-aliases-bulk",
+        json!({ "ids": ids, "aliases": ["x"], "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // add aliases (dedupe, order preserving)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/add-aliases-bulk",
+        json!({ "ids": ids, "aliases": ["b", "a"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(
+        emoji_by_id(&list, &id_one).unwrap()["aliases"],
+        json!(["a", "b"])
+    );
+    assert_eq!(
+        emoji_by_id(&list, &id_two).unwrap()["aliases"],
+        json!(["a", "b"])
+    );
+
+    // remove aliases from one row only
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/remove-aliases-bulk",
+        json!({ "ids": [id_one], "aliases": ["a"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(
+        emoji_by_id(&list, &id_one).unwrap()["aliases"],
+        json!(["b"])
+    );
+    assert_eq!(
+        emoji_by_id(&list, &id_two).unwrap()["aliases"],
+        json!(["a", "b"])
+    );
+
+    // set aliases (replace both)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/set-aliases-bulk",
+        json!({ "ids": ids, "aliases": ["only"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(
+        emoji_by_id(&list, &id_one).unwrap()["aliases"],
+        json!(["only"])
+    );
+    assert_eq!(
+        emoji_by_id(&list, &id_two).unwrap()["aliases"],
+        json!(["only"])
+    );
+
+    // category bulk
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/set-category-bulk",
+        json!({ "ids": ids, "category": "cat", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(
+        emoji_by_id(&list, &id_one).unwrap()["category"],
+        json!("cat")
+    );
+    assert_eq!(
+        emoji_by_id(&list, &id_two).unwrap()["category"],
+        json!("cat")
+    );
+
+    // license bulk, then reset to null (absent category/license resets too)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/set-license-bulk",
+        json!({ "ids": ids, "license": "MIT", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(
+        emoji_by_id(&list, &id_one).unwrap()["license"],
+        json!("MIT")
+    );
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/set-license-bulk",
+        json!({ "ids": ids, "license": null, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(emoji_by_id(&list, &id_one).unwrap()["license"], Value::Null);
+
+    // delete bulk → 204, list empty
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/emoji/delete-bulk",
+        json!({ "ids": ids, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
+    assert_eq!(list, json!([]));
+}

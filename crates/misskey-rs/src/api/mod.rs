@@ -720,6 +720,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END announcements DISPATCH ARM ====
 
+    // ==== admin-emoji DISPATCH ARM (admin/emoji/*) ====
+    // Noses in ahead of the admin/* catch-all (announcements/roles_lite
+    // convention): the module owns the 12 emoji-management names; every other
+    // admin/* name keeps falling through. Method check, body parsing and
+    // token extraction live here; the shared requireAdmin gate and the
+    // endpoint bodies in api::admin_emoji (SQL in mk-db/src/emoji.rs).
+    if admin_emoji::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_emoji::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-emoji DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -6198,6 +6218,13 @@ mod tests;
 /// gates with the meta.rootUserId bypass) and every admin handler; mod.rs
 /// only registers the module and the single `admin/*` dispatch arm above.
 mod admin;
+
+/// `admin/emoji/*` family (admin emoji management). Module file
+/// `api/admin_emoji.rs` owns the endpoint table + handlers, the shared
+/// requireAdmin gate and the parameter validation; SQL lives in
+/// `mk-db/src/emoji.rs`. mod.rs only registers the module and the dispatch
+/// arm above (ahead of the admin/* catch-all).
+mod admin_emoji;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file
