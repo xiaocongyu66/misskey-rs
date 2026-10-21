@@ -15762,141 +15762,106 @@ async fn ap_keys_remote_cache_probe_shape() {
     );
 }
 
-// ===== push-send: note-reasoned fan-out (mention/reply/renote/reaction) =====
-//
-// Every note-reasoned notification routes through social::notify_note_event,
-// which now spawns the upstream createNotification push tail (L196). This pins
-// that the send path is invoked once per wired type: the subscription endpoint
-// is an ephemeral local listener, so each accepted connection is one
-// send_to_user attempt. It also pins the shared gate: target == actor reports
-// "dropped", and the push spawn sits behind that same branch.
+// ===== email-leg: password reset (upstream request-reset-password +
+// reset-password) =====
+// request stores a code in password_reset_request; reset consumes it and
+// bumps user_profile."password"; signin with the new password then succeeds.
 #[tokio::test]
-async fn push_fanout_mention_reply_renote_reaction_invokes_send() {
+async fn password_reset_round_trip_and_wrong_code() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = fresh_pool("mktest_push_fanout").await;
+    let pool = fresh_pool("mktest_password_reset").await;
+    let username = format!("reset{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool.clone()));
-    let alice = signup(&app, &format!("pfa{}", mk_types::id::gen_aid_now())).await;
-    let bob = signup(&app, &format!("pfb{}", mk_types::id::gen_aid_now())).await;
-    let (a_id, a_token) = (
-        alice["id"].as_str().unwrap(),
-        alice["token"].as_str().unwrap(),
-    );
-    let (b_id, b_token, b_name) = (
-        bob["id"].as_str().unwrap(),
-        bob["token"].as_str().unwrap(),
-        bob["username"].as_str().unwrap().to_string(),
-    );
+    let signed = signup(&app, &username).await;
+    let user_id = signed["id"].as_str().unwrap().to_string();
 
-    // bob's note is the target of the reply / renote / reaction legs.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/notes/create",
-        json!({ "text": "target", "i": b_token }),
+    // the reset flow needs a verified email on the profile (signup only
+    // stores one when the meta email flags are on)
+    mk_db::sqlx::query(
+        r#"UPDATE "user_profile" SET "email" = $2, "emailVerified" = TRUE WHERE "userId" = $1"#,
     )
-    .await;
-    assert_eq!(s, StatusCode::OK, "bob note: {v}");
-    let b_note = v["createdNote"]["id"].as_str().unwrap().to_string();
-
-    // bob's push subscription: an ephemeral local listener. Each accepted
-    // connection is one send_to_user delivery attempt.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf).await;
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            let _ = tx.send(());
-        }
-    });
-    mk_db::sw::insert_subscription(
-        &pool,
-        &mk_types::id::gen_aid_now(),
-        b_id,
-        &format!("http://127.0.0.1:{port}/push"),
-        "auth",
-        "pub",
-        false,
-    )
+    .bind(&user_id)
+    .bind("reset@example.org")
+    .execute(&pool)
     .await
     .unwrap();
 
-    async fn expect_push(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, label: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{label}: push send path not invoked"))
-            .unwrap_or_else(|| panic!("{label}: listener closed"));
-    }
-
-    // mention
-    let (s, v) = post_json(
+    // request: silent 204, code row written
+    let (s, b) = post_json(
         app.clone(),
-        "/api/notes/create",
-        json!({ "i": a_token, "text": format!("@{b_name} hi") }),
+        "/api/request-reset-password",
+        json!({ "username": username, "email": "reset@example.org" }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "mention note: {v}");
-    expect_push(&mut rx, "mention").await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let code: String = mk_db::sqlx::query_scalar(
+        r#"SELECT "token" FROM "password_reset_request" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
-    // reply
-    let (s, v) = post_json(
+    // a wrong code is rejected and leaves the password alone
+    let (s, b) = post_json(
         app.clone(),
-        "/api/notes/create",
-        json!({ "i": a_token, "text": "reply", "replyId": b_note }),
+        "/api/reset-password",
+        json!({ "token": "00000000", "password": "newpass" }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "reply note: {v}");
-    expect_push(&mut rx, "reply").await;
-
-    // renote
-    let (s, v) = post_json(
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], "INVALID_TOKEN", "body: {b}");
+    let (s_old, _) = post_json(
         app.clone(),
-        "/api/notes/create",
-        json!({ "i": a_token, "renoteId": b_note }),
+        "/api/signin",
+        json!({ "username": username, "password": "test" }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "renote: {v}");
-    expect_push(&mut rx, "renote").await;
+    assert_eq!(
+        s_old,
+        StatusCode::OK,
+        "old password still works after a miss"
+    );
 
-    // reaction
-    let (s, v) = post_json(
+    // the mailed code resets the password
+    let (s, b) = post_json(
         app.clone(),
-        "/api/notes/reactions/create",
-        json!({ "i": a_token, "noteId": b_note, "reaction": "like" }),
+        "/api/reset-password",
+        json!({ "token": code, "password": "newpass" }),
     )
     .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "reaction: {v}");
-    expect_push(&mut rx, "reaction").await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
 
-    // guard: target == actor → the shared gate reports dropped for every
-    // wired type; notify_note_event returns before its push spawn there.
-    for reason in ["mention", "reply", "renote", "reaction"] {
-        let inserted = mk_db::notification::insert_if_not_muted(
-            &pool,
-            &mk_db::notification::NewNotification {
-                id: &mk_types::id::gen_aid_now(),
-                r#type: reason,
-                user_id: a_id,
-                notifier_id: Some(a_id),
-                note_id: Some(b_note.as_str()),
-                reaction: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            !inserted,
-            "{reason}: self-notification must be gated (no row, no push)"
-        );
-    }
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/signin",
+        json!({ "username": username, "password": "newpass" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["finished"], json!(true), "body: {b}");
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/signin",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "old password rejected after reset"
+    );
+
+    // the code is single-use
+    let (s, b) = post_json(
+        app,
+        "/api/reset-password",
+        json!({ "token": code, "password": "again" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], "INVALID_TOKEN", "body: {b}");
 }

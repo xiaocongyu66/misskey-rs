@@ -180,6 +180,33 @@ pub async fn verify_email(pool: &mk_db::sqlx::PgPool, user_id: &str, code: &str)
     )
 }
 
+/// Password-reset request (upstream `request-reset-password.ts`): generates
+/// a code, stores it in `password_reset_request` (30-minute TTL, see mk-db
+/// `set_password_reset_code`) and emails it. Upstream sends a
+/// `/reset-password/<64-char token>` link; this slice reuses the 8-char
+/// signup code alphabet (`generate_code`) and mails the code itself — the
+/// SMTP sender is still the NoopSender stand-in, so delivery is
+/// fire-and-forget until a transport is wired.
+pub async fn request_password_reset(
+    pool: &mk_db::sqlx::PgPool,
+    user_id: &str,
+    email: &str,
+) -> Result<(), String> {
+    let code = generate_code();
+    mk_db::user::set_password_reset_code(pool, user_id, &code)
+        .await
+        .map_err(|e| format!("password reset code write: {e}"))?;
+    let sender = NoopSender;
+    sender
+        .send_email(
+            email,
+            "Password reset requested",
+            &format!("<p>To reset your password, use this code: <b>{code}</b></p>"),
+            &format!("To reset your password, use this code: {code}"),
+        )
+        .await
+}
+
 #[cfg(test)]
 mod email4_tests {
     use super::*;

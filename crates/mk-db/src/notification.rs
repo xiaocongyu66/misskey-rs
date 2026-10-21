@@ -76,23 +76,20 @@ async fn insert_notification_once(
 ///   (mention/reply/renote/quote/reaction AND follow/receiveFollowRequest
 ///   alike; mute.ts Notification + Notification (Grouped) read exactly this).
 /// Notifier-less rows (upstream allows them) bypass both gates, mirroring
-/// `if (notifierId) {...}`. Returns `Ok(true)` when the row was inserted and
-/// `Ok(false)` when the gate dropped it, so the push fan-out can sit behind
-/// the exact same gate (upstream `createNotification` returns null before the
-/// push tail).
+/// `if (notifierId) {...}`.
 pub async fn insert_if_not_muted(
     pool: &PgPool,
     n: &NewNotification<'_>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     if let Some(notifier_id) = n.notifier_id {
         if n.user_id == notifier_id {
-            return Ok(false);
+            return Ok(());
         }
         if crate::social::muting_exists(pool, n.user_id, notifier_id).await? {
-            return Ok(false);
+            return Ok(());
         }
     }
-    insert_notification(pool, n).await.map(|()| true)
+    insert_notification(pool, n).await
 }
 
 /// queue-min: pollEnded dedup probe — the at-least-once queue (plus the

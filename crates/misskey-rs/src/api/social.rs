@@ -171,8 +171,7 @@ fn user_id_param<'a>(body: &'a Value) -> Result<&'a str, Response> {
 /// is TYPE-AGNOSTIC (NotificationService.ts L111-114, checked before the
 /// recieveConfig ladder), so the follow-family legs drop the same way
 /// (recieveConfig / suspended-notifier pack filtering not modeled —
-/// TODO(M2+)). Insert side + push fan-out: the Redis-stream fanout is not
-/// ported.
+/// TODO(M2+)). Insert side only: the Redis-stream fanout is not ported.
 pub(crate) async fn notify_note_event(
     pool: &mk_db::sqlx::PgPool,
     notifiee_id: &str,
@@ -182,10 +181,8 @@ pub(crate) async fn notify_note_event(
 ) {
     // ntf-mute: gate + insert centralized in mk-db
     // (notification::insert_if_not_muted) so both notify sites share ONE
-    // type-agnostic muting drop. `Ok(false)` = self-notification (L110) or
-    // muted notifier (L111-114): upstream `createNotification` returns null
-    // there, BEFORE the push tail, so neither a row nor a push is produced.
-    match mk_db::notification::insert_if_not_muted(
+    // type-agnostic muting drop.
+    if let Err(e) = mk_db::notification::insert_if_not_muted(
         pool,
         &mk_db::notification::NewNotification {
             id: &mk_types::id::gen_aid_now(),
@@ -198,33 +195,8 @@ pub(crate) async fn notify_note_event(
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(e) => {
-            tracing::error!(target: "dbg_social", error = %e, "notify_note_event insert");
-            return;
-        }
+        tracing::error!(target: "dbg_social", error = %e, "notify_note_event insert");
     }
-    // push-send: NotificationService.createNotification push tail (L196
-    // `pushNotification(notifieeId, 'notification', packed)`) — mention /
-    // reply / renote / quote / reaction (and the follower 'note' leg) fan out
-    // here fire-and-forget; all delivery errors are logged and swallowed
-    // inside send_to_user (upstream `.catch`).
-    let (pool, notifiee_id, reason, note_id) = (
-        pool.clone(),
-        notifiee_id.to_string(),
-        reason.to_string(),
-        note_id.to_string(),
-    );
-    tokio::spawn(async move {
-        let _ = mk_core::push_deliver::send_to_user(
-            &pool,
-            &notifiee_id,
-            &reason,
-            &serde_json::json!({ "noteId": note_id }),
-        )
-        .await;
-    });
 }
 
 /// note-notify (upstream NoteCreateService.create L790-813): the
@@ -258,9 +230,20 @@ pub(crate) async fn notify_note_to_followers(
                 }
             }
         }
-        // the per-follower push ('note') rides notify_note_event's
-        // insert-gated fire-and-forget spawn — no separate delivery here.
         notify_note_event(pool, &follower_id, author_id, "note", note_id).await;
+        // push-send: PushNotificationService.pushNotification(userId, 'note',
+        // { noteId }) — fire-and-forget per follower; all delivery errors are
+        // logged and swallowed inside send_to_user (upstream `.catch`).
+        let (pool, follower_id, note_id) = (pool.clone(), follower_id.clone(), note_id.to_string());
+        tokio::spawn(async move {
+            mk_core::push_deliver::send_to_user(
+                &pool,
+                &follower_id,
+                "note",
+                &serde_json::json!({ "noteId": note_id }),
+            )
+            .await;
+        });
     }
 }
 
