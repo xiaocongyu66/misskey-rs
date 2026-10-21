@@ -30,14 +30,119 @@ impl EmailSender for NoopSender {
     }
 }
 
-/// SMTP transport sender — not implemented yet.
-///
-/// TODO: port upstream's SMTP transport (nodemailer) wiring behind this seam.
-pub struct SmtpSender;
+/// Minimal SMTP transport (upstream `EmailService.ts` builds the envelope
+/// through nodemailer; this hand-rolls the RFC 5321 command sequence over a
+/// plain tokio TCP stream — no AUTH/STARTTLS/8BITMIME extensions, TLS is a
+/// documented TODO).
+pub struct SmtpSender {
+    pub host: String,
+    pub port: u16,
+}
+
+/// One SMTP line reply (`252 code + text`); `Err` carries the code on a
+/// mismatch.
+async fn expect_code(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    want: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    // last line of a reply has ' ' after the code; intermediate '-' lines loop
+    loop {
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("smtp read: {e}"))?;
+        if line.len() < 4 {
+            return Err(format!("smtp short reply: {line:?}"));
+        }
+        let (code, sep) = line.split_at(3);
+        if code != want {
+            return Err(format!("smtp expected {want}, got {code}"));
+        }
+        if sep.starts_with(' ') {
+            return Ok(());
+        }
+    }
+}
+
+impl SmtpSender {
+    async fn deliver(&self, to: &str, subject: &str, html: &str, text: &str) -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| format!("smtp connect: {e}"))?;
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+
+        expect_code(&mut reader, "220").await?;
+        let cmd = |s: String| format!("{s}\r\n");
+        writer
+            .write_all(cmd("EHLO mk-rs".into()).as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "250").await?;
+
+        // minimal MIME multipart/alternative (text + html parts)
+        let boundary = "mk-rs-alt-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n--{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--{boundary}--\r\n"
+        );
+        // dot-stuffing: RFC 5321 §4.5.2 — a body line starting with '.' gets
+        // one extra '.' prepended
+        let stuffed: String = body
+            .lines()
+            .map(|l| {
+                if l.starts_with('.') {
+                    format!(".{l}\r\n")
+                } else {
+                    format!("{l}\r\n")
+                }
+            })
+            .collect();
+
+        writer
+            .write_all(cmd(format!("MAIL FROM:<no-reply@mk-rs>")).as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "250").await?;
+        writer
+            .write_all(cmd(format!("RCPT TO:<{to}>")).as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "250").await?;
+        writer
+            .write_all(cmd("DATA".into()).as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "354").await?;
+        let payload = format!(
+            "To: {to}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n{stuffed}.\r\n"
+        );
+        writer
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "250").await?;
+        writer
+            .write_all(cmd("QUIT".into()).as_bytes())
+            .await
+            .map_err(|e| format!("smtp write: {e}"))?;
+        expect_code(&mut reader, "221").await?;
+        let _ = &mut writer;
+        Ok(())
+    }
+}
 
 impl EmailSender for SmtpSender {
-    fn send_email(&self, _to: &str, _subject: &str, _html: &str, _text: &str) -> EmailFuture<'_> {
-        Box::pin(async { Err("smtp transport not implemented".to_string()) })
+    fn send_email(&self, to: &str, subject: &str, html: &str, text: &str) -> EmailFuture<'_> {
+        let to = to.to_string();
+        let subject = subject.to_string();
+        let html = html.to_string();
+        let text = text.to_string();
+        Box::pin(async move { self.deliver(&to, &subject, &html, &text).await })
     }
 }
 
@@ -79,12 +184,114 @@ mod email4_tests {
         assert_eq!(out, Ok(()));
     }
 
+    /// Fake SMTP server: canned replies, recorded commands. Returns the
+    /// bound address + a shared log of received lines.
+    async fn spawn_fake_smtp() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        tokio::sync::mpsc::Sender<String>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        // rcpt_tx flips the RCPT reply to 550 (the rejection leg)
+        let (rcpt_tx, mut rcpt_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let log2 = log.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = sock.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+            let mut reject = false;
+            writer.write_all(b"220 fake ready\r\n").await.unwrap();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let cmd = line.trim_end().to_string();
+                log2.lock().await.push(cmd.clone());
+                if cmd.starts_with("EHLO") {
+                    writer.write_all(b"250 fake\r\n").await.unwrap();
+                } else if cmd.starts_with("MAIL FROM") {
+                    writer.write_all(b"250 ok\r\n").await.unwrap();
+                } else if cmd.starts_with("RCPT TO") {
+                    if let Ok(target) = rcpt_rx.try_recv() {
+                        reject = target.ends_with("@reject.test");
+                    }
+                    if reject {
+                        writer
+                            .write_all(b"550 mailbox unavailable\r\n")
+                            .await
+                            .unwrap();
+                    } else {
+                        writer.write_all(b"250 ok\r\n").await.unwrap();
+                    }
+                } else if cmd == "DATA" {
+                    writer.write_all(b"354 go\r\n").await.unwrap();
+                } else if cmd == "." {
+                    if reject {
+                        // after the 550 the client stops; end the session
+                        break;
+                    }
+                    writer.write_all(b"250 queued\r\n").await.unwrap();
+                } else if cmd == "QUIT" {
+                    writer.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                }
+            }
+        });
+        (addr, log, rcpt_tx)
+    }
+
     #[tokio::test]
-    async fn smtp_sender_reports_unimplemented() {
-        let sender = SmtpSender;
+    async fn smtp_delivers_command_sequence_with_dot_stuffing() {
+        let (addr, log, _tx) = spawn_fake_smtp().await;
+        let sender = SmtpSender {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        };
+        sender
+            .send_email("user@dest.test", "verify", "<p>hi</p>", "..leading dot")
+            .await
+            .expect("deliver");
+        let log = log.lock().await;
+        let seq: Vec<&str> = log.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            seq.first().copied().unwrap_or(""),
+            "EHLO mk-rs",
+            "commands: {seq:?}"
+        );
+        assert_eq!(seq.first(), Some(&"EHLO mk-rs"));
+        assert!(
+            seq.iter()
+                .any(|c| c.starts_with("MAIL FROM:<no-reply@mk-rs>"))
+        );
+        assert!(seq.iter().any(|c| c == "RCPT TO:<user@dest.test>"));
+        assert!(seq.iter().any(|c| c == "DATA"));
+        assert_eq!(seq.last().copied(), Some("QUIT"));
+        // the body's leading-dot line arrives dot-stuffed ("...leading dot")
+        assert!(
+            log.iter().any(|c| c == "...leading dot"),
+            "dot-stuffing: {log:?}"
+        );
+        // and the terminating "." was NOT stuffed
+        assert!(log.iter().any(|c| c == "."));
+    }
+
+    #[tokio::test]
+    async fn smtp_rcpt_rejection_carries_the_code() {
+        let (addr, _log, tx) = spawn_fake_smtp().await;
+        let sender = SmtpSender {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        };
+        tx.send("user@reject.test".into()).await.unwrap();
         let out = sender
-            .send_email("a@b.c", "subject", "<p>hi</p>", "hi")
+            .send_email("user@reject.test", "verify", "<p>hi</p>", "hi")
             .await;
-        assert_eq!(out.unwrap_err(), "smtp transport not implemented");
+        assert!(out.unwrap_err().contains("550"), "err: {out:?}");
     }
 }
