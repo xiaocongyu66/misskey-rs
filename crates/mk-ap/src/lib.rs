@@ -13,3 +13,6 @@ pub mod inbox;
 // InboxProcessorService verify + ApInboxService Create{Note}/Follow/Like/
 // Undo arms over mk-db rows; remote fetches are the documented boundary).
 pub mod processor;
+// fed-3: remote person ingest (upstream ApPersonService.fetchPerson /
+// createPerson): the worker-side row that remote routing will hang off.
+pub mod person;

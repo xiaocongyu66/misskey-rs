@@ -148,9 +148,9 @@ pub async fn verify_and_route(
     )?;
 
     // the InboxProcessorService actor gate: the signer must BE activity.actor.
-    // The local lane compares against the auth user row; the REMOTE lane (no
-    // auth row — person ingest pending) checks the keyId prefix against the
-    // actor and stops after verify (routing lanes need the person row).
+    // The local lane compares against the auth user row; the REMOTE lane checks
+    // the keyId prefix against the actor, verifies, ingests the person row, and
+    // stops (routing lanes for remote actors are a separate slice).
     let activity: Value = serde_json::from_slice(body).map_err(|_| ())?;
     if let Some(owner_id) = parse_local_ap_id(&parsed.key_id, local_host, "users") {
         let auth = get_auth_user_from_key_id(pool, &owner_id).await?;
@@ -165,14 +165,34 @@ pub async fn verify_and_route(
     let actor_uri = activity
         .get("actor")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     let key_base = parsed.key_id.split('#').next().unwrap_or(&parsed.key_id);
     if !key_base.is_empty() && !actor_uri.starts_with(key_base) {
         return Err(());
     }
-    return Ok(RouteEffect::Skipped(
-        "remote actor verified (person ingest + routing lanes pending)",
-    ));
+    // Person ingest (upstream ApInboxService resolves activity.actor through
+    // ApPersonService.resolvePerson before performActivity): fetch the actor
+    // document over the shared TLS client (`fetch`'s key lane uses the same
+    // one), land/reuse the remote `user` row, then stop.
+    let actor_doc = match mk_core::services::tls_http::get_json(&actor_uri).await {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::info!(target: "dbg_ap", actor = %actor_uri, error = %e, "remote actor fetch failed");
+            return Err(());
+        }
+    };
+    let user_id = match crate::person::ensure_remote_person(pool, &actor_uri, &actor_doc).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::info!(target: "dbg_ap", actor = %actor_uri, error = %e, "remote person ingest failed");
+            return Err(());
+        }
+    };
+    tracing::info!(target: "dbg_ap", actor = %actor_uri, user_id = %user_id, "remote actor ingested");
+    Ok(RouteEffect::Skipped(
+        "remote actor ingested (routing lanes pending)",
+    ))
 }
 
 /// The local actor's routing ladder (Create/Follow/Like/Undo) — extracted
