@@ -19,6 +19,14 @@
 use sqlx::{Column, PgPool, Row, TypeInfo};
 
 /// Epoch second normalized to the span bucket (`Chart.dateToTimestamp`).
+/// Current wall-clock in ms (the chart writers' `Date.now()`).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn bucket(span: &str, at_ms: i64) -> i64 {
     let secs = at_ms.div_euclid(1000);
     match span {

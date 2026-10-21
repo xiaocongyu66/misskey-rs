@@ -133,6 +133,30 @@ pub async fn insert_note(pool: &PgPool, n: &NewNote<'_>) -> Result<(), sqlx::Err
     .bind(n.channel_id) // chan-note2
     .execute(pool)
     .await?;
+    // upstream NoteCreateService's per-user chart bump (PerUserNotesChart):
+    // hour + day twins, best-effort (a chart failure must not fail the note)
+    let now = crate::charts::now_ms();
+    let deltas: [(&str, i32); 5] = [
+        ("total", 1),
+        ("inc", 1),
+        ("dec", 0),
+        ("diffs_normal", if n.reply_id.is_none() { 1 } else { 0 }),
+        ("diffs_reply", if n.reply_id.is_some() { 1 } else { 0 }),
+    ];
+    for span in ["hour", "day"] {
+        if let Err(e) = crate::charts::update_per_user(
+            pool,
+            "notes",
+            span,
+            crate::charts::bucket(span, now),
+            n.user_id,
+            &deltas,
+        )
+        .await
+        {
+            tracing::warn!(target: "charts", error = %e, "per-user notes chart bump failed");
+        }
+    }
     Ok(())
 }
 
