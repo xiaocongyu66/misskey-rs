@@ -18285,3 +18285,192 @@ async fn users_lists_more_create_push_show_membership_update_pull_delete() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("NO_SUCH_LIST"));
 }
+
+// ============================================================================
+// notes-more batch (endpoints/notes/*): favorites create/delete (via
+// i/favorites), reactions/delete, renotes, children, conversation, state and
+// unrenote. Tables: note_favorite / note_reaction / note (0001 baseline).
+// ============================================================================
+
+#[tokio::test]
+async fn notes_more_batch_flow() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mknotes_more_batch").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let ua = format!("notesmorea{}", mk_types::id::gen_aid_now());
+    let ub = format!("notesmoreb{}", mk_types::id::gen_aid_now());
+    let a = signup(&app, &ua).await;
+    let b = signup(&app, &ub).await;
+    let a_token = a["token"].as_str().unwrap().to_string();
+    let b_token = b["token"].as_str().unwrap().to_string();
+
+    // b writes the target note
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "target", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let target = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // --- favorites create → i/favorites → state → duplicate → delete ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/favorites/create",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "favorite create: {v}");
+    let (s, v) = post_json(app.clone(), "/api/i/favorites", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "i/favorites: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["noteId"], json!(target), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/state",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "state: {v}");
+    assert_eq!(v["isFavorited"], json!(true), "{v}");
+    assert_eq!(v["isMutedThread"], json!(false), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/favorites/create",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "duplicate favorite: {v}");
+    assert_eq!(v["error"]["code"], json!("ALREADY_FAVORITED"), "{v}");
+
+    // --- reaction add → list → delete → list empty → NOT_REACTED ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "noteId": target, "reaction": "👍", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "reaction delete: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], json!("NOT_REACTED"), "{v}");
+
+    // --- renote list ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "renoteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let renote_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    assert_eq!(s, StatusCode::OK, "renotes: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["id"], json!(renote_id), "{v}");
+
+    // --- children: direct reply in, pure renote out ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "reply", "replyId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reply_id = v["createdNote"]["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/children",
+        json!({ "noteId": target }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "children: {v}");
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .collect();
+    assert!(ids.contains(&reply_id.as_str()), "children: {v}");
+    assert!(!ids.contains(&renote_id.as_str()), "pure renote excluded: {v}");
+
+    // --- conversation walks the reply chain upward ---
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/conversation",
+        json!({ "noteId": reply_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "conversation: {v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
+    assert_eq!(v[0]["id"], json!(target), "{v}");
+
+    // --- unrenote removes a's renote ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/unrenote",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+
+    // --- favorites delete → list empty → NOT_FAVORITED ---
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/favorites/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, v) = post_json(app.clone(), "/api/i/favorites", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
+    let (s, v) = post_json(
+        app,
+        "/api/notes/favorites/delete",
+        json!({ "noteId": target, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], json!("NOT_FAVORITED"), "{v}");
+}
+

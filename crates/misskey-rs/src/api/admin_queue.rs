@@ -192,19 +192,13 @@ fn require_scope(ctx: &admin::AdminCtx, kind: &str) -> Result<(), Response> {
 }
 
 /// requireModerator + the read/write scope for the endpoint name.
-async fn gate_read(
-    state: &AppState,
-    token: Option<&str>,
-) -> Result<admin::AdminCtx, Response> {
+async fn gate_read(state: &AppState, token: Option<&str>) -> Result<admin::AdminCtx, Response> {
     let ctx = admin::gate(state, token, Gate::Moderator).await?;
     require_scope(&ctx, "read:admin:queue")?;
     Ok(ctx)
 }
 
-async fn gate_write(
-    state: &AppState,
-    token: Option<&str>,
-) -> Result<admin::AdminCtx, Response> {
+async fn gate_write(state: &AppState, token: Option<&str>) -> Result<admin::AdminCtx, Response> {
     let ctx = admin::gate(state, token, Gate::Moderator).await?;
     require_scope(&ctx, "write:admin:queue")?;
     Ok(ctx)
@@ -680,7 +674,12 @@ async fn clear(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult
         Some(Value::String(s))
             if matches!(
                 s.as_str(),
-                "*" | "completed" | "wait" | "active" | "paused" | "prioritized" | "delayed"
+                "*" | "completed"
+                    | "wait"
+                    | "active"
+                    | "paused"
+                    | "prioritized"
+                    | "delayed"
                     | "failed"
             ) =>
         {
@@ -740,11 +739,7 @@ async fn stats(state: &AppState, token: Option<&str>) -> ApiResult {
 
 /// `endpoints/admin/queue/inbox-delayed.ts` / `deliver-delayed.ts`: delayed
 /// jobs of the kind grouped by payload host, sorted by count desc.
-async fn delayed_hosts(
-    state: &AppState,
-    kind: &str,
-    token: Option<&str>,
-) -> ApiResult {
+async fn delayed_hosts(state: &AppState, kind: &str, token: Option<&str>) -> ApiResult {
     let _ctx = gate_read(state, token).await?;
     let pool = state.pool.as_ref().expect("gated");
 
@@ -774,10 +769,7 @@ async fn delayed_hosts(
     }
     let mut out: Vec<(String, i64)> = counts.into_iter().collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let res: Vec<Value> = out
-        .into_iter()
-        .map(|(host, n)| json!([host, n]))
-        .collect();
+    let res: Vec<Value> = out.into_iter().map(|(host, n)| json!([host, n])).collect();
     Ok((StatusCode::OK, Json(json!(res))).into_response())
 }
 
