@@ -20,6 +20,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 mk-db = { workspace = true }
 mk-types = { workspace = true }
+# tls-http: https:// actor keyIds ride mk_core::services::tls_http (reqwest
+# + rustls); mk-core has no dependency on mk-ap, so no cycle.
+mk-core = { workspace = true }
+# ap-keys: the in-process remote-key TTL cache rides once_cell (already in
+# the lockfile as a reqwest transitive).
+once_cell = "1"
 sqlx = { workspace = true }
 
 [dev-dependencies]

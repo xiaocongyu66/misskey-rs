@@ -1061,8 +1061,10 @@ name = "mk-ap"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "mk-core",
  "mk-db",
  "mk-types",
+ "once_cell",
  "rand 0.8.8",
  "rsa",
  "serde",
@@ -1082,6 +1084,7 @@ dependencies = [
  "mk-types",
  "rand 0.8.8",
  "regex",
+ "reqwest",
  "rsa",
  "serde",
  "serde_json",

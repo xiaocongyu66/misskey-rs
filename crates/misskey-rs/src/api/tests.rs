@@ -15719,12 +15719,13 @@ async fn charts_fed_shape_and_update_commits() {
 
 // ===== ap-keys: remote keyId fetch (GetAuthService lane) =====
 
-// fetch_actor_key rejects https:// (TLS dead-end) and the fake-actor http
-// path surfaces the connection error without panicking.
+// fetch_actor_key: https now rides the TLS client (the fixed "TLS pending"
+// rejection is gone) — a closed loopback port pins an Err. The http path
+// keeps surfacing its connect error.
 #[tokio::test]
-async fn ap_keys_fetch_rejects_https_and_surfaces_http_errors() {
-    let out = mk_ap::fetch::fetch_actor_key("https://remote.example/users/u#main-key").await;
-    assert_eq!(out.unwrap_err(), "non-http keyId (TLS pending)");
+async fn ap_keys_fetch_surfaces_https_and_http_transport_errors() {
+    let out = mk_ap::fetch::fetch_actor_key("https://127.0.0.1:9/users/u#main-key").await;
+    assert!(out.is_err(), "https connect must fail: {out:?}");
     // an http keyId whose host is unroutable → connect error string, no panic
     let out = mk_ap::fetch::fetch_actor_key("http://127.0.0.1:9/users/u").await;
     let err = out.unwrap_err();

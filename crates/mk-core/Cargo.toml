@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# tls-http: the shared rustls client for https:// federation reads
+# (tls_http::get_json/get_text). Same workspace reqwest the drive lane uses.
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -21,6 +21,9 @@ pub mod role;
 pub mod roles_v2;
 pub mod search_bridge;
 pub mod signup;
+// tls-http: reqwest+rustls GET helpers so https:// endpoints (remote actor
+// keyIds, upstream GetAuthService) are no longer dead-ends.
+pub mod tls_http;
 pub mod user_pack;
 
 pub use signup::{
