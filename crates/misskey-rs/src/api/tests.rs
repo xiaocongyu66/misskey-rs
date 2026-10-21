@@ -15650,7 +15650,10 @@ async fn charts_fed_shape_and_update_commits() {
     }
     init_tracing();
     let pool = fresh_pool("mktest_charts_fed").await;
-    let now = 1_760_000_000_000i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     for span in ["hour", "day"] {
         mk_db::charts::update_federation(
             &pool,

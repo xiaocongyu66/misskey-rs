@@ -104,7 +104,8 @@ pub async fn fetch_actor_key(key_id: &str) -> Result<String, String> {
 /// exists so the verify lane prefers a row hit and documents the miss. The
 /// `user_keypair` table is the LOCAL pair and must never be consulted here.
 pub async fn remote_key_cached(pool: &PgPool, actor_uri: &str) -> Option<()> {
-    let exists: Option<i64> =
+    // SELECT 1 is INT4 — an i64 decode fails and .ok() would swallow the hit
+    let exists: Option<i32> =
         sqlx::query_scalar(r#"SELECT 1 FROM "user" WHERE "uri" = $1 AND "host" IS NOT NULL"#)
             .bind(actor_uri)
             .fetch_optional(pool)
