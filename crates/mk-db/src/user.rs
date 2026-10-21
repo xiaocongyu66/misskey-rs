@@ -144,7 +144,7 @@ pub async fn set_email_verify_code(
     code: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"UPDATE "user_profile" SET "email" = $2, "emailVerifyCode" = $3 WHERE "userId" = $1"#,
+        r#"UPDATE "user_profile" SET "email" = $1, "emailVerifyCode" = $2 WHERE "userId" = $3"#,
     )
     .bind(email)
     .bind(code)
