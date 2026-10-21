@@ -18,6 +18,8 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+# push-crypto: RFC 8291 aes128gcm payload seal (pure-Rust aes+ghash transitives)
+aes-gcm = "0.10"
 axum = { version = "0.8", features = ["ws"] }
 # drive lane: reqwest = the DriveService.uploadFromUrl downloader; futures-util
 # = the /streaming websocket hub (split + forward task over ws::WebSocket).

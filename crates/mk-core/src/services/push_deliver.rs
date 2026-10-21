@@ -85,7 +85,30 @@ pub async fn send_to_user(
             continue;
         };
         attempted += 1;
-        match post_push(&host, port, &path, &jwt, &k).await {
+        // upstream pushNotification body {type, body, userId, dateTime} sealed
+        // per RFC 8291 against the subscription's p256dh/auth; an encryption
+        // failure falls back to the empty body (logged once per send)
+        let payload = serde_json::json!({
+            "type": notif_type,
+            "body": body,
+            "userId": user_id,
+            "dateTime": chrono_ms(),
+        });
+        let sealed = crate::services::web_push::encrypt_payload(
+            serde_json::to_vec(&payload).unwrap_or_default().as_slice(),
+            &random_key32(),
+            &row.publickey,
+            &row.auth,
+        );
+        let empty: Vec<u8> = Vec::new();
+        let push_body = match &sealed {
+            Some(bytes) => bytes.as_slice(),
+            None => {
+                eprintln!("push: payload encryption failed for {}", row.endpoint);
+                empty.as_slice()
+            }
+        };
+        match post_push(&host, port, &path, &jwt, &k, push_body).await {
             Ok(status) => {
                 if status == 404 || status == 410 {
                     // upstream L131-139: endpoint gone → drop the subscription
@@ -136,7 +159,14 @@ fn endpoint_parts(endpoint: &str) -> Option<(String, u16, String, String)> {
 
 /// One wire attempt: VAPID auth header + aes128gcm marker + empty body.
 /// Returns the response status; transport errors surface as Err.
-async fn post_push(host: &str, port: u16, path: &str, jwt: &str, k: &str) -> Result<u16, String> {
+async fn post_push(
+    host: &str,
+    port: u16,
+    path: &str,
+    jwt: &str,
+    k: &str,
+    body: &[u8],
+) -> Result<u16, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let request = format!(
@@ -146,9 +176,10 @@ async fn post_push(host: &str, port: u16, path: &str, jwt: &str, k: &str) -> Res
          Content-Encoding: aes128gcm\r\n\
          TTL: 2419200\r\n\
          Content-Type: application/octet-stream\r\n\
-         Content-Length: 0\r\n\
+         Content-Length: {}\r\n\
          Connection: close\r\n\
-         \r\n"
+         \r\n",
+        body.len()
     );
     let mut stream = tokio::net::TcpStream::connect((host, port))
         .await
@@ -157,6 +188,10 @@ async fn post_push(host: &str, port: u16, path: &str, jwt: &str, k: &str) -> Res
         .write_all(request.as_bytes())
         .await
         .map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(body)
+        .await
+        .map_err(|e| format!("write body: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
     let mut raw = Vec::new();
     stream

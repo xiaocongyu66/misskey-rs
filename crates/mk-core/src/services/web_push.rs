@@ -171,8 +171,59 @@ pub fn encrypt_payload(
     p256dh_b64: &str,
     auth_b64: &str,
 ) -> Option<Vec<u8>> {
-    let _ = (plaintext, keypair, p256dh_b64, auth_b64);
-    None
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes128Gcm, Nonce};
+
+    // p256dh = base64url(0x04 || x || y) of the subscription's client key
+    let p256dh = mk_db::webauthn::b64url_decode(p256dh_b64).ok()?;
+    if p256dh.len() != 65 || p256dh[0] != 0x04 {
+        return None;
+    }
+    let mut client_x = [0u8; 32];
+    client_x.copy_from_slice(&p256dh[1..33]);
+    let mut client_y = [0u8; 32];
+    client_y.copy_from_slice(&p256dh[33..65]);
+    let auth = mk_db::webauthn::b64url_decode(auth_b64).ok()?;
+
+    let (eph_x, eph_y) = mk_db::webauthn::p256_pub_from_priv(keypair)?;
+    let shared = mk_db::webauthn::p256_ecdh(keypair, &client_x, &client_y)?;
+
+    // RFC 8291 §3.3: ikm = HKDF(shared, auth_secret, "Content-Encoding: auth\0" || 0x00, 32)
+    let mut ikm_info = b"Content-Encoding: auth\0".to_vec();
+    ikm_info.push(0);
+    let ikm = hkdf_sha256(&shared, Some(&auth), &ikm_info, 32);
+
+    let mut salt = [0u8; 16];
+    {
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut salt);
+    }
+
+    // cek = HKDF(ikm, salt, "Content-Encoding: aes128gcm\0" || 0x01 || u16be(16), 16)
+    let mut cek_info = b"Content-Encoding: aes128gcm\0".to_vec();
+    cek_info.push(1);
+    cek_info.extend_from_slice(&16u16.to_be_bytes());
+    let cek = hkdf_sha256(&ikm, Some(&salt), &cek_info, 16);
+
+    // nonce = HKDF(ikm, salt, "Content-Encoding: nonce\0" || 0x01 || u16be(12), 12)
+    let mut nonce_info = b"Content-Encoding: nonce\0".to_vec();
+    nonce_info.push(1);
+    nonce_info.extend_from_slice(&12u16.to_be_bytes());
+    let nonce = hkdf_sha256(&ikm, Some(&salt), &nonce_info, 12);
+
+    let cipher = Aes128Gcm::new_from_slice(&cek).ok()?;
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plaintext).ok()?;
+
+    // aes128gcm framing header: salt(16) || eph pub(65) || rs u32be || idlen(0)
+    let mut out = Vec::with_capacity(16 + 65 + 4 + 1 + ct.len());
+    out.extend_from_slice(&salt);
+    out.push(0x04);
+    out.extend_from_slice(&eph_x);
+    out.extend_from_slice(&eph_y);
+    out.extend_from_slice(&4096u32.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&ct);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -261,13 +312,70 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_payload_is_none_while_aes_gcm_is_absent_from_the_lock() {
-        // garbage p256dh/auth (and any other input) cannot produce a body:
-        // the AES-128-GCM crate is not in the lock — the seam stays None
+    fn encrypt_payload_rejects_garbage_keys() {
+        // non-base64 or non-0x04 p256dh cannot produce a body
         assert_eq!(
             encrypt_payload(b"{}", &[7u8; 32], "not-base64!!", "also-not"),
             None
         );
+        let not_uncompressed = mk_db::webauthn::b64url_encode(&[1u8; 65]);
+        assert_eq!(
+            encrypt_payload(b"{}", &[7u8; 32], &not_uncompressed, "YXV0aA"),
+            None
+        );
+    }
+
+    #[test]
+    fn encrypt_payload_round_trips_with_rfc8291_derivation() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes128Gcm, Nonce};
+
+        // client keypair (the subscription's p256dh) + sender ephemeral
+        let client_priv = [0x11u8; 32];
+        let (cx, cy) = mk_db::webauthn::p256_pub_from_priv(&client_priv).expect("client");
+        let mut p256dh = vec![0x04u8];
+        p256dh.extend_from_slice(&cx);
+        p256dh.extend_from_slice(&cy);
+        let auth = [0x22u8; 16];
+        let sender_priv = [0x33u8; 32];
+
+        let out = encrypt_payload(
+            b"hello",
+            &sender_priv,
+            &mk_db::webauthn::b64url_encode(&p256dh),
+            &mk_db::webauthn::b64url_encode(&auth),
+        )
+        .expect("encrypt");
+
+        // header: salt(16) | 0x04 x(32) y(32) | rs(4) | idlen(0) = 86 bytes
+        assert_eq!(out[16], 0x04);
+        assert_eq!(&out[81..85], &4096u32.to_be_bytes());
+        assert_eq!(out[85], 0);
+        let salt = &out[..16];
+        let mut eph_x = [0u8; 32];
+        eph_x.copy_from_slice(&out[17..49]);
+        let mut eph_y = [0u8; 32];
+        eph_y.copy_from_slice(&out[49..81]);
+
+        // receiver side: shared = client_priv × eph_pub
+        let shared = mk_db::webauthn::p256_ecdh(&client_priv, &eph_x, &eph_y).expect("shared");
+        let mut ikm_info = b"Content-Encoding: auth\0".to_vec();
+        ikm_info.push(0);
+        let ikm = hkdf_sha256(&shared, Some(&auth), &ikm_info, 32);
+        let mut cek_info = b"Content-Encoding: aes128gcm\0".to_vec();
+        cek_info.push(1);
+        cek_info.extend_from_slice(&16u16.to_be_bytes());
+        let cek = hkdf_sha256(&ikm, Some(salt), &cek_info, 16);
+        let mut nonce_info = b"Content-Encoding: nonce\0".to_vec();
+        nonce_info.push(1);
+        nonce_info.extend_from_slice(&12u16.to_be_bytes());
+        let nonce = hkdf_sha256(&ikm, Some(salt), &nonce_info, 12);
+
+        let cipher = Aes128Gcm::new_from_slice(&cek).expect("cipher");
+        let plain = cipher
+            .decrypt(Nonce::from_slice(&nonce), &out[86..])
+            .expect("decrypt");
+        assert_eq!(plain, b"hello");
     }
 
     fn raw_to_der(sig: &[u8]) -> Vec<u8> {
