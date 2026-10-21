@@ -729,10 +729,12 @@ pub async fn update_per_user(
     let mut placeholders = String::new();
     let mut sets = String::new();
     for (n, (col, _)) in deltas.iter().enumerate() {
-        // first fragment carries no leading comma (SET , x is a syntax error)
+        // cols/sets are bare lists after (date, group) / SET — the first
+        // fragment carries no leading comma (SET , x is a syntax error).
+        // placeholders always follow the $2 bind, so every one takes a comma.
         let sep = if n == 0 { "" } else { ", " };
         cols.push_str(&format!("{sep}\"___{col}\""));
-        placeholders.push_str(&format!("{sep}${}", n + 3));
+        placeholders.push_str(&format!(", ${}", n + 3));
         sets.push_str(&format!(
             "{sep}\"___{col}\" = \"{table}\".\"___{col}\" + EXCLUDED.\"___{col}\""
         ));
