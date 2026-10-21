@@ -181,6 +181,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(db) => {
             let pool = mk_db::connect(&db.url()).await?;
             mk_db::run_migrations(&pool).await?;
+            // vapid: generate-and-persist the sw keypair once (upstream
+            // MetaService.init) so the push identity is stable thereafter.
+            match mk_core::services::config::ensure_vapid_keys(&pool).await {
+                Ok(_) => tracing::info!("vapid: sw keypair ready"),
+                Err(e) => tracing::warn!("vapid: ensure_vapid_keys failed: {e}"),
+            }
             // arena-exports: the exportClips consumer (upstream's db-queue
             // BullMQ worker lane) — PG-brokered via mk_queue. config.url is
             // the base the exported drive files' /files urls embed.

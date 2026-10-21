@@ -11,10 +11,11 @@
 //!   shape this lane exercises (header set, 404/410 subscription pruning,
 //!   error swallowing) is complete. Upstream payload envelope would be
 //!   `{type, body, userId, dateTime: Date.now()}` JSON.
-//! - **VAPID keypair**: `meta."swPrivateKey"` (base64url, 32-byte scalar)
-//!   through [`crate::services::config::push_vapid_key`] gives a stable
-//!   identity; when it is unset we log and keep the historical per-call
-//!   random key. `sub` rides `meta.email` (`mailto:`), else the placeholder.
+//! - **VAPID keypair**: [`crate::services::config::ensure_vapid_keys`]
+//!   generates `meta."swPrivateKey"` / `"swPublicKey"` on first use and
+//!   reuses them afterwards, giving a stable identity; only a meta failure
+//!   falls back to the historical per-call random key. `sub` rides
+//!   `meta.email` (`mailto:`), else the placeholder.
 //! - **TLS**: the minimal client (mirroring
 //!   [`crate::services::search_bridge`]) speaks plain HTTP only, so
 //!   `https://` endpoints (everything upstream would actually deliver to,
@@ -57,12 +58,13 @@ pub async fn send_to_user(
         "dateTime": chrono_ms(),
     });
 
-    // Stable VAPID identity from meta when configured; the random key is the
-    // documented fallback (new identity per send, but the leg keeps running).
-    let key = match crate::services::config::push_vapid_key(pool).await {
-        Some(key) => key,
-        None => {
-            eprintln!("push: meta.swPrivateKey unset/invalid — random per-send key");
+    // Stable VAPID identity: generate-and-persist on first use, reuse after
+    // (upstream MetaService.init). The random key is the documented fallback
+    // when meta is unreachable (new identity per send, but the leg runs on).
+    let key = match crate::services::config::ensure_vapid_keys(pool).await {
+        Ok((key, _public)) => key,
+        Err(e) => {
+            eprintln!("push: ensure_vapid_keys failed ({e}) — random per-send key");
             random_key32()
         }
     };
