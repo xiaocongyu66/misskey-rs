@@ -582,7 +582,9 @@ async fn feed(state: AppState, seg: &str, kind: FeedKind, _accept: Option<String
 
     // profile description + visibility gates for the description line
     let prof: Option<(Option<String>, String, String)> = sqlx::query_as(
-        r#"SELECT "description", "followingVisibility", "followersVisibility"
+        r#"SELECT "description",
+                  "followingVisibility"::text AS "followingVisibility",
+                  "followersVisibility"::text AS "followersVisibility"
            FROM "user_profile" WHERE "userId" = $1"#,
     )
     .bind(&id)

@@ -16340,3 +16340,48 @@ async fn charts_site_shape_and_instance_update_commits() {
         assert_eq!(e["error"]["code"], "INVALID_PARAM", "{span} body: {e}");
     }
 }
+// Regression: the feed profile query selected the followingVisibility /
+// followersVisibility PG enums straight into String, so sqlx failed the
+// decode on every feed request ("feed profile" in the log) and the profile
+// silently fell back to None. Both reads now cast the enum to text.
+#[tokio::test]
+async fn feed_profile_visibility_enum_decodes_as_text() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkfeedvis").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("feedvis{}", mk_types::id::gen_aid_now());
+    let signed = signup(&app, &username).await;
+    let id = signed["id"].as_str().unwrap().to_string();
+    let token = signed["token"].as_str().unwrap().to_string();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "i": token, "followingVisibility": "followers" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+
+    // The mk-db profile read decodes the enum columns as String.
+    let profile = mk_db::user::find_profile(&pool, &id)
+        .await
+        .expect("find_profile must decode the visibility enums without error");
+    assert_eq!(profile.following_visibility, "followers");
+
+    // The feed's own profile query must decode too: a non-public
+    // followingVisibility renders the hidden "?" count (prof == None would
+    // instead fall back to the real count).
+    let (s, h, body) = get_accept(&app, &format!("/@{username}.json"), "*/*").await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(
+        hdr(&h, "content-type").as_deref(),
+        Some("application/json; charset=utf-8")
+    );
+    assert!(
+        body.contains("? Following"),
+        "feed profile enum decoded (count hidden): {body}"
+    );
+}
