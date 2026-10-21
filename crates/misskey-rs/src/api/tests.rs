@@ -16848,3 +16848,223 @@ async fn admin_ad_crud_roundtrip() {
             .any(|a| a["id"] == json!(ad_id))
     );
 }
+
+// ==== i-more slice 1: i/favorites + i/gallery/likes + i/pages/likes ====
+
+/// `i/favorites`: the caller's note_favorite rows (id DESC), other users'
+/// rows excluded, cursors respected.
+#[tokio::test]
+async fn i_favorites_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_favorites").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("fava{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("favb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let n1 = mk_types::id::gen_aid_now();
+    let n2 = mk_types::id::gen_aid_now();
+    for nid in [&n1, &n2] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "note" ("id", "userId", "visibility") VALUES ($1, $2, 'public')"#,
+        )
+        .bind(nid)
+        .bind(aid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let f1 = mk_types::id::gen_aid_now();
+    let f2 = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(&f1)
+    .bind(aid)
+    .bind(&n1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(&f2)
+    .bind(bid)
+    .bind(&n2)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(app.clone(), "/api/i/favorites", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(f1));
+    assert_eq!(arr[0]["noteId"], json!(n1));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // cursors: untilId=f1 is exclusive → empty; sinceId=f1 → empty (no newer)
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": at, "untilId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": at, "sinceId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // other user's token only sees their own row
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/favorites",
+        json!({ "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(f2));
+
+    // requireCredential: no token → CREDENTIAL_REQUIRED
+    let (s, b) = post_json(app, "/api/i/favorites", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
+/// `i/gallery/likes`: the caller's gallery_like rows joined to gallery_post.
+#[tokio::test]
+async fn i_gallery_likes_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_gallery").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("gala{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("galb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let p1 = mk_types::id::gen_aid_now();
+    let p2 = mk_types::id::gen_aid_now();
+    for (pid, uid, title) in [(&p1, aid, "alice post"), (&p2, bid, "bob post")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "gallery_post" ("id", "updatedAt", "title", "userId")
+               VALUES ($1, now(), $2, $3)"#,
+        )
+        .bind(pid)
+        .bind(title)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let l1 = mk_types::id::gen_aid_now();
+    let l2 = mk_types::id::gen_aid_now();
+    for (lid, uid, pid) in [(&l1, aid, &p1), (&l2, bid, &p2)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "gallery_like" ("id", "userId", "postId") VALUES ($1, $2, $3)"#,
+        )
+        .bind(lid)
+        .bind(uid)
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/gallery/likes",
+        json!({ "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(l1));
+    assert_eq!(arr[0]["post"]["id"], json!(p1));
+    assert_eq!(arr[0]["post"]["title"], json!("alice post"));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // other user sees only their own like
+    let (_, b) = post_json(
+        app,
+        "/api/i/gallery/likes",
+        json!({ "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["post"]["id"], json!(p2));
+}
+
+/// `i/pages/likes`: the caller's page_like rows joined to page.
+#[tokio::test]
+async fn i_pages_likes_lists_only_callers_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_pages").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("pga{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("pgb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let q1 = mk_types::id::gen_aid_now();
+    let q2 = mk_types::id::gen_aid_now();
+    for (pid, uid, title) in [(&q1, aid, "alice page"), (&q2, bid, "bob page")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "page"
+                 ("id", "updatedAt", "title", "name", "alignCenter", "font",
+                  "userId", "visibility")
+               VALUES ($1, now(), $2, $2, false, 'sans-serif', $3, 'public')"#,
+        )
+        .bind(pid)
+        .bind(title)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let m1 = mk_types::id::gen_aid_now();
+    let m2 = mk_types::id::gen_aid_now();
+    for (lid, uid, pid) in [(&m1, aid, &q1), (&m2, bid, &q2)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "page_like" ("id", "userId", "pageId") VALUES ($1, $2, $3)"#,
+        )
+        .bind(lid)
+        .bind(uid)
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(app.clone(), "/api/i/pages/likes", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(m1));
+    assert_eq!(arr[0]["page"]["id"], json!(q1));
+    assert_eq!(arr[0]["page"]["title"], json!("alice page"));
+    assert_eq!(arr[0]["page"]["visibility"], json!("public"));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // other user sees only their own like
+    let (_, b) = post_json(app, "/api/i/pages/likes", json!({ "i": bob["token"] })).await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["page"]["id"], json!(q2));
+}
