@@ -15750,10 +15750,10 @@ async fn ap_keys_remote_cache_probe_shape() {
     .execute(&pool)
     .await
     .unwrap();
-    // a hit still returns None today (no publicKey column on the baseline)
+    // a hit reports the row (the fetch still needs to run — no key column)
     assert_eq!(
         mk_ap::fetch::remote_key_cached(&pool, "http://remote.example/users/u").await,
-        None
+        Some(())
     );
     assert_eq!(
         mk_ap::fetch::remote_key_cached(&pool, "http://remote.example/users/other").await,

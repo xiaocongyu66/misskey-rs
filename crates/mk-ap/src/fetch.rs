@@ -103,7 +103,7 @@ pub async fn fetch_actor_key(key_id: &str) -> Result<String, String> {
 /// only in the upstream column the 0001 baseline lacks — today this probe
 /// exists so the verify lane prefers a row hit and documents the miss. The
 /// `user_keypair` table is the LOCAL pair and must never be consulted here.
-pub async fn remote_key_cached(pool: &PgPool, actor_uri: &str) -> Option<String> {
+pub async fn remote_key_cached(pool: &PgPool, actor_uri: &str) -> Option<()> {
     let exists: Option<i64> =
         sqlx::query_scalar(r#"SELECT 1 FROM "user" WHERE "uri" = $1 AND "host" IS NOT NULL"#)
             .bind(actor_uri)
@@ -111,8 +111,9 @@ pub async fn remote_key_cached(pool: &PgPool, actor_uri: &str) -> Option<String>
             .await
             .ok()
             .flatten();
-    // no publicKey column on the 0001 baseline → a hit still needs the fetch
-    exists.map(|_| String::new()).flatten()
+    // no publicKey column on the 0001 baseline → a hit still needs the fetch,
+    // so the probe only reports that the row exists
+    exists.map(|_| ())
 }
 
 #[cfg(test)]
@@ -154,12 +155,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // a hit still returns nothing (no publicKey column to read)
+        // a hit reports the row (the fetch still needs to run)
         assert_eq!(
             remote_key_cached(&pool, "http://remote.example/users/u").await,
-            None
+            Some(())
         );
-        // and a local-only uri misses entirely
+        // a local-only uri misses entirely
         assert_eq!(
             remote_key_cached(&pool, "http://remote.example/users/other").await,
             None

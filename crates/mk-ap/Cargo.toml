@@ -14,6 +14,10 @@ rsa = { workspace = true }
 base64 = "0.22"
 # fed-2: the InboxProcessorService worker lane persists through mk-db's
 # following/note_reaction/note helpers and ids via mk_types::id (gen_aid_now).
+# ap-keys: the fetch lane's minimal HTTP client rides tokio's TcpStream,
+# the remote-key-miss log rides tracing (workspace shapes).
+tokio = { workspace = true }
+tracing = { workspace = true }
 mk-db = { workspace = true }
 mk-types = { workspace = true }
 sqlx = { workspace = true }
