@@ -312,6 +312,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "charts/notes"
         // charts-users: same guest-ok shape (endpoints/charts/users.ts)
         || name == "charts/users"
+        // charts-fed: same guest-ok shape (endpoints/charts/federation.ts)
+        || name == "charts/federation"
         // freq-agent: users/get-frequently-replied-users slice + requisites
         // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
         || name == "users/get-frequently-replied-users"
@@ -459,6 +461,11 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // below; no userId (site-wide counts only).
         if name == "charts/users" {
             return charts_users(&state, &body).await;
+        }
+        // charts-fed arm: same paramDef — the read is mk-db federation_chart
+        // (FederationChart.getChart port) in charts_federation below.
+        if name == "charts/federation" {
+            return charts_federation(&state, &body).await;
         }
         // ff-arena: persist meta."federation" on admin/update-meta BEFORE the
         // note/freq lane arms — those `return` on the name, so an arm placed
@@ -4392,6 +4399,50 @@ async fn charts_users(state: &AppState, body: &Value) -> Response {
         Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
         Err(e) => {
             tracing::error!(target: "dbg_notes", error = %e, "users_chart");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// `POST /api/charts/federation` (endpoints/charts/federation.ts) — the
+/// site-wide federation counters. Same paramDef as charts/users (guest-ok);
+/// the read is mk-db federation_chart.
+async fn charts_federation(state: &AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let invalid = || {
+        api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "INVALID_PARAM",
+            "3d81ceae-475f-4600-b2a8-2bc116157532",
+            "Invalid param.",
+        ))
+    };
+    let span = match body.get("span").and_then(|v| v.as_str()) {
+        Some(s @ ("day" | "hour")) => s,
+        _ => return invalid(),
+    };
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 30usize,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=500) => n as usize,
+            _ => return invalid(),
+        },
+    };
+    let offset = match body.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(0) => None,
+            Some(ms) => Some(ms),
+            None => return invalid(),
+        },
+    };
+    match mk_db::charts::federation_chart(pool, span, limit, offset).await {
+        Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "federation_chart");
             api_err(ApiError::internal_error())
         }
     }

@@ -15638,3 +15638,78 @@ async fn charts_users_shape_and_signup_commits() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
     assert_eq!(e["error"]["code"], "INVALID_PARAM", "body: {e}");
 }
+
+// ===== charts-fed: federation chart (FederationChart) =====
+
+// shape: one flat object of arrays (len=limit over the shipped keys); a
+// direct update_federation write bumps its latest bucket.
+#[tokio::test]
+async fn charts_fed_shape_and_update_commits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_charts_fed").await;
+    let now = 1_760_000_000_000i64;
+    for span in ["hour", "day"] {
+        mk_db::charts::update_federation(
+            &pool,
+            span,
+            mk_db::charts::bucket(span, now),
+            &[("sub", 1), ("pubActive", 2)],
+        )
+        .await
+        .unwrap();
+    }
+
+    for (span, limit) in [("hour", 5usize), ("day", 3)] {
+        let (s, chart) = post_json(
+            crate::build_router(test_state(pool.clone())),
+            "/api/charts/federation",
+            json!({ "span": span, "limit": limit }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{span} body: {chart}");
+        for key in [
+            "deliveredInstances",
+            "inboxInstances",
+            "stalled",
+            "sub",
+            "pub",
+            "pubsub",
+            "subActive",
+            "pubActive",
+        ] {
+            assert_eq!(
+                chart[key].as_array().map(Vec::len),
+                Some(limit),
+                "{span}.{key}: {chart}"
+            );
+        }
+        assert_eq!(
+            chart["sub"].as_array().unwrap().last().unwrap(),
+            &json!(1),
+            "{span} sub latest: {chart}"
+        );
+        assert_eq!(
+            chart["pubActive"].as_array().unwrap().last().unwrap(),
+            &json!(2),
+            "{span} pubActive latest: {chart}"
+        );
+        assert_eq!(
+            chart["stalled"].as_array().unwrap().last().unwrap(),
+            &json!(0),
+            "{span} untouched key zero: {chart}"
+        );
+    }
+
+    // span required → INVALID_PARAM
+    let (s, e) = post_json(
+        crate::build_router(test_state(pool.clone())),
+        "/api/charts/federation",
+        json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], "INVALID_PARAM", "body: {e}");
+}

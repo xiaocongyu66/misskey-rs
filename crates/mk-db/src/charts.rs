@@ -380,3 +380,130 @@ pub async fn users_chart(
     }
     Ok(serde_json::json!({ "local": local, "remote": remote }))
 }
+
+// ==== federation chart (site-wide; upstream `core/chart/charts/federation.ts`) ====
+
+/// The federation chart's flat counter columns — all smallint on the 0001
+/// baseline (363+), no local/remote prefix (the site-wide totals).
+const FEDERATION_KEYS: [&str; 8] = [
+    "deliveredInstances",
+    "inboxInstances",
+    "stalled",
+    "sub",
+    "pub",
+    "pubsub",
+    "subActive",
+    "pubActive",
+];
+
+/// `FederationChart.update` — one multi-column UPSERT per event batch.
+/// `fields` carries only the counters this event moves (absent = +0).
+pub async fn update_federation(
+    pool: &PgPool,
+    span: &str,
+    date: i64,
+    fields: &[(&str, i16)],
+) -> Result<(), sqlx::Error> {
+    let table = match span {
+        "hour" => "__chart__federation",
+        _ => "__chart_day__federation",
+    };
+    // every shipped column, the event's delta or 0 — keeps the UPSERT shape
+    // uniform (placeholder order matches the bind order by construction)
+    let mut cols = String::new();
+    let mut sets = String::new();
+    let mut vals: Vec<i16> = Vec::with_capacity(FEDERATION_KEYS.len() + 1);
+    vals.push(0); // placeholder for the date bind, never read directly
+    for (n, key) in FEDERATION_KEYS.iter().enumerate() {
+        if n > 0 {
+            cols.push_str(", ");
+            sets.push_str(", ");
+        }
+        cols.push_str(&format!(r#""___{key}""#));
+        let delta = fields
+            .iter()
+            .find(|(k, _)| *k == *key)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        vals.push(delta);
+        sets.push_str(&format!(
+            r#""___{key}" = "{table}"."___{key}" + EXCLUDED."___{key}""#
+        ));
+    }
+    let placeholders: Vec<String> = (1..=FEDERATION_KEYS.len() + 1)
+        .map(|i| format!("${i}"))
+        .collect();
+    let sql = format!(
+        r#"INSERT INTO "{table}" ("date", {cols})
+           VALUES ({})
+           ON CONFLICT ("date") DO UPDATE SET {sets}"#,
+        placeholders.join(", ")
+    );
+    let mut q = sqlx::query(&sql).bind(date as i32);
+    for v in &vals[1..] {
+        q = q.bind(v);
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
+/// `getChart` for the federation chart — the endpoint returns the log keys
+/// as one flat object of arrays (no local/remote nesting).
+pub async fn federation_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let step: i64 = match span {
+        "hour" => 3600,
+        _ => 86_400,
+    };
+    let end = bucket(
+        span,
+        until_ms.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        }),
+    );
+    let select_cols: Vec<String> = FEDERATION_KEYS
+        .iter()
+        .map(|k| format!(r#""___{k}""#))
+        .collect();
+    let table = match span {
+        "hour" => "__chart__federation",
+        _ => "__chart_day__federation",
+    };
+    let sql = format!(
+        r#"SELECT {} FROM "{table}" WHERE "date" = $1"#,
+        select_cols.join(", ")
+    );
+    let mut slots: Vec<[i16; FEDERATION_KEYS.len()]> = Vec::with_capacity(limit);
+    for k in (0..limit as i64).rev() {
+        let date = end - k * step;
+        let row = sqlx::query_as::<_, (i16, i16, i16, i16, i16, i16, i16, i16)>(&sql)
+            .bind(date as i32)
+            .fetch_optional(pool)
+            .await?;
+        slots.push(row.unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]));
+    }
+    // latest-known extrapolation over leading all-zero rows (getChartRaw)
+    let known = slots.iter().rposition(|c| c.iter().any(|v| *v != 0));
+    if let Some(last_known) = known {
+        let base = slots[slots.len() - 1 - last_known];
+        let cut = slots.len() - 1 - last_known;
+        for c in slots.iter_mut().take(cut) {
+            *c = base;
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (idx, key) in FEDERATION_KEYS.iter().enumerate() {
+        out.insert(
+            (*key).to_string(),
+            serde_json::json!(slots.iter().map(|c| c[idx]).collect::<Vec<_>>()),
+        );
+    }
+    Ok(serde_json::Value::Object(out))
+}
