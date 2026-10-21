@@ -138,6 +138,43 @@ pub fn hkdf_sha256(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], len: usize) -> 
     okm
 }
 
+// ==== RFC 8291 `aes128gcm` payload seal (the wire half) ====
+
+/// RFC 8291 `aes128gcm` content-coding: seal `plaintext` to the client key
+/// (`p256dh_b64` = base64url `0x04 || x || y`, `auth_b64` = the auth secret)
+/// under the server EC scalar `keypair`. `None` on any bad input.
+///
+/// Derivation structure (RFC 8291 §4.2/§4.3 — every primitive below is
+/// already present in-tree):
+/// 1. `client = b64url_decode(p256dh_b64)` → `0x04 || x[..32] || y[..32]`
+/// 2. `auth = b64url_decode(auth_b64)`
+/// 3. fresh ephemeral scalar (OsRng, masked) + `p256_pub_from_priv`
+/// 4. `shared = p256_ecdh(eph_priv, client_x, client_y)`
+/// 5. `ikm = hkdf_sha256(&shared, Some(&auth), b"Content-Encoding: auth\0", 32)`
+/// 6. random 16-byte `salt`
+/// 7. `cek = hkdf_sha256(&ikm, Some(&salt),
+///    b"Content-Encoding: aes128gcm\0" || u32be(16), 16)`
+/// 8. `nonce = hkdf_sha256(&ikm, Some(&salt),
+///    b"Content-Encoding: nonce\0" || u32be(12), 12)`
+/// 9. AES-128-GCM seal (no AAD) + framing header
+///    `salt(16) || eph_pub(65) || rs=u32be(4096) || idlen=0`.
+///
+/// **Dead-end:** step 9 needs AES-128-GCM, and the `aes-gcm` crate is NOT in
+/// the workspace lock (`Cargo.lock` carries no `aes`/`ghash` — hand-rolling
+/// the block cipher + GHASH is out of scope), so no ciphertext can be
+/// produced yet. This seam returns `None` unconditionally until the crate
+/// lands; [`crate::services::push_deliver`] keeps the empty body + fallback
+/// log meanwhile. Steps 1-8 above are exactly what will run once it does.
+pub fn encrypt_payload(
+    plaintext: &[u8],
+    keypair: &[u8; 32],
+    p256dh_b64: &str,
+    auth_b64: &str,
+) -> Option<Vec<u8>> {
+    let _ = (plaintext, keypair, p256dh_b64, auth_b64);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +258,16 @@ mod tests {
         assert_eq!(p256_ecdh(&[0u8; 32], &bx, &by), None);
         let n = hex32("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
         assert_eq!(p256_ecdh(&n, &bx, &by), None);
+    }
+
+    #[test]
+    fn encrypt_payload_is_none_while_aes_gcm_is_absent_from_the_lock() {
+        // garbage p256dh/auth (and any other input) cannot produce a body:
+        // the AES-128-GCM crate is not in the lock — the seam stays None
+        assert_eq!(
+            encrypt_payload(b"{}", &[7u8; 32], "not-base64!!", "also-not"),
+            None
+        );
     }
 
     fn raw_to_der(sig: &[u8]) -> Vec<u8> {
