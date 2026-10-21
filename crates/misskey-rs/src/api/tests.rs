@@ -15404,6 +15404,14 @@ async fn push_send_list_by_user_row_shape_and_type_filter() {
     init_tracing();
     let pool = fresh_pool("mktest_push_send_list").await;
     let uid = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $2, $2)"#,
+    )
+    .bind(&uid)
+    .bind(format!("pushsend{}", &uid[..6]))
+    .execute(&pool)
+    .await
+    .unwrap();
     mk_db::sw::insert_subscription(
         &pool,
         &mk_types::id::gen_aid_now(),
@@ -15525,11 +15533,10 @@ async fn email_leg_code_round_trip() {
     let pool = fresh_pool("mktest_email_leg").await;
     let user_id = mk_types::id::gen_aid_now();
     mk_db::sqlx::query(
-        r#"INSERT INTO "user" ("id", "username", "usernameLower", "createdAt") VALUES ($1, $2, $2, $3)"#,
+        r#"INSERT INTO "user" ("id", "username", "usernameLower") VALUES ($1, $2, $2)"#,
     )
     .bind(&user_id)
     .bind(format!("emailleg{}", &user_id[..6]))
-    .bind(0i64)
     .execute(&pool)
     .await
     .unwrap();

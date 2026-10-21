@@ -79,7 +79,7 @@ pub struct Row {
 /// one user, in PK order (stable for tests; upstream relies on cache order).
 pub async fn list_by_user(pool: &PgPool, user_id: &str) -> Result<Vec<Row>, sqlx::Error> {
     sqlx::query_as::<_, Row>(
-        r#"SELECT "endpoint", "auth", "publickey", "sendReadMessage" FROM "sw_subscription"
+        r#"SELECT "endpoint", "auth", "publickey", "sendReadMessage" AS send_read_message FROM "sw_subscription"
            WHERE "userId" = $1 ORDER BY "id""#,
     )
     .bind(user_id)

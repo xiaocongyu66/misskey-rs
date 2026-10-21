@@ -91,13 +91,13 @@ pub async fn update_note(
 /// One span bucket's counters (0 where the row is absent).
 #[derive(Debug, Default, Clone)]
 pub struct NoteCounts {
-    pub total: i64,
-    pub inc: i64,
-    pub dec: i64,
-    pub diffs_normal: i64,
-    pub diffs_renote: i64,
-    pub diffs_reply: i64,
-    pub diffs_with_file: i64,
+    pub total: i32,
+    pub inc: i32,
+    pub dec: i32,
+    pub diffs_normal: i32,
+    pub diffs_renote: i32,
+    pub diffs_reply: i32,
+    pub diffs_with_file: i32,
 }
 
 async fn bucket_counts(
@@ -121,20 +121,20 @@ async fn bucket_counts(
     let row = sqlx::query_as::<
         _,
         (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
         ),
     >(&sql)
     .bind(date as i32)
