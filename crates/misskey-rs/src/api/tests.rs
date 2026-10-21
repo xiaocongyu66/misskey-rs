@@ -15620,12 +15620,12 @@ async fn charts_users_shape_and_signup_commits() {
     assert_eq!(
         chart["local"]["total"].as_array().unwrap().last().unwrap(),
         &json!(1),
-        "signup bumps {span} local.total: {chart}"
+        "signup bumps local.total: {chart}"
     );
     assert_eq!(
         chart["local"]["inc"].as_array().unwrap().last().unwrap(),
         &json!(1),
-        "signup moves {span} local.inc: {chart}"
+        "signup moves local.inc: {chart}"
     );
     assert_eq!(
         chart["remote"]["total"].as_array().unwrap().last().unwrap(),
