@@ -15763,6 +15763,110 @@ async fn ap_keys_remote_cache_probe_shape() {
     );
 }
 
+// ===== email-leg: password reset (upstream request-reset-password +
+// reset-password) =====
+// request stores a code in password_reset_request; reset consumes it and
+// bumps user_profile."password"; signin with the new password then succeeds.
+#[tokio::test]
+async fn password_reset_round_trip_and_wrong_code() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_password_reset").await;
+    let username = format!("reset{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+    let signed = signup(&app, &username).await;
+    let user_id = signed["id"].as_str().unwrap().to_string();
+
+    // the reset flow needs a verified email on the profile (signup only
+    // stores one when the meta email flags are on)
+    mk_db::sqlx::query(
+        r#"UPDATE "user_profile" SET "email" = $2, "emailVerified" = TRUE WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .bind("reset@example.org")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // request: silent 204, code row written
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/request-reset-password",
+        json!({ "username": username, "email": "reset@example.org" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let code: String = mk_db::sqlx::query_scalar(
+        r#"SELECT "token" FROM "password_reset_request" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // a wrong code is rejected and leaves the password alone
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/reset-password",
+        json!({ "token": "00000000", "password": "newpass" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], "INVALID_TOKEN", "body: {b}");
+    let (s_old, _) = post_json(
+        app.clone(),
+        "/api/signin",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    assert_eq!(
+        s_old,
+        StatusCode::OK,
+        "old password still works after a miss"
+    );
+
+    // the mailed code resets the password
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/reset-password",
+        json!({ "token": code, "password": "newpass" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/signin",
+        json!({ "username": username, "password": "newpass" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["finished"], json!(true), "body: {b}");
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/signin",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "old password rejected after reset"
+    );
+
+    // the code is single-use
+    let (s, b) = post_json(
+        app,
+        "/api/reset-password",
+        json!({ "token": code, "password": "again" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], "INVALID_TOKEN", "body: {b}");
+}
+
 // ===== push-send: note-reasoned fan-out (mention/reply/renote/reaction) =====
 //
 // Every note-reasoned notification routes through social::notify_note_event,
@@ -16341,6 +16445,7 @@ async fn charts_site_shape_and_instance_update_commits() {
         assert_eq!(e["error"]["code"], "INVALID_PARAM", "{span} body: {e}");
     }
 }
+
 // Regression: the feed profile query selected the followingVisibility /
 // followersVisibility PG enums straight into String, so sqlx failed the
 // decode on every feed request ("feed profile" in the log) and the profile

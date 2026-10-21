@@ -1032,6 +1032,124 @@ pub async fn users_explore(
         .await
 }
 
+/// Password-reset email lane (upstream `request-reset-password.ts` +
+/// `reset-password.ts`). The 0001 baseline ships a dedicated
+/// `password_reset_request` table (`id`, `token`, `"userId"` — no timestamp
+/// column), so the mission's "no column → in-process TTL map" fallback is
+/// NOT needed: the code is persisted here. Upstream derives the 30-minute
+/// TTL from the AID-encoded creation time, so the row id is AID-shaped
+/// (8 base36 chars of ms-since-2000 + 2 noise chars).
+const RESET_TTL_MS: i64 = 30 * 60 * 1000;
+const TIME_2000_MS: i64 = 946_684_800_000;
+
+fn reset_base36(mut v: u64, width: usize) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = vec![b'0'; width];
+    for slot in out.iter_mut().rev() {
+        *slot = DIGITS[(v % 36) as usize];
+        v /= 36;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// AID-shaped id for the reset row (`mk-types::id::gen_aid` shape without
+/// pulling the crate into mk-db).
+fn reset_aid(now_ms: i64) -> String {
+    let elapsed = if now_ms > TIME_2000_MS {
+        (now_ms - TIME_2000_MS) as u64
+    } else {
+        0
+    };
+    format!("{}00", reset_base36(elapsed, 8))
+}
+
+fn reset_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Stores a fresh reset code for `user_id`, dropping any previous request so
+/// only the newest code is live (upstream allows several rows but only the
+/// token from the last email is usable in practice).
+pub async fn set_password_reset_code(
+    pool: &PgPool,
+    user_id: &str,
+    code: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "password_reset_request" WHERE "userId" = $1"#)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        r#"INSERT INTO "password_reset_request" ("id", "token", "userId") VALUES ($1, $2, $3)"#,
+    )
+    .bind(reset_aid(reset_now_ms()))
+    .bind(code)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Resolves the user a reset token was issued for (`reset-password.ts`
+/// `findOneByOrFail({ token })`). None → unknown token.
+pub async fn password_reset_user_id(
+    pool: &PgPool,
+    code: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT "userId" FROM "password_reset_request" WHERE "token" = $1 LIMIT 1"#,
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Consumes the code when it matches `user_id` and is younger than the
+/// upstream 30-minute window; stale or unknown codes are purged and report
+/// false. The `id >= cutoff` predicate is the TTL check (AID time prefix).
+pub async fn take_password_reset_code(
+    pool: &PgPool,
+    user_id: &str,
+    code: &str,
+) -> Result<bool, sqlx::Error> {
+    let cutoff = reset_aid(reset_now_ms().saturating_sub(RESET_TTL_MS));
+    let hit: Option<String> = sqlx::query_scalar(
+        r#"DELETE FROM "password_reset_request"
+           WHERE "userId" = $1 AND "token" = $2 AND "id" >= $3
+           RETURNING "id""#,
+    )
+    .bind(user_id)
+    .bind(code)
+    .bind(&cutoff)
+    .fetch_optional(pool)
+    .await?;
+    if hit.is_none() {
+        sqlx::query(r#"DELETE FROM "password_reset_request" WHERE "userId" = $1 AND "token" = $2"#)
+            .bind(user_id)
+            .bind(code)
+            .execute(pool)
+            .await?;
+    }
+    Ok(hit.is_some())
+}
+
+/// `reset-password.ts`: `userProfilesRepository.update(userId, { password })`.
+pub async fn set_password_hash(
+    pool: &PgPool,
+    user_id: &str,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "user_profile" SET "password" = $2 WHERE "userId" = $1"#)
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// `i/update.ts` L483-531: description/body hashtags merge into `user.tags`
 /// (normalized upstream-side; our extractor lowercases; caller caps at 32).
 pub async fn merge_user_tags(
