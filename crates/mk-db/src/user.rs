@@ -134,6 +134,45 @@ pub async fn append_logged_in_date(
     Ok(())
 }
 
+/// email-leg (upstream SignupService.ts): the signup email address and its
+/// verification code land on user_profile ("email" + "emailVerifyCode",
+/// 0001_init.sql user_profile block) for the verify-email endpoint to consume.
+pub async fn set_email_verify_code(
+    pool: &PgPool,
+    user_id: &str,
+    email: &str,
+    code: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "user_profile" SET "email" = $2, "emailVerifyCode" = $3 WHERE "userId" = $1"#,
+    )
+    .bind(email)
+    .bind(code)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// email-leg take(): matches `code` against the stored one; on a hit the code
+/// is consumed and "emailVerified" flips true (upstream verify-email), on a
+/// miss nothing changes and false comes back.
+pub async fn take_email_verify_code(
+    pool: &PgPool,
+    user_id: &str,
+    code: &str,
+) -> Result<bool, sqlx::Error> {
+    let out = sqlx::query(
+        r#"UPDATE "user_profile" SET "emailVerifyCode" = NULL, "emailVerified" = TRUE
+           WHERE "userId" = $1 AND "emailVerifyCode" = $2"#,
+    )
+    .bind(user_id)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(out.rows_affected() > 0)
+}
+
 /// e2e harness reset: truncate every public table (incl. identities) but
 /// keep the schema (and sqlx's migration bookkeeping state semantics: the
 /// bookkeeping table is truncated too — migrations are already applied).

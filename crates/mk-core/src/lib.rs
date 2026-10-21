@@ -5,3 +5,6 @@
 
 pub mod packers;
 pub mod services;
+// push lane: social.rs + the tests tail address this as
+// mk_core::push_deliver (the services module is otherwise the only path)
+pub use services::push_deliver;

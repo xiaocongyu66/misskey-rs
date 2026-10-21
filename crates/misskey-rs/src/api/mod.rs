@@ -258,6 +258,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "notes/create"
         || name == "sw/register"
         || name == "sw/unregister"
+        // email-leg: verify-email (upstream endpoint, requireCredential)
+        || name == "verify-email"
         || name == "notes/show"
         || name == "users/search"
         || name == "users/search-by-username-and-host"
@@ -410,6 +412,12 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // upstream PushNotificationService.isValidEndpoint = a parseable URL)
         if name == "sw/register" || name == "sw/unregister" {
             return sw_register_unregister(&state, name.as_str(), &body, token.as_deref()).await;
+        }
+        // email-leg: verify-email — {code} is matched against
+        // user_profile."emailVerifyCode"; a hit consumes the code and flips
+        // "emailVerified" (see verify_email_route).
+        if name == "verify-email" {
+            return verify_email_route(&state, &body, token.as_deref()).await;
         }
         if name == "notes/reactions/create" || name == "notes/delete" {
             return social::note_credential_dispatch(
@@ -1221,6 +1229,25 @@ fn require_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, Response> {
 /// (captcha/invitation/email checks are skipped when config.test, matching
 /// upstream `NODE_ENV === 'test'` shortcuts).
 async fn signup_route(state: &AppState, body: &Value) -> Response {
+    // email-leg (SignupService.ts email section): the instance meta is read
+    // once; when enableEmail && emailRequiredForSignup the signup contract
+    // demands emailAddress (missing → INVALID_PARAM 'required'), and the
+    // address + a generated code are persisted to user_profile below.
+    let email_required = if let Some(pool) = &state.pool {
+        match mk_db::meta::fetch_nodeinfo_meta(pool).await {
+            Ok(m) => m.enable_email && m.email_required_for_signup,
+            Err(err) => {
+                tracing::error!(target: "dbg_signup", error = %err, "meta email flags");
+                return api_err(ApiError::internal_error());
+            }
+        }
+    } else {
+        false
+    };
+    let email_addr = body.get("emailAddress").and_then(Value::as_str);
+    if email_required && email_addr.map_or(true, str::is_empty) {
+        return invalid_param("emailAddress", "required");
+    }
     let username = match require_str(body, "username") {
         Ok(v) => v,
         Err(r) => return r,
@@ -1304,6 +1331,26 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
             tracing::error!(target: "dbg_signup", %err, "rootUserId stamp failed");
             return api_err(ApiError::internal_error());
         }
+        // email-leg: persist the not-yet-verified email + its code (upstream
+        // SignupService hands them to EmailService for delivery; the NoopSender
+        // stand-in fires and forgets until SMTP lands).
+        if email_required {
+            let addr = email_addr.unwrap_or_default();
+            let code = mk_core::services::email::generate_code();
+            if let Err(err) =
+                mk_db::user::set_email_verify_code(pool, &outcome.user_id, addr, &code).await
+            {
+                tracing::error!(target: "dbg_signup", %err, "email verify code write failed");
+                return api_err(ApiError::internal_error());
+            }
+            let sender = mk_core::services::email::NoopSender;
+            let addr = addr.to_string();
+            tokio::spawn(async move {
+                let _ = sender
+                    .send_email(&addr, "Verify your email", "<p>code</p>", "code")
+                    .await;
+            });
+        }
     }
 
     let mut packed = serde_json::to_value(mk_core::services::me_detailed_fresh(
@@ -1379,6 +1426,30 @@ fn reply_fastify_error(status: u16, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+/// `POST /api/verify-email` (upstream endpoint, requireCredential) — email-leg
+/// minimal contract: `{code}` (paramDef string, minLength 1) is matched
+/// against user_profile."emailVerifyCode" for the caller; a hit consumes the
+/// code and flips "emailVerified" (204, upstream res: null). A miss is 400
+/// INVALID_PARAM — the exact upstream error id for the wrong-code case is
+/// next-slice (needs one more upstream read).
+async fn verify_email_route(state: &AppState, body: &Value, token: Option<&str>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let Some(me_id) = resolve_me(pool, token).await else {
+        return Err(authentication_failed()).unwrap_or_else(|r| r);
+    };
+    let code = body.get("code").and_then(Value::as_str).unwrap_or("");
+    if code.is_empty() {
+        return invalid_param("code", "required");
+    }
+    if mk_core::services::email::verify_email(pool, &me_id, code).await {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        invalid_param("code", "incorrect")
+    }
 }
 
 async fn reset_route(state: &AppState) -> Response {

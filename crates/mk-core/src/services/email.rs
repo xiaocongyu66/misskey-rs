@@ -41,6 +41,31 @@ impl EmailSender for SmtpSender {
     }
 }
 
+/// Alphabet/length of the signup verification code. The upstream email
+/// section of `SignupService.ts` was unreadable within the skim budget, so
+/// this lands the documented fallback shape: 8 lowercase alphanumerics.
+const VERIFY_CODE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const VERIFY_CODE_LEN: usize = 8;
+
+/// Generates the signup email verification code (8 lowercase alphanumerics).
+pub fn generate_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..VERIFY_CODE_LEN)
+        .map(|_| VERIFY_CODE_ALPHABET[rng.gen_range(0..VERIFY_CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// email-leg verify: consumes the stored code for `user_id` when `code`
+/// matches, flipping user_profile."emailVerified" (mk-db
+/// `take_email_verify_code`). False when nothing matches (stale/unknown code).
+pub async fn verify_email(pool: &mk_db::sqlx::PgPool, user_id: &str, code: &str) -> bool {
+    matches!(
+        mk_db::user::take_email_verify_code(pool, user_id, code).await,
+        Ok(true)
+    )
+}
+
 #[cfg(test)]
 mod email4_tests {
     use super::*;

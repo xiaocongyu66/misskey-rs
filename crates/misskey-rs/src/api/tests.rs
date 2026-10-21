@@ -15514,3 +15514,60 @@ async fn push_send_dead_endpoint_swallowed_note_still_200s() {
     assert_eq!(s, StatusCode::OK, "note with dead push endpoint: {v}");
     assert_eq!(v["createdNote"]["text"], "push smoke", "body: {v}");
 }
+
+// ===== email-leg: verification-code storage round-trip =====
+// user_profile."email"/"emailVerifyCode"/"emailVerified" (0001:4047-4049);
+// the signup lane writes the pair, the verify endpoint consumes it.
+#[tokio::test]
+async fn email_leg_code_round_trip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_email_leg").await;
+    let user_id = mk_types::id::gen_aid_now();
+    sqlx::query(
+        r#"INSERT INTO "user" ("id", "username", "usernameLower", "createdAt") VALUES ($1, $2, $2, $3)"#,
+    )
+    .bind(&user_id)
+    .bind(format!("emailleg{}", &user_id[..6]))
+    .bind(0i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ($1)"#)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let code = mk_core::services::email::generate_code();
+    assert_eq!(code.len(), 8, "upstream-shaped 8-char code: {code}");
+    mk_db::user::set_email_verify_code(&pool, &user_id, "leg@example.org", &code)
+        .await
+        .unwrap();
+    // a wrong code is a miss and flips nothing
+    assert!(!mk_core::services::email::verify_email(&pool, &user_id, "xxxxxxxx").await);
+    let (verified, stored): (bool, Option<String>) = sqlx::query_as(
+        r#"SELECT "emailVerified", "emailVerifyCode" FROM "user_profile" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!verified, "miss leaves emailVerified false");
+    assert_eq!(
+        stored.as_deref(),
+        Some(code.as_str()),
+        "code survives a miss"
+    );
+    // the right code flips the flag and consumes itself
+    assert!(mk_core::services::email::verify_email(&pool, &user_id, &code).await);
+    let verified: bool = sqlx::query_as(
+        r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(verified, "hit flips emailVerified");
+}
