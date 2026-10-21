@@ -269,16 +269,16 @@ mod email4_tests {
             seq.iter()
                 .any(|c| c.starts_with("MAIL FROM:<no-reply@mk-rs>"))
         );
-        assert!(seq.iter().any(|c| c == "RCPT TO:<user@dest.test>"));
+        assert!(seq.iter().any(|c| c.as_str() == "RCPT TO:<user@dest.test>"));
         assert!(seq.iter().any(|c| c == "DATA"));
         assert_eq!(seq.last().copied(), Some("QUIT"));
         // the body's leading-dot line arrives dot-stuffed ("...leading dot")
         assert!(
-            log.iter().any(|c| c == "...leading dot"),
+            log.iter().any(|c| c.as_str() == "...leading dot"),
             "dot-stuffing: {log:?}"
         );
         // and the terminating "." was NOT stuffed
-        assert!(log.iter().any(|c| c == "."));
+        assert!(log.iter().any(|c| c.as_str() == "."));
     }
 
     #[tokio::test]
@@ -292,6 +292,7 @@ mod email4_tests {
         let out = sender
             .send_email("user@reject.test", "verify", "<p>hi</p>", "hi")
             .await;
-        assert!(out.unwrap_err().contains("550"), "err: {out:?}");
+        let err = out.unwrap_err();
+        assert!(err.contains("550"), "err: {err}");
     }
 }
