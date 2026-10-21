@@ -113,13 +113,14 @@ pub async fn verify_and_route(
     // local keyIds verify against the local keypair row; REMOTE keyIds ride
     // the GetAuthService.getKeyById fetch (crates/mk-ap/src/fetch.rs —
     // best-effort: TLS-less client, errors are the documented dead-ends)
+    // parse_local_ap_id returns Option<String>: a None keyId is REMOTE
     let remote_public_key: Option<String> = match parse_local_ap_id(
         &parsed.key_id,
         local_host,
         "users",
     ) {
-        Ok(owner_id) => None,
-        Err(()) => match crate::fetch::fetch_actor_key(&parsed.key_id).await {
+        Some(owner_id) => None,
+        None => match crate::fetch::fetch_actor_key(&parsed.key_id).await {
             Ok(pem) => Some(pem),
             Err(e) => {
                 tracing::info!(target: "dbg_ap", key_id = %parsed.key_id, error = %e, "remote key fetch failed");
@@ -151,7 +152,7 @@ pub async fn verify_and_route(
     // auth row — person ingest pending) checks the keyId prefix against the
     // actor and stops after verify (routing lanes need the person row).
     let activity: Value = serde_json::from_slice(body).map_err(|_| ())?;
-    if let Ok(owner_id) = parse_local_ap_id(&parsed.key_id, local_host, "users") {
+    if let Some(owner_id) = parse_local_ap_id(&parsed.key_id, local_host, "users") {
         let auth = get_auth_user_from_key_id(pool, &owner_id).await?;
         if !actor_matches_auth_user(activity.get("actor"), &auth, local_host) {
             return Err(());
