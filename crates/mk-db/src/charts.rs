@@ -244,3 +244,138 @@ pub async fn notes_chart(
     remote.insert("diffs".into(), serde_json::Value::Object(diffs_r));
     Ok(serde_json::json!({ "local": local, "remote": remote }))
 }
+
+// ==== users chart (site-wide; upstream `core/chart/charts/users.ts`) ====
+
+/// `UsersChart.update(group, isAdditional)` — the site-wide users-count
+/// chart (`__chart__users` hour / `__chart_day__users` day, 0001:861+).
+/// `group` is the local/remote prefix; is_additional=true is a new user
+/// (total+1, inc+1), false is a departure (total-1, dec+1).
+pub async fn update_users(
+    pool: &PgPool,
+    span: &str,
+    date: i64,
+    group: &str,
+    is_additional: bool,
+) -> Result<(), sqlx::Error> {
+    let table = match span {
+        "hour" => "__chart__users",
+        _ => "__chart_day__users",
+    };
+    let sql = format!(
+        r#"INSERT INTO "{table}" ("date",
+               "___{group}_total", "___{group}_inc", "___{group}_dec")
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT ("date") DO UPDATE SET
+               "___{group}_total" = "{table}"."___{group}_total" + EXCLUDED."___{group}_total",
+               "___{group}_inc" = "{table}"."___{group}_inc" + EXCLUDED."___{group}_inc",
+               "___{group}_dec" = "{table}"."___{group}_dec" + EXCLUDED."___{group}_dec""#
+    );
+    sqlx::query(&sql)
+        .bind(date as i32)
+        .bind(if is_additional { 1 } else { -1 })
+        .bind(if is_additional { 1 } else { 0 })
+        .bind(if is_additional { 0 } else { 1 })
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// One span bucket's user counters for both groups (0 where absent).
+#[derive(Debug, Default, Clone)]
+struct UserCounts {
+    total: i32,
+    inc: i32,
+    dec: i32,
+}
+
+async fn users_counts(
+    pool: &PgPool,
+    span: &str,
+    date: i64,
+) -> Result<[UserCounts; 2], sqlx::Error> {
+    let table = match span {
+        "hour" => "__chart__users",
+        _ => "__chart_day__users",
+    };
+    let sql = format!(
+        r#"SELECT "___local_total", "___local_inc", "___local_dec",
+                  "___remote_total", "___remote_inc", "___remote_dec"
+           FROM "{table}" WHERE "date" = $1"#
+    );
+    let row = sqlx::query_as::<_, (i32, i32, i32, i32, i32, i32)>(&sql)
+        .bind(date as i32)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        None => [UserCounts::default(), UserCounts::default()],
+        Some((lt, li, ld, rt, ri, rd)) => [
+            UserCounts {
+                total: lt,
+                inc: li,
+                dec: ld,
+            },
+            UserCounts {
+                total: rt,
+                inc: ri,
+                dec: rd,
+            },
+        ],
+    })
+}
+
+/// `getChart` for the users chart — same slot walk/extrapolation as
+/// [`notes_chart`], three flat arrays per group, no diffs.
+pub async fn users_chart(
+    pool: &PgPool,
+    span: &str,
+    limit: usize,
+    until_ms: Option<i64>,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let step: i64 = match span {
+        "hour" => 3600,
+        _ => 86_400,
+    };
+    let end = bucket(
+        span,
+        until_ms.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        }),
+    );
+    let mut slots: Vec<(i64, [UserCounts; 2])> = Vec::with_capacity(limit);
+    for k in (0..limit as i64).rev() {
+        let date = end - k * step;
+        slots.push((date, users_counts(pool, span, date).await?));
+    }
+    let known = slots
+        .iter()
+        .rposition(|(_, c)| c[0].total != 0 || c[1].total != 0);
+    if let Some(last_known) = known {
+        let base = slots[slots.len() - 1 - last_known].1.clone();
+        let cut = slots.len() - 1 - last_known;
+        for (_, counts) in slots.iter_mut().take(cut) {
+            *counts = base.clone();
+        }
+    }
+    let mut local = serde_json::Map::new();
+    let mut remote = serde_json::Map::new();
+    for (idx, key) in ["total", "inc", "dec"].iter().enumerate() {
+        let get = |c: &UserCounts| match idx {
+            0 => c.total,
+            1 => c.inc,
+            _ => c.dec,
+        };
+        local.insert(
+            (*key).to_string(),
+            serde_json::json!(slots.iter().map(|(_, c)| get(&c[0])).collect::<Vec<_>>()),
+        );
+        remote.insert(
+            (*key).to_string(),
+            serde_json::json!(slots.iter().map(|(_, c)| get(&c[1])).collect::<Vec<_>>()),
+        );
+    }
+    Ok(serde_json::json!({ "local": local, "remote": remote }))
+}

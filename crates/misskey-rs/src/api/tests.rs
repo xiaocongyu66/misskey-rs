@@ -15576,3 +15576,65 @@ async fn email_leg_code_round_trip() {
     .unwrap();
     assert!(verified, "hit flips emailVerified");
 }
+
+// ===== charts-users: site-wide users chart (UsersChart) =====
+
+// shape {local,remote} {total,inc,dec} arrays len=limit; a signup bumps the
+// local latest bucket, remote stays zero.
+#[tokio::test]
+async fn charts_users_shape_and_signup_commits() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_charts_users").await;
+    let app = crate::build_router(test_state(pool));
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+
+    // shape: {local, remote}, each {total, inc, dec} arrays limit-long
+    let (s, chart) = post_json(
+        app.clone(),
+        "/api/charts/users",
+        json!({ "span": "hour", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {chart}");
+    for side in ["local", "remote"] {
+        for key in ["total", "inc", "dec"] {
+            assert_eq!(
+                chart[side][key].as_array().map(Vec::len),
+                Some(5),
+                "{side}.{key}: {chart}"
+            );
+        }
+    }
+
+    // the committed signup moved local.total/latest to 1 with inc counted
+    let (s, chart) = post_json(
+        app.clone(),
+        "/api/charts/users",
+        json!({ "span": "hour", "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {chart}");
+    assert_eq!(
+        chart["local"]["total"].as_array().unwrap().last().unwrap(),
+        &json!(1),
+        "signup bumps {span} local.total: {chart}"
+    );
+    assert_eq!(
+        chart["local"]["inc"].as_array().unwrap().last().unwrap(),
+        &json!(1),
+        "signup moves {span} local.inc: {chart}"
+    );
+    assert_eq!(
+        chart["remote"]["total"].as_array().unwrap().last().unwrap(),
+        &json!(0),
+        "remote untouched: {chart}"
+    );
+
+    // span required → INVALID_PARAM
+    let (s, e) = post_json(app.clone(), "/api/charts/users", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
+    assert_eq!(e["error"]["code"], "INVALID_PARAM", "body: {e}");
+}

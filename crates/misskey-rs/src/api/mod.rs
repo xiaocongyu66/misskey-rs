@@ -451,6 +451,13 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         if name == "charts/notes" {
             return charts_notes(&state, &body).await;
         }
+        // charts-users arm: same paramDef as charts/notes (span required
+        // day|hour, limit 1..500 default 30, offset nullable ms) — the read
+        // is mk-db users_chart (UsersChart.getChart port) in charts_users
+        // below; no userId (site-wide counts only).
+        if name == "charts/users" {
+            return charts_users(&state, &body).await;
+        }
         // ff-arena: persist meta."federation" on admin/update-meta BEFORE the
         // note/freq lane arms — those `return` on the name, so an arm placed
         // after them never ran (census 39212045330: the ff-visibility.ts
@@ -1330,6 +1337,22 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
         if let Err(err) = mk_db::admin::stamp_root_user_id_if_unset(pool, &outcome.user_id).await {
             tracing::error!(target: "dbg_signup", %err, "rootUserId stamp failed");
             return api_err(ApiError::internal_error());
+        }
+        // charts-users: UsersChart.update('local', true) rides the committed
+        // signup (hour + day pair, total+1/inc+1) — best-effort like the
+        // notes chart writes; a chart failure logs, never fails signup.
+        for span in ["hour", "day"] {
+            if let Err(err) = mk_db::charts::update_users(
+                pool,
+                span,
+                mk_db::charts::bucket(span, now_ms() as i64),
+                "local",
+                true,
+            )
+            .await
+            {
+                tracing::error!(target: "dbg_signup", %err, "charts update_users[signup]");
+            }
         }
         // email-leg: persist the not-yet-verified email + its code (upstream
         // SignupService hands them to EmailService for delivery; the NoopSender
@@ -4323,6 +4346,50 @@ async fn charts_notes(state: &AppState, body: &Value) -> Response {
         Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
         Err(e) => {
             tracing::error!(target: "dbg_notes", error = %e, "notes_chart");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// `POST /api/charts/users` (endpoints/charts/users.ts) — the site-wide
+/// users-count chart. Same paramDef as charts/notes minus the userId
+/// (guest-ok); the read is mk-db users_chart.
+async fn charts_users(state: &AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let invalid = || {
+        api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "INVALID_PARAM",
+            "3d81ceae-475f-4600-b2a8-2bc116157532",
+            "Invalid param.",
+        ))
+    };
+    let span = match body.get("span").and_then(|v| v.as_str()) {
+        Some(s @ ("day" | "hour")) => s,
+        _ => return invalid(),
+    };
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 30usize,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=500) => n as usize,
+            _ => return invalid(),
+        },
+    };
+    let offset = match body.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(0) => None,
+            Some(ms) => Some(ms),
+            None => return invalid(),
+        },
+    };
+    match mk_db::charts::users_chart(pool, span, limit, offset).await {
+        Ok(chart) => (StatusCode::OK, Json(chart)).into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_notes", error = %e, "users_chart");
             api_err(ApiError::internal_error())
         }
     }
