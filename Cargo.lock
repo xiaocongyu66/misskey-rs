@@ -1079,6 +1079,7 @@ name = "mk-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "bcrypt",
  "mk-db",
  "mk-types",
@@ -1086,9 +1087,12 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]

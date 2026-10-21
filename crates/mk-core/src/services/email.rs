@@ -3,9 +3,10 @@
 //! Upstream (`packages/backend/src/core/EmailService.ts`) sends mail through a
 //! configured SMTP transport and no-ops when SMTP is not configured. This
 //! module defines the seam: a dyn-compatible [`EmailSender`] so a coordinator
-//! can wire either the [`NoopSender`] (no SMTP configured) or a future
-//! [`SmtpSender`] transport. Nothing is wired yet — the seam + contract tests
-//! only.
+//! can wire either the [`NoopSender`] (no SMTP configured) or an [`SmtpSender`]
+//! transport. The SMTP transport speaks plain RFC 5321 on port 25/test
+//! endpoints and STARTTLS (rustls + webpki roots, same provider as
+//! `tls_http`) with optional AUTH PLAIN credentials elsewhere.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,23 +32,47 @@ impl EmailSender for NoopSender {
 }
 
 /// Minimal SMTP transport (upstream `EmailService.ts` builds the envelope
-/// through nodemailer; this hand-rolls the RFC 5321 command sequence over a
-/// plain tokio TCP stream — no AUTH/STARTTLS/8BITMIME extensions, TLS is a
-/// documented TODO).
+/// through nodemailer; this hand-rolls the RFC 5321 command sequence).
+///
+/// When [`use_tls`](Self::use_tls) is true (the default, mirroring upstream
+/// nodemailer's `secure: true`) the session is upgraded with STARTTLS before
+/// AUTH/envelope; the plain path is kept for trusted port-25 relays and the
+/// in-process test server.
 pub struct SmtpSender {
     pub host: String,
     pub port: u16,
     /// `None` keeps the historical `no-reply@mk-rs` envelope sender (the
     /// tests / unwired seam); `Some(pool)` reads `meta.email` at send time.
     pub pool: Option<mk_db::sqlx::PgPool>,
+    /// AUTH PLAIN username. `None` (together with `password: None`) skips
+    /// AUTH; both must be set to authenticate.
+    pub username: Option<String>,
+    /// AUTH PLAIN password; must be set together with `username`.
+    pub password: Option<String>,
+    /// Run STARTTLS + AUTH (default `true`). Set `false` only for trusted
+    /// plaintext relays (port 25) and the in-process test server.
+    pub use_tls: bool,
+}
+
+impl Default for SmtpSender {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: 25,
+            pool: None,
+            username: None,
+            password: None,
+            use_tls: true,
+        }
+    }
 }
 
 /// One SMTP line reply (`252 code + text`); `Err` carries the code on a
 /// mismatch.
-async fn expect_code(
-    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    want: &str,
-) -> Result<(), String> {
+async fn expect_code<R>(reader: &mut R, want: &str) -> Result<(), String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     use tokio::io::AsyncBufReadExt;
     let mut line = String::new();
     // last line of a reply has ' ' after the code; intermediate '-' lines loop
@@ -70,24 +95,76 @@ async fn expect_code(
     }
 }
 
+/// AUTH PLAIN initial response: `base64("\0user\0pass")` (RFC 4616).
+fn auth_plain(username: &str, password: &str) -> String {
+    use base64::Engine;
+    let raw = format!("\0{username}\0{password}");
+    base64::engine::general_purpose::STANDARD.encode(raw)
+}
+
 impl SmtpSender {
-    async fn deliver(&self, to: &str, subject: &str, html: &str, text: &str) -> Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// Host/port transport with the default policy (STARTTLS on, no AUTH).
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            ..Self::default()
+        }
+    }
 
-        let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(|e| format!("smtp connect: {e}"))?;
-        let (read_half, mut writer) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(read_half);
-
-        expect_code(&mut reader, "220").await?;
-        let cmd = |s: String| format!("{s}\r\n");
+    /// Writes one CRLF-terminated SMTP command.
+    async fn write_line<W>(writer: &mut W, line: &str) -> Result<(), String>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
         writer
-            .write_all(cmd("EHLO mk-rs".into()).as_bytes())
+            .write_all(format!("{line}\r\n").as_bytes())
             .await
-            .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "250").await?;
+            .map_err(|e| format!("smtp write: {e}"))
+    }
 
+    async fn ehlo<R, W>(reader: &mut R, writer: &mut W) -> Result<(), String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        Self::write_line(writer, "EHLO mk-rs").await?;
+        expect_code(reader, "250").await
+    }
+
+    /// AUTH PLAIN when credentials are configured (both-or-neither).
+    async fn auth<R, W>(&self, reader: &mut R, writer: &mut W) -> Result<(), String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        match (&self.username, &self.password) {
+            (None, None) => Ok(()),
+            (Some(user), Some(pass)) => {
+                let token = auth_plain(user, pass);
+                Self::write_line(writer, &format!("AUTH PLAIN {token}")).await?;
+                expect_code(reader, "235").await
+            }
+            _ => Err("smtp auth: username and password must be set together".into()),
+        }
+    }
+
+    /// MAIL FROM / RCPT TO / DATA / QUIT over an established session whose
+    /// greeting and EHLO have already been consumed.
+    async fn envelope<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: &str,
+    ) -> Result<(), String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         // minimal MIME multipart/alternative (text + html parts)
         let boundary = "mk-rs-alt-boundary";
         let body = format!(
@@ -112,36 +189,92 @@ impl SmtpSender {
             Some(pool) => crate::services::config::email_from(pool).await,
             None => crate::services::config::DEFAULT_EMAIL_FROM.to_string(),
         };
-        writer
-            .write_all(cmd(format!("MAIL FROM:<{from}>")).as_bytes())
-            .await
-            .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "250").await?;
-        writer
-            .write_all(cmd(format!("RCPT TO:<{to}>")).as_bytes())
-            .await
-            .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "250").await?;
-        writer
-            .write_all(cmd("DATA".into()).as_bytes())
-            .await
-            .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "354").await?;
+        Self::write_line(writer, &format!("MAIL FROM:<{from}>")).await?;
+        expect_code(reader, "250").await?;
+        Self::write_line(writer, &format!("RCPT TO:<{to}>")).await?;
+        expect_code(reader, "250").await?;
+        Self::write_line(writer, "DATA").await?;
+        expect_code(reader, "354").await?;
         let payload = format!(
             "To: {to}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n{stuffed}.\r\n"
         );
+        use tokio::io::AsyncWriteExt;
         writer
             .write_all(payload.as_bytes())
             .await
             .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "250").await?;
-        writer
-            .write_all(cmd("QUIT".into()).as_bytes())
-            .await
-            .map_err(|e| format!("smtp write: {e}"))?;
-        expect_code(&mut reader, "221").await?;
-        let _ = &mut writer;
+        expect_code(reader, "250").await?;
+        Self::write_line(writer, "QUIT").await?;
+        expect_code(reader, "221").await?;
         Ok(())
+    }
+
+    /// Plain TCP path (port 25 / test endpoints). No STARTTLS, no AUTH.
+    async fn deliver(&self, to: &str, subject: &str, html: &str, text: &str) -> Result<(), String> {
+        let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| format!("smtp connect: {e}"))?;
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+
+        expect_code(&mut reader, "220").await?;
+        Self::ehlo(&mut reader, &mut writer).await?;
+        self.envelope(&mut reader, &mut writer, to, subject, html, text)
+            .await
+    }
+
+    /// STARTTLS path (upstream nodemailer `secure: true`):
+    /// greeting → EHLO → STARTTLS/220 → TLS handshake (webpki roots, SNI =
+    /// `host`) → EHLO → AUTH PLAIN (when credentials are set) → envelope.
+    pub async fn deliver_tls(
+        &self,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| format!("smtp connect: {e}"))?;
+        let (read_half, writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut writer = writer;
+
+        expect_code(&mut reader, "220").await?;
+        Self::ehlo(&mut reader, &mut writer).await?;
+        Self::write_line(&mut writer, "STARTTLS").await?;
+        expect_code(&mut reader, "220").await?;
+
+        // The peer sends nothing between the 220 and our ClientHello, so the
+        // BufReader holds no extra bytes; reunite hands the raw socket to
+        // rustls for the handshake.
+        let tcp = reader
+            .into_inner()
+            .reunite(writer)
+            .map_err(|_| "smtp tls: stream reunite failed".to_string())?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let server_name: rustls::pki_types::ServerName<'static> = self
+            .host
+            .clone()
+            .try_into()
+            .map_err(|e| format!("smtp tls server name {:?}: {e}", self.host))?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| format!("smtp tls handshake: {e}"))?;
+
+        let (read_half, mut writer) = tokio::io::split(tls);
+        let mut reader = tokio::io::BufReader::new(read_half);
+        Self::ehlo(&mut reader, &mut writer).await?;
+        self.auth(&mut reader, &mut writer).await?;
+        self.envelope(&mut reader, &mut writer, to, subject, html, text)
+            .await
     }
 }
 
@@ -151,7 +284,13 @@ impl EmailSender for SmtpSender {
         let subject = subject.to_string();
         let html = html.to_string();
         let text = text.to_string();
-        Box::pin(async move { self.deliver(&to, &subject, &html, &text).await })
+        Box::pin(async move {
+            if self.use_tls {
+                self.deliver_tls(&to, &subject, &html, &text).await
+            } else {
+                self.deliver(&to, &subject, &html, &text).await
+            }
+        })
     }
 }
 
@@ -251,6 +390,11 @@ mod email4_tests {
                 log2.lock().await.push(cmd.clone());
                 if cmd.starts_with("EHLO") {
                     writer.write_all(b"250 fake\r\n").await.unwrap();
+                } else if cmd == "STARTTLS" {
+                    // advertise acceptance, then drop the socket: the client's
+                    // TLS handshake must fail (no real cert infra in tests)
+                    writer.write_all(b"220 go ahead\r\n").await.unwrap();
+                    break;
                 } else if cmd.starts_with("MAIL FROM") {
                     writer.write_all(b"250 ok\r\n").await.unwrap();
                 } else if cmd.starts_with("RCPT TO") {
@@ -288,7 +432,8 @@ mod email4_tests {
         let sender = SmtpSender {
             host: addr.ip().to_string(),
             port: addr.port(),
-            pool: None,
+            use_tls: false,
+            ..Default::default()
         };
         sender
             .send_email("user@dest.test", "verify", "<p>hi</p>", "..leading dot")
@@ -324,7 +469,8 @@ mod email4_tests {
         let sender = SmtpSender {
             host: addr.ip().to_string(),
             port: addr.port(),
-            pool: None,
+            use_tls: false,
+            ..Default::default()
         };
         tx.send("user@reject.test".into()).await.unwrap();
         let out = sender
@@ -332,5 +478,33 @@ mod email4_tests {
             .await;
         let err = out.unwrap_err();
         assert!(err.contains("550"), "err: {err}");
+    }
+
+    /// AUTH PLAIN payload is `base64("\0user\0pass")` (RFC 4616).
+    #[test]
+    fn auth_plain_matches_rfc4616_base64() {
+        assert_eq!(auth_plain("user", "pass"), "AHVzZXIAcGFzcw==");
+        assert_eq!(auth_plain("", ""), "AAA=");
+    }
+
+    /// No real TLS test (self-signed cert infra is out of scope): against the
+    /// plain fake server the `use_tls` branch must run STARTTLS and then fail
+    /// at the handshake once the peer drops the socket.
+    #[tokio::test]
+    async fn use_tls_against_plain_server_fails_at_handshake() {
+        let (addr, log, _tx) = spawn_fake_smtp().await;
+        let sender = SmtpSender {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            use_tls: true,
+            ..Default::default()
+        };
+        let err = sender
+            .send_email("user@dest.test", "verify", "<p>hi</p>", "hi")
+            .await
+            .unwrap_err();
+        assert!(err.contains("smtp tls handshake"), "err: {err}");
+        // the TLS branch really did negotiate STARTTLS first
+        assert!(log.lock().await.iter().any(|c| c == "STARTTLS"));
     }
 }

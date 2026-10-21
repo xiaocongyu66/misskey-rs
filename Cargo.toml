@@ -24,6 +24,14 @@ axum = { version = "0.8", features = ["ws"] }
 # drive lane: reqwest = the DriveService.uploadFromUrl downloader; futures-util
 # = the /streaming websocket hub (split + forward task over ws::WebSocket).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# smtp-tls: raw TLS-wrapped TCP for SMTP STARTTLS (SMTP is not HTTP, so the
+# reqwest client is unusable). Same ring provider + webpki roots the reqwest
+# chain already pins in Cargo.lock — default features stay off so aws-lc-rs
+# is never pulled in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+base64 = "0.22"
 futures-util = "0.3"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
