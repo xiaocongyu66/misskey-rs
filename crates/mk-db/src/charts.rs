@@ -548,13 +548,6 @@ fn span_step(span: &str) -> i64 {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// One row's non-unique `___` counters as (column base, value) pairs.
 /// Decodes INT2 (smallint) as i16 — the baseline mixes INT2/INT4 columns.
 async fn flat_counts(
