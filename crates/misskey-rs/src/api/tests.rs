@@ -17956,7 +17956,12 @@ async fn notes_more_batch_flow() {
     .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let renote_id = v["createdNote"]["id"].as_str().unwrap().to_string();
-    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/renotes",
+        json!({ "noteId": target }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "renotes: {v}");
     assert_eq!(v.as_array().map(|x| x.len()), Some(1), "{v}");
     assert_eq!(v[0]["id"], json!(renote_id), "{v}");
@@ -17984,7 +17989,10 @@ async fn notes_more_batch_flow() {
         .filter_map(|n| n["id"].as_str())
         .collect();
     assert!(ids.contains(&reply_id.as_str()), "children: {v}");
-    assert!(!ids.contains(&renote_id.as_str()), "pure renote excluded: {v}");
+    assert!(
+        !ids.contains(&renote_id.as_str()),
+        "pure renote excluded: {v}"
+    );
 
     // --- conversation walks the reply chain upward ---
     let (s, v) = post_json(
@@ -18005,7 +18013,12 @@ async fn notes_more_batch_flow() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, v) = post_json(app.clone(), "/api/notes/renotes", json!({ "noteId": target })).await;
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/renotes",
+        json!({ "noteId": target }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v.as_array().map(|x| x.len()), Some(0), "{v}");
 
