@@ -38,6 +38,20 @@ pub async fn get_text(url: &str) -> Result<String, String> {
     get(url, "text/plain, */*").await
 }
 
+/// `POST url` with the given headers and body; returns the status code.
+/// Used by the push lane for the https WebPush endpoints.
+pub async fn post(url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<u16, String> {
+    let mut req = CLIENT.post(url).body(body.to_vec());
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("tls http post {url}: {e}"))?;
+    Ok(response.status().as_u16())
+}
+
 async fn get(url: &str, accept: &str) -> Result<String, String> {
     let response = CLIENT
         .get(url)

@@ -75,11 +75,8 @@ pub async fn send_to_user(
         if notif_type == "readAllNotifications" && !row.send_read_message {
             continue;
         }
-        let Some((host, port, path, origin)) = endpoint_parts(&row.endpoint) else {
-            eprintln!(
-                "push: skip {} (https needs a real client / unparseable endpoint)",
-                row.endpoint
-            );
+        let Some((host, port, path, origin, tls)) = endpoint_parts(&row.endpoint) else {
+            eprintln!("push: skip {} (unparseable endpoint)", row.endpoint);
             continue;
         };
         let Some(jwt) = crate::services::web_push::vapid_jwt(&origin, &sub, &key, chrono_ms())
@@ -115,7 +112,24 @@ pub async fn send_to_user(
                 empty.as_slice()
             }
         };
-        match post_push(&host, port, &path, &jwt, &k, push_body).await {
+        let push_result = if tls {
+            // https endpoints ride the shared TLS client
+            let auth = format!("vapid t={jwt}, k={k}");
+            crate::services::tls_http::post(
+                &row.endpoint,
+                &[
+                    ("Authorization", auth.as_str()),
+                    ("Content-Encoding", "aes128gcm"),
+                    ("TTL", "2419200"),
+                    ("Content-Type", "application/octet-stream"),
+                ],
+                push_body,
+            )
+            .await
+        } else {
+            post_push(&host, port, &path, &jwt, &k, push_body).await
+        };
+        match push_result {
             Ok(status) => {
                 if status == 404 || status == 410 {
                     // upstream L131-139: endpoint gone → drop the subscription
@@ -142,8 +156,12 @@ pub async fn send_to_user(
 
 /// `scheme://host[:port]/path` -> (host, port, path, origin). Plain-http
 /// delivery only (see module docs); `https://` yields None here.
-fn endpoint_parts(endpoint: &str) -> Option<(String, u16, String, String)> {
-    let rest = endpoint.strip_prefix("http://")?;
+fn endpoint_parts(endpoint: &str) -> Option<(String, u16, String, String, bool)> {
+    let (rest, tls, default_port) = if let Some(r) = endpoint.strip_prefix("https://") {
+        (r, true, 443)
+    } else {
+        (endpoint.strip_prefix("http://")?, false, 80)
+    };
     let (authority, path) = match rest.find('/') {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
@@ -155,13 +173,14 @@ fn endpoint_parts(endpoint: &str) -> Option<(String, u16, String, String)> {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
             (h, p.parse::<u16>().ok()?)
         }
-        _ => (authority, 80),
+        _ => (authority, default_port),
     };
     if host.is_empty() {
         return None;
     }
-    let origin = format!("http://{authority}");
-    Some((host.to_string(), port, path.to_string(), origin))
+    let scheme = if tls { "https" } else { "http" };
+    let origin = format!("{scheme}://{authority}");
+    Some((host.to_string(), port, path.to_string(), origin, tls))
 }
 
 /// One wire attempt: VAPID auth header + aes128gcm marker + empty body.
@@ -241,16 +260,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_parts_splits_http_urls_only() {
-        let (host, port, path, origin) =
+    fn endpoint_parts_splits_http_and_https() {
+        let (host, port, path, origin, tls) =
             endpoint_parts("http://127.0.0.1:9/dead/endpoint").expect("parts");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 9);
         assert_eq!(path, "/dead/endpoint");
         assert_eq!(origin, "http://127.0.0.1:9");
-        // scheme-less / https / garbage all refuse (https = client TODO)
+        assert!(!tls);
+        // https rides the TLS client now: default port 443, tls flag set
+        let (host, port, _, origin, tls) =
+            endpoint_parts("https://push.example.test/send").expect("https parts");
+        assert_eq!(
+            (host.as_str(), port, origin.as_str(), tls),
+            ("push.example.test", 443, "https://push.example.test", true)
+        );
+        // scheme-less / garbage still refuse
         assert!(endpoint_parts("push.example.test/send").is_none());
-        assert!(endpoint_parts("https://push.example.test/send").is_none());
         assert!(endpoint_parts("http:///nohost").is_none());
     }
 }
