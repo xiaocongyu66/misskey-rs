@@ -269,16 +269,16 @@ mod email4_tests {
             seq.iter()
                 .any(|c| c.starts_with("MAIL FROM:<no-reply@mk-rs>"))
         );
-        assert!(seq.iter().any(|c| c.as_str() == "RCPT TO:<user@dest.test>"));
-        assert!(seq.iter().any(|c| c == "DATA"));
+        assert!(seq.iter().any(|c| *c == "RCPT TO:<user@dest.test>"));
+        assert!(seq.iter().any(|c| *c == "DATA"));
         assert_eq!(seq.last().copied(), Some("QUIT"));
         // the body's leading-dot line arrives dot-stuffed ("...leading dot")
         assert!(
-            log.iter().any(|c| c.as_str() == "...leading dot"),
+            log.iter().any(|c| *c == "...leading dot"),
             "dot-stuffing: {log:?}"
         );
         // and the terminating "." was NOT stuffed
-        assert!(log.iter().any(|c| c.as_str() == "."));
+        assert!(log.iter().any(|c| *c == "."));
     }
 
     #[tokio::test]
