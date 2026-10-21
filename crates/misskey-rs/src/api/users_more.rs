@@ -160,10 +160,7 @@ async fn optional_me(
     }
 }
 
-fn user_lite(
-    state: &AppState,
-    row: &mk_db::user::LocalUserRow,
-) -> Value {
+fn user_lite(state: &AppState, row: &mk_db::user::LocalUserRow) -> Value {
     let ctx = mk_core::services::user_pack::InstanceCtx {
         url: &state.config.url,
         host: &state.config.host(),
@@ -246,8 +243,7 @@ pub(crate) async fn handle(
             | "users/lists/pull"
             | "users/lists/create-from-public"
     ) {
-        match super::social::require_checked_user(pool, token.as_deref(), credential_declared)
-            .await
+        match super::social::require_checked_user(pool, token.as_deref(), credential_declared).await
         {
             Ok(id) => Some(id),
             Err(resp) => return resp,
@@ -262,8 +258,12 @@ pub(crate) async fn handle(
         "users/lists/get-memberships" => {
             lists_get_memberships(state, pool, body, token.as_deref()).await
         }
-        "users/lists/update" => lists_update(pool, body, me_id.as_deref().unwrap_or_default()).await,
-        "users/lists/delete" => lists_delete(pool, body, me_id.as_deref().unwrap_or_default()).await,
+        "users/lists/update" => {
+            lists_update(pool, body, me_id.as_deref().unwrap_or_default()).await
+        }
+        "users/lists/delete" => {
+            lists_delete(pool, body, me_id.as_deref().unwrap_or_default()).await
+        }
         "users/lists/favorite" => {
             lists_favorite(pool, body, me_id.as_deref().unwrap_or_default()).await
         }
@@ -303,7 +303,7 @@ async fn users_relation(
                         return Err(invalid_param(
                             "userId",
                             "array items must be misskey:id strings",
-                        ))
+                        ));
                     }
                 }
             }
@@ -313,7 +313,7 @@ async fn users_relation(
             return Err(invalid_param(
                 "userId",
                 "required (string or array of misskey:id)",
-            ))
+            ));
         }
     };
 
