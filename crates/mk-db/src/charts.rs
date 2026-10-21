@@ -366,8 +366,8 @@ pub async fn users_chart(
     for (idx, key) in ["total", "inc", "dec"].iter().enumerate() {
         let get = |c: &UserCounts| match idx {
             0 => c.total,
-            1 => c.inc,
-            _ => c.dec,
+            1 => c.inc as i32,
+            _ => c.dec as i32,
         };
         local.insert(
             (*key).to_string(),
