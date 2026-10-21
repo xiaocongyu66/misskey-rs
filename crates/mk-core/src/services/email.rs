@@ -37,6 +37,9 @@ impl EmailSender for NoopSender {
 pub struct SmtpSender {
     pub host: String,
     pub port: u16,
+    /// `None` keeps the historical `no-reply@mk-rs` envelope sender (the
+    /// tests / unwired seam); `Some(pool)` reads `meta.email` at send time.
+    pub pool: Option<mk_db::sqlx::PgPool>,
 }
 
 /// One SMTP line reply (`252 code + text`); `Err` carries the code on a
@@ -103,8 +106,14 @@ impl SmtpSender {
             })
             .collect();
 
+        // envelope sender from meta.email when a pool is wired, else the
+        // historical literal (0001 has no meta.url to derive a host from)
+        let from = match &self.pool {
+            Some(pool) => crate::services::config::email_from(pool).await,
+            None => crate::services::config::DEFAULT_EMAIL_FROM.to_string(),
+        };
         writer
-            .write_all(cmd(format!("MAIL FROM:<no-reply@mk-rs>")).as_bytes())
+            .write_all(cmd(format!("MAIL FROM:<{from}>")).as_bytes())
             .await
             .map_err(|e| format!("smtp write: {e}"))?;
         expect_code(&mut reader, "250").await?;
@@ -252,6 +261,7 @@ mod email4_tests {
         let sender = SmtpSender {
             host: addr.ip().to_string(),
             port: addr.port(),
+            pool: None,
         };
         sender
             .send_email("user@dest.test", "verify", "<p>hi</p>", "..leading dot")
@@ -287,6 +297,7 @@ mod email4_tests {
         let sender = SmtpSender {
             host: addr.ip().to_string(),
             port: addr.port(),
+            pool: None,
         };
         tx.send("user@reject.test".into()).await.unwrap();
         let out = sender

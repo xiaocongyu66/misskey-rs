@@ -2,6 +2,7 @@
 
 // email4: EmailSender seam (upstream EmailService.sendEmail) + Noop/SMTP
 // senders. Deliberately unwired this slice — seam + contract tests only.
+pub mod config;
 pub mod email;
 pub mod misc;
 // arena-move: account-migration pure helpers — Acct.parse parity, the

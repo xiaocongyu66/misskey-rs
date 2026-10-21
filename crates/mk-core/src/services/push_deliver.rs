@@ -11,10 +11,10 @@
 //!   shape this lane exercises (header set, 404/410 subscription pruning,
 //!   error swallowing) is complete. Upstream payload envelope would be
 //!   `{type, body, userId, dateTime: Date.now()}` JSON.
-//! - **VAPID keypair**: there is NO config yet (upstream reads
-//!   `meta.swPrivateKey` / `config.url`; 0001 carries no swPrivateKey column
-//!   either) — a random 32-byte key is generated per call and `sub` is a
-//!   placeholder `mailto:`. Swap for real config when it lands.
+//! - **VAPID keypair**: `meta."swPrivateKey"` (base64url, 32-byte scalar)
+//!   through [`crate::services::config::push_vapid_key`] gives a stable
+//!   identity; when it is unset we log and keep the historical per-call
+//!   random key. `sub` rides `meta.email` (`mailto:`), else the placeholder.
 //! - **TLS**: the minimal client (mirroring
 //!   [`crate::services::search_bridge`]) speaks plain HTTP only, so
 //!   `https://` endpoints (everything upstream would actually deliver to,
@@ -39,7 +39,7 @@ pub async fn send_to_user(
     body: &serde_json::Value,
 ) -> usize {
     // Upstream bails before any fetch when worker config is absent; the
-    // random per-call key below always "exists", so no early return here.
+    // random fallback key below always "exists", so no early return here.
     let rows = match mk_db::sw::list_by_user(pool, user_id).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -57,7 +57,18 @@ pub async fn send_to_user(
         "dateTime": chrono_ms(),
     });
 
-    let key = random_key32();
+    // Stable VAPID identity from meta when configured; the random key is the
+    // documented fallback (new identity per send, but the leg keeps running).
+    let key = match crate::services::config::push_vapid_key(pool).await {
+        Some(key) => key,
+        None => {
+            eprintln!("push: meta.swPrivateKey unset/invalid — random per-send key");
+            random_key32()
+        }
+    };
+    let sub = crate::services::config::push_mailto(pool)
+        .await
+        .unwrap_or_else(|| "mailto:push@example.invalid".to_string());
     let mut attempted = 0usize;
     for row in &rows {
         // upstream L105-107: read-bookkeeping pushes need the user's opt-in
@@ -71,12 +82,8 @@ pub async fn send_to_user(
             );
             continue;
         };
-        let Some(jwt) = crate::services::web_push::vapid_jwt(
-            &origin,
-            "mailto:push@example.invalid", // TODO(config): config.url / meta sub
-            &key,
-            chrono_ms(),
-        ) else {
+        let Some(jwt) = crate::services::web_push::vapid_jwt(&origin, &sub, &key, chrono_ms())
+        else {
             eprintln!("push: vapid_jwt failed for {}", row.endpoint);
             continue;
         };
