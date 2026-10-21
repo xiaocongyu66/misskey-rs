@@ -15713,3 +15713,50 @@ async fn charts_fed_shape_and_update_commits() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {e}");
     assert_eq!(e["error"]["code"], "INVALID_PARAM", "body: {e}");
 }
+
+// ===== ap-keys: remote keyId fetch (GetAuthService lane) =====
+
+// fetch_actor_key rejects https:// (TLS dead-end) and the fake-actor http
+// path surfaces the connection error without panicking.
+#[tokio::test]
+async fn ap_keys_fetch_rejects_https_and_surfaces_http_errors() {
+    let out = mk_ap::fetch::fetch_actor_key("https://remote.example/users/u#main-key").await;
+    assert_eq!(out.unwrap_err(), "non-http keyId (TLS pending)");
+    // an http keyId whose host is unroutable → connect error string, no panic
+    let out = mk_ap::fetch::fetch_actor_key("http://127.0.0.1:9/users/u").await;
+    assert!(
+        out.unwrap_err().contains("actor fetch connect"),
+        "err: {out:?}"
+    );
+}
+
+// the remote cache probe: a stored remote user row (host NOT NULL + uri)
+// hits, a local row or foreign uri misses.
+#[tokio::test]
+async fn ap_keys_remote_cache_probe_shape() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_ap_keys_probe").await;
+    let uid = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "user" ("id", "username", "usernameLower", "host", "uri") VALUES ($1, $2, $2, $3, $4)"#,
+    )
+    .bind(&uid)
+    .bind("remuser")
+    .bind("remote.example")
+    .bind("http://remote.example/users/u")
+    .execute(&pool)
+    .await
+    .unwrap();
+    // a hit still returns None today (no publicKey column on the baseline)
+    assert_eq!(
+        mk_ap::fetch::remote_key_cached(&pool, "http://remote.example/users/u").await,
+        None
+    );
+    assert_eq!(
+        mk_ap::fetch::remote_key_cached(&pool, "http://remote.example/users/other").await,
+        None
+    );
+}

@@ -4,6 +4,7 @@
 
 // fed-min: the draft-cavage-11 signature-verify skeleton (upstream
 // ApRequestService.ts #genSigningString + InboxProcessorService verify).
+pub mod fetch;
 pub mod signature;
 // fed-min: the inbox POST dispatch skeleton (upstream ApInboxService
 // .performOneActivity; HTTP side answers 202, worker side does the work).

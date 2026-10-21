@@ -110,8 +110,29 @@ pub async fn verify_and_route(
     // config host — `https://<local_host>/users/<id>[#fragment]` — and the
     // owner row must carry a keypair PEM. Remote keyIds stay Err here.
     let parsed = parse_signature_header(&sig_header).ok_or(())?;
-    let owner_id = parse_local_ap_id(&parsed.key_id, local_host, "users").ok_or(())?;
-    let auth = get_auth_user_from_key_id(pool, &owner_id).await?;
+    // local keyIds verify against the local keypair row; REMOTE keyIds ride
+    // the GetAuthService.getKeyById fetch (crates/mk-ap/src/fetch.rs —
+    // best-effort: TLS-less client, errors are the documented dead-ends)
+    let remote_public_key: Option<String> = match parse_local_ap_id(
+        &parsed.key_id,
+        local_host,
+        "users",
+    ) {
+        Ok(owner_id) => None,
+        Err(()) => match crate::fetch::fetch_actor_key(&parsed.key_id).await {
+            Ok(pem) => Some(pem),
+            Err(e) => {
+                tracing::info!(target: "dbg_ap", key_id = %parsed.key_id, error = %e, "remote key fetch failed");
+                return Err(());
+            }
+        },
+    };
+    let verify_key = if let Some(pem) = remote_public_key {
+        pem
+    } else {
+        let owner_id = parse_local_ap_id(&parsed.key_id, local_host, "users").ok_or(())?;
+        get_auth_user_from_key_id(pool, &owner_id).await?.public_key
+    };
 
     // the RSA verify itself (the keyId came back through parse already)
     verify_http_signature(
@@ -122,24 +143,51 @@ pub async fn verify_and_route(
         body,
         &header("date").unwrap_or_default(),
         &header("digest").unwrap_or_default(),
-        &auth.public_key,
+        &verify_key,
     )?;
 
-    // the InboxProcessorService actor gate: the signer must BE activity.actor
+    // the InboxProcessorService actor gate: the signer must BE activity.actor.
+    // The local lane compares against the auth user row; the REMOTE lane (no
+    // auth row — person ingest pending) checks the keyId prefix against the
+    // actor and stops after verify (routing lanes need the person row).
     let activity: Value = serde_json::from_slice(body).map_err(|_| ())?;
-    if !actor_matches_auth_user(activity.get("actor"), &auth, local_host) {
+    if let Ok(owner_id) = parse_local_ap_id(&parsed.key_id, local_host, "users") {
+        let auth = get_auth_user_from_key_id(pool, &owner_id).await?;
+        if !actor_matches_auth_user(activity.get("actor"), &auth, local_host) {
+            return Err(());
+        }
+        if auth.is_suspended {
+            return Ok(RouteEffect::Skipped("skip: actor is suspended"));
+        }
+        return route_local(pool, &auth, &activity, local_host).await;
+    }
+    let actor_uri = activity
+        .get("actor")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let key_base = parsed.key_id.split('#').next().unwrap_or(&parsed.key_id);
+    if !key_base.is_empty() && !actor_uri.starts_with(key_base) {
         return Err(());
     }
-    // performOneActivity's suspended gate: `if (actor.isSuspended) return`
-    if auth.is_suspended {
-        return Ok(RouteEffect::Skipped("skip: actor is suspended"));
-    }
+    return Ok(RouteEffect::Skipped(
+        "remote actor verified (person ingest + routing lanes pending)",
+    ));
+}
 
-    match classify(&activity) {
-        ActivityKind::Create => create_note(pool, &auth, &activity, local_host).await,
-        ActivityKind::Follow => follow(pool, &auth, &activity, local_host).await,
-        ActivityKind::Like => like(pool, &auth, &activity, local_host).await,
-        ActivityKind::Undo => undo(pool, &auth, &activity, local_host).await,
+/// The local actor's routing ladder (Create/Follow/Like/Undo) — extracted
+/// when the remote keyId arm landed so verify_and_route could branch before
+/// the auth-row lookup.
+async fn route_local(
+    pool: &PgPool,
+    auth: &AuthUserRow,
+    activity: &Value,
+    local_host: &str,
+) -> Result<RouteEffect, ()> {
+    match classify(activity) {
+        ActivityKind::Create => create_note(pool, auth, activity, local_host).await,
+        ActivityKind::Follow => follow(pool, auth, activity, local_host).await,
+        ActivityKind::Like => like(pool, auth, activity, local_host).await,
+        ActivityKind::Undo => undo(pool, auth, activity, local_host).await,
         // Delete and the remaining upstream arms keep their worker lanes
         // pending (Delete{Person} tombstones, Update, Accept, ...).
         ActivityKind::Delete | ActivityKind::Other => {
