@@ -285,8 +285,9 @@ pub async fn update_users(
 #[derive(Debug, Default, Clone)]
 struct UserCounts {
     total: i32,
-    inc: i32,
-    dec: i32,
+    // 0001:865-869 — inc/dec are smallint on the users chart (total integer)
+    inc: i16,
+    dec: i16,
 }
 
 async fn users_counts(
@@ -303,7 +304,7 @@ async fn users_counts(
                   "___remote_total", "___remote_inc", "___remote_dec"
            FROM "{table}" WHERE "date" = $1"#
     );
-    let row = sqlx::query_as::<_, (i32, i32, i32, i32, i32, i32)>(&sql)
+    let row = sqlx::query_as::<_, (i32, i16, i16, i32, i16, i16)>(&sql)
         .bind(date as i32)
         .fetch_optional(pool)
         .await?;
