@@ -19,12 +19,13 @@
 //! upstream's `user_publickey` (keyId-keyed) rows. Local keyIds therefore
 //! route by the `ApDbResolverService.parseUri` rule
 //! (`https://<config host>/users/<id>`, fragment allowed) instead of a keyId
-//! lookup. Remote keyIds are the resolver boundary of this slice: they
-//! return [`Err`] (the caller answers 202 anyway — the HTTP row already
-//! accepted the job upstream-side; the failure is a worker job reason).
-//! Remote-fetch stubs (resolving a string `activity.object`, extracting
-//! emojis, following out to remote inboxes) do not exist here — every arm
-//! degrades to a documented [`RouteEffect::Skipped`] or Err.
+//! lookup. Remote keyIds ride the key fetch ([`crate::fetch`]); after verify
+//! the actor is ingested through [`crate::person::ensure_remote_person`] and
+//! the activity routes against that row ([`route_remote`]) with the same
+//! Create{Note}/Follow/Like/Undo arms as the local ladder.
+//! Remote-fetch stubs that still do not exist here (resolving a string
+//! `activity.object`, renotes-to-remote, extracting emojis, following out to
+//! remote inboxes) degrade to a documented [`RouteEffect::Skipped`] or Err.
 
 use mk_db::sqlx::PgPool;
 use serde_json::Value;
@@ -150,7 +151,7 @@ pub async fn verify_and_route(
     // the InboxProcessorService actor gate: the signer must BE activity.actor.
     // The local lane compares against the auth user row; the REMOTE lane checks
     // the keyId prefix against the actor, verifies, ingests the person row, and
-    // stops (routing lanes for remote actors are a separate slice).
+    // hands off to route_remote (Create/Follow/Like/Undo against that row).
     let activity: Value = serde_json::from_slice(body).map_err(|_| ())?;
     if let Some(owner_id) = parse_local_ap_id(&parsed.key_id, local_host, "users") {
         let auth = get_auth_user_from_key_id(pool, &owner_id).await?;
@@ -190,9 +191,58 @@ pub async fn verify_and_route(
         }
     };
     tracing::info!(target: "dbg_ap", actor = %actor_uri, user_id = %user_id, "remote actor ingested");
-    Ok(RouteEffect::Skipped(
-        "remote actor ingested (routing lanes pending)",
-    ))
+    route_remote(pool, &user_id, &actor_uri, &activity, local_host).await
+}
+
+/// The remote actor's routing ladder, hung off the ingested person row:
+/// `remote_user_id` is the `user.id` returned by `ensure_remote_person` and
+/// `actor_uri` is the verified actor id (the Create attribution and the
+/// `note.userHost` source). Upstream `ApInboxService.performOneActivity`
+/// resolves the actor through ApPersonService first and then runs the same
+/// arms as the local ladder — the only difference is the author/follower id.
+///
+/// Create{Note} → the shared inline-note insert with the remote author;
+/// Follow → a direct `following` row toward a LOCAL followee; Like → the
+/// plain reaction row; Undo{Follow} → delete that row. Everything else keeps
+/// its worker lane pending. Renotes-to-remote (an inline Note carrying a
+/// renote reference) are skipped: they need the target resolver + renote row.
+pub async fn route_remote(
+    pool: &PgPool,
+    remote_user_id: &str,
+    actor_uri: &str,
+    activity: &Value,
+    local_host: &str,
+) -> Result<RouteEffect, ()> {
+    let kind = classify(activity);
+    let effect = match kind {
+        ActivityKind::Create => {
+            create_remote_note(pool, remote_user_id, actor_uri, activity).await?
+        }
+        ActivityKind::Follow => follow_by(pool, remote_user_id, activity, local_host).await?,
+        ActivityKind::Like => like_by(pool, remote_user_id, activity, local_host).await?,
+        ActivityKind::Undo => undo_remote(pool, remote_user_id, activity, local_host).await?,
+        ActivityKind::Delete | ActivityKind::Other => {
+            RouteEffect::Skipped("unhandled arm (worker lane pending)")
+        }
+    };
+    // The effect strings: a persisted arm logs "remote <kind> persisted",
+    // every no-op carries the upstream "skip: <reason>" shape.
+    if matches!(
+        &effect,
+        RouteEffect::NoteCreated { .. }
+            | RouteEffect::Followed
+            | RouteEffect::Liked { .. }
+            | RouteEffect::Unfollowed
+    ) {
+        tracing::info!(
+            target: "dbg_ap",
+            actor = %actor_uri,
+            user_id = %remote_user_id,
+            "remote {} persisted",
+            kind.as_str().to_ascii_lowercase()
+        );
+    }
+    Ok(effect)
 }
 
 /// The local actor's routing ladder (Create/Follow/Like/Undo) — extracted
@@ -297,6 +347,47 @@ async fn create_note(
     activity: &Value,
     local_host: &str,
 ) -> Result<RouteEffect, ()> {
+    // upstream: absent attributedTo defaults to the actor (create() copies
+    // activity.actor over), and a mismatching one is the createNote skip.
+    let actor_uri = auth
+        .uri
+        .clone()
+        .unwrap_or_else(|| format!("https://{local_host}/users/{}", auth.id));
+    create_note_from(pool, &auth.id, &actor_uri, auth.host.as_deref(), activity).await
+}
+
+/// The remote actor's Create{Note}: the same insert as the local lane with
+/// the ingested person's id + actor uri, and `note.userHost` set from the
+/// actor's host (the local lane leaves it NULL). Renotes-to-remote carry a
+/// renote reference in the object and need the target resolver + renote row
+/// — skipped until that worker lane lands.
+async fn create_remote_note(
+    pool: &PgPool,
+    user_id: &str,
+    actor_uri: &str,
+    activity: &Value,
+) -> Result<RouteEffect, ()> {
+    if let Some(note) = activity.get("object").and_then(Value::as_object) {
+        if note.contains_key("renoteId") || note.contains_key("_misskey_renote") {
+            return Ok(RouteEffect::Skipped(
+                "skip: renotes-to-remote not supported (worker lane pending)",
+            ));
+        }
+    }
+    let user_host = uri_host(actor_uri).map(|h| h.to_ascii_lowercase());
+    create_note_from(pool, user_id, actor_uri, user_host.as_deref(), activity).await
+}
+
+/// The shared Create{Note} body (local + remote authors): inline objects
+/// only, `uri` = object.id, `text` = content folded, visibility from the
+/// audience merge, `userHost` = the author's host column (NULL local).
+async fn create_note_from(
+    pool: &PgPool,
+    user_id: &str,
+    actor_uri: &str,
+    user_host: Option<&str>,
+    activity: &Value,
+) -> Result<RouteEffect, ()> {
     let Some(object) = activity.get("object") else {
         return Ok(RouteEffect::Skipped(
             "skip: activity has no object property",
@@ -312,12 +403,6 @@ async fn create_note(
         return Ok(RouteEffect::Skipped("skip: note.id is not a string"));
     };
 
-    // upstream: absent attributedTo defaults to the actor (create() copies
-    // activity.actor over), and a mismatching one is the createNote skip.
-    let actor_uri = auth
-        .uri
-        .clone()
-        .unwrap_or_else(|| format!("https://{local_host}/users/{}", auth.id));
     if let Some(attributed) = get_ap_id(note.get("attributedTo")) {
         if attributed != actor_uri {
             return Ok(RouteEffect::Skipped(
@@ -326,7 +411,9 @@ async fn create_note(
         }
     }
     // upstream: host in actor.uri !== note.id → skip
-    let actor_host = auth.host.clone().unwrap_or_else(|| local_host.to_string());
+    let Some(actor_host) = uri_host(actor_uri) else {
+        return Ok(RouteEffect::Skipped("skip: host in actor.uri !== note.id"));
+    };
     if uri_host(uri)
         .map(|h| !h.eq_ignore_ascii_case(&actor_host))
         .unwrap_or(true)
@@ -359,10 +446,10 @@ async fn create_note(
     )
     .bind(&note_id)
     .bind(&text)
-    .bind(&auth.id)
+    .bind(user_id)
     .bind(visibility)
     .bind(uri)
-    .bind(&auth.host)
+    .bind(user_host)
     .execute(pool)
     .await
     .map_err(|_| ())?;
@@ -483,6 +570,17 @@ async fn follow(
     activity: &Value,
     local_host: &str,
 ) -> Result<RouteEffect, ()> {
+    follow_by(pool, &auth.id, activity, local_host).await
+}
+
+/// The follow body keyed by the follower id (local auth user or the ingested
+/// remote person): direct `following` row + counter bumps.
+async fn follow_by(
+    pool: &PgPool,
+    follower_id: &str,
+    activity: &Value,
+    local_host: &str,
+) -> Result<RouteEffect, ()> {
     let Some(followee_id) =
         local_user_id_from_object(activity.get("object"), pool, local_host).await?
     else {
@@ -490,7 +588,7 @@ async fn follow(
     };
     // unique (followerId, followeeId) — a re-delivered Follow is the
     // upstream 'already following' IdentifiableError, i.e. a skip
-    if mk_db::social::following_exists(pool, &auth.id, &followee_id)
+    if mk_db::social::following_exists(pool, follower_id, &followee_id)
         .await
         .map_err(|_| ())?
     {
@@ -499,13 +597,13 @@ async fn follow(
     mk_db::social::insert_following(
         pool,
         &mk_types::id::gen_aid_now(),
-        &auth.id,
+        follower_id,
         &followee_id,
         false,
     )
     .await
     .map_err(|_| ())?;
-    mk_db::social::bump_follow_counts(pool, &auth.id, &followee_id, 1)
+    mk_db::social::bump_follow_counts(pool, follower_id, &followee_id, 1)
         .await
         .map_err(|_| ())?;
     Ok(RouteEffect::Followed)
@@ -556,6 +654,17 @@ async fn like(
     activity: &Value,
     local_host: &str,
 ) -> Result<RouteEffect, ()> {
+    like_by(pool, &auth.id, activity, local_host).await
+}
+
+/// The reaction body keyed by the reacting user id (local auth user or the
+/// ingested remote person): a missing target note is the documented skip.
+async fn like_by(
+    pool: &PgPool,
+    user_id: &str,
+    activity: &Value,
+    local_host: &str,
+) -> Result<RouteEffect, ()> {
     let Some(target_uri) = get_ap_id(activity.get("object")) else {
         return Ok(RouteEffect::Skipped("skip: target note not found"));
     };
@@ -570,7 +679,7 @@ async fn like(
     let Some(note_id) = find_note_by_ap_id(pool, &target_uri, local_host).await? else {
         return Ok(RouteEffect::Skipped("skip: target note not found"));
     };
-    if mk_db::note::find_note_reaction(pool, &note_id, &auth.id)
+    if mk_db::note::find_note_reaction(pool, &note_id, user_id)
         .await
         .map_err(|_| ())?
         .is_some()
@@ -580,7 +689,7 @@ async fn like(
     mk_db::note::insert_note_reaction(
         pool,
         &mk_types::id::gen_aid_now(),
-        &auth.id,
+        user_id,
         &note_id,
         reaction,
     )
@@ -716,6 +825,47 @@ async fn undo_like(
             .map_err(|_| ())?;
     }
     Ok(RouteEffect::Unliked)
+}
+
+/// The remote actor's Undo arm: only Undo{Follow} routes here (delete the
+/// `following` row + counters); the reaction/other object lanes keep their
+/// local worker lanes for now.
+async fn undo_remote(
+    pool: &PgPool,
+    remote_user_id: &str,
+    activity: &Value,
+    local_host: &str,
+) -> Result<RouteEffect, ()> {
+    let Some(inner) = activity.get("object").and_then(|v| v.as_object()) else {
+        return Ok(RouteEffect::Skipped(
+            "resolver boundary: undo object is not an inline object",
+        ));
+    };
+    let inner = Value::Object(inner.clone());
+    match inner.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "Follow" => {
+            let Some(followee_id) =
+                local_user_id_from_object(inner.get("object"), pool, local_host).await?
+            else {
+                return Ok(RouteEffect::Skipped("skip: followee not found"));
+            };
+            if mk_db::social::following_exists(pool, remote_user_id, &followee_id)
+                .await
+                .map_err(|_| ())?
+            {
+                mk_db::social::delete_following(pool, remote_user_id, &followee_id)
+                    .await
+                    .map_err(|_| ())?;
+                mk_db::social::bump_follow_counts(pool, remote_user_id, &followee_id, -1)
+                    .await
+                    .map_err(|_| ())?;
+                Ok(RouteEffect::Unfollowed)
+            } else {
+                Ok(RouteEffect::Skipped("skip: not following"))
+            }
+        }
+        _ => Ok(RouteEffect::Skipped("skip: unknown object type")),
+    }
 }
 
 #[cfg(test)]

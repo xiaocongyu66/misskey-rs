@@ -16491,3 +16491,118 @@ async fn feed_profile_visibility_enum_decodes_as_text() {
         "feed profile enum decoded (count hidden): {body}"
     );
 }
+
+// fed-2 remote routing // — route_remote hangs the Create/Follow/Like/Undo
+// arms off the ingested person row. verify_and_route's remote branch fetches
+// the actor doc over the network, so the routing half is pinned here directly
+// with an ensure_remote_person row (the ingest half has its own unit tests).
+#[tokio::test]
+async fn fed2_remote_activity_routing_persists_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkfed2remote").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+
+    let actor_uri = "https://remote.example/users/alice";
+    let actor_doc = serde_json::json!({
+        "id": actor_uri,
+        "type": "Person",
+        "preferredUsername": "alice",
+        "inbox": "https://remote.example/users/alice/inbox",
+    });
+    let remote_id = mk_ap::person::ensure_remote_person(&pool, actor_uri, &actor_doc)
+        .await
+        .expect("remote person row");
+
+    // --- Create{Note}: remote author id + uri + userHost ---
+    let note_uri = "https://remote.example/notes/r1";
+    let create = serde_json::json!({
+        "type": "Create",
+        "actor": actor_uri,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": {
+            "id": note_uri,
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "<p>remote hi</p>",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+    let effect = mk_ap::processor::route_remote(&pool, &remote_id, actor_uri, &create, FED2_HOST)
+        .await
+        .expect("remote Create routes");
+    assert!(matches!(
+        effect,
+        mk_ap::processor::RouteEffect::NoteCreated { .. }
+    ));
+    let (text, user_id, user_host): (Option<String>, String, Option<String>) =
+        mk_db::sqlx::query_as(
+            r#"SELECT "text", "userId", "userHost" FROM "note" WHERE "uri" = $1"#,
+        )
+        .bind(note_uri)
+        .fetch_one(&pool)
+        .await
+        .expect("remote note row");
+    assert_eq!(text.as_deref(), Some("remote hi"));
+    assert_eq!(user_id, remote_id, "the ingested person is the author");
+    assert_eq!(user_host.as_deref(), Some("remote.example"));
+
+    // --- Follow: remote follower → local followee ---
+    let (local_id, _pem) = fed2_user(&pool, "fed2remoteLocal").await;
+    let local_uri = format!("https://{FED2_HOST}/users/{local_id}");
+    let follow = serde_json::json!({
+        "type": "Follow",
+        "actor": actor_uri,
+        "object": local_uri
+    });
+    let effect = mk_ap::processor::route_remote(&pool, &remote_id, actor_uri, &follow, FED2_HOST)
+        .await
+        .expect("remote Follow routes");
+    assert_eq!(effect, mk_ap::processor::RouteEffect::Followed);
+    let rows: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+    )
+    .bind(&remote_id)
+    .bind(&local_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "the remote Follow landed the following row");
+
+    // --- Like on a missing note: documented skip, no panic ---
+    let like = serde_json::json!({
+        "type": "Like",
+        "actor": actor_uri,
+        "object": "https://remote.example/notes/missing",
+        "content": "👍"
+    });
+    let effect = mk_ap::processor::route_remote(&pool, &remote_id, actor_uri, &like, FED2_HOST)
+        .await
+        .expect("Like on a missing note still routes");
+    assert_eq!(
+        effect,
+        mk_ap::processor::RouteEffect::Skipped("skip: target note not found")
+    );
+
+    // --- Undo{Follow}: removes the row ---
+    let undo = serde_json::json!({
+        "type": "Undo",
+        "actor": actor_uri,
+        "object": { "type": "Follow", "actor": actor_uri, "object": local_uri }
+    });
+    let effect = mk_ap::processor::route_remote(&pool, &remote_id, actor_uri, &undo, FED2_HOST)
+        .await
+        .expect("remote Undo{Follow} routes");
+    assert_eq!(effect, mk_ap::processor::RouteEffect::Unfollowed);
+    let rows: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+    )
+    .bind(&remote_id)
+    .bind(&local_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "undo deleted the following row");
+}
