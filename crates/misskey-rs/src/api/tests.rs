@@ -15761,3 +15761,142 @@ async fn ap_keys_remote_cache_probe_shape() {
         None
     );
 }
+
+// ===== push-send: note-reasoned fan-out (mention/reply/renote/reaction) =====
+//
+// Every note-reasoned notification routes through social::notify_note_event,
+// which now spawns the upstream createNotification push tail (L196). This pins
+// that the send path is invoked once per wired type: the subscription endpoint
+// is an ephemeral local listener, so each accepted connection is one
+// send_to_user attempt. It also pins the shared gate: target == actor reports
+// "dropped", and the push spawn sits behind that same branch.
+#[tokio::test]
+async fn push_fanout_mention_reply_renote_reaction_invokes_send() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_push_fanout").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("pfa{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("pfb{}", mk_types::id::gen_aid_now())).await;
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
+    let (b_id, b_token, b_name) = (
+        bob["id"].as_str().unwrap(),
+        bob["token"].as_str().unwrap(),
+        bob["username"].as_str().unwrap().to_string(),
+    );
+
+    // bob's note is the target of the reply / renote / reaction legs.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "target", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "bob note: {v}");
+    let b_note = v["createdNote"]["id"].as_str().unwrap().to_string();
+
+    // bob's push subscription: an ephemeral local listener. Each accepted
+    // connection is one send_to_user delivery attempt.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = tx.send(());
+        }
+    });
+    mk_db::sw::insert_subscription(
+        &pool,
+        &mk_types::id::gen_aid_now(),
+        b_id,
+        &format!("http://127.0.0.1:{port}/push"),
+        "auth",
+        "pub",
+        false,
+    )
+    .await
+    .unwrap();
+
+    async fn expect_push(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, label: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: push send path not invoked"))
+            .unwrap_or_else(|| panic!("{label}: listener closed"));
+    }
+
+    // mention
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": a_token, "text": format!("@{b_name} hi") }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "mention note: {v}");
+    expect_push(&mut rx, "mention").await;
+
+    // reply
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": a_token, "text": "reply", "replyId": b_note }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "reply note: {v}");
+    expect_push(&mut rx, "reply").await;
+
+    // renote
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": a_token, "renoteId": b_note }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "renote: {v}");
+    expect_push(&mut rx, "renote").await;
+
+    // reaction
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/notes/reactions/create",
+        json!({ "i": a_token, "noteId": b_note, "reaction": "like" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "reaction: {v}");
+    expect_push(&mut rx, "reaction").await;
+
+    // guard: target == actor → the shared gate reports dropped for every
+    // wired type; notify_note_event returns before its push spawn there.
+    for reason in ["mention", "reply", "renote", "reaction"] {
+        let inserted = mk_db::notification::insert_if_not_muted(
+            &pool,
+            &mk_db::notification::NewNotification {
+                id: &mk_types::id::gen_aid_now(),
+                r#type: reason,
+                user_id: a_id,
+                notifier_id: Some(a_id),
+                note_id: Some(b_note.as_str()),
+                reaction: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !inserted,
+            "{reason}: self-notification must be gated (no row, no push)"
+        );
+    }
+}
