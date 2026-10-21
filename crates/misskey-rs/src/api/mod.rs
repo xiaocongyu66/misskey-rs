@@ -740,6 +740,19 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END admin-emoji DISPATCH ARM ====
 
+    // ==== admin-queue DISPATCH ARM (admin/queue/*) ====
+    // Noses in ahead of the admin/* catch-all (announcements/admin-emoji
+    // convention): api::admin_queue owns the 12 queue-introspection names
+    // backed by the mk_queue_jobs table; every other admin/* name keeps
+    // falling through. Method check, body parsing and token resolution live
+    // in the module (the admin.rs pattern), and pause/resume stay unhandled
+    // (documented: mk-queue has no pause primitive) so they reach the
+    // admin catch-all as unknown endpoints.
+    if admin_queue::handles(name.as_str()) {
+        return admin_queue::handle(&state, name.as_str(), req).await;
+    }
+    // ==== END admin-queue DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -6218,6 +6231,15 @@ mod tests;
 /// gates with the meta.rootUserId bypass) and every admin handler; mod.rs
 /// only registers the module and the single `admin/*` dispatch arm above.
 mod admin;
+
+/// `admin/queue/*` family over the in-tree PG queue (`mk_queue_jobs`,
+/// `mk-queue` crate). Module file `api/admin_queue.rs` owns the endpoint
+/// table + handlers and the requireModerator/read-write-scope gates; mod.rs
+/// only registers the module and the dispatch arm above (ahead of the
+/// admin/* catch-all). pause/resume are documented skips (no pause
+/// primitive in mk-queue).
+mod admin_queue;
+
 
 /// `admin/emoji/*` family (admin emoji management). Module file
 /// `api/admin_emoji.rs` owns the endpoint table + handlers, the shared

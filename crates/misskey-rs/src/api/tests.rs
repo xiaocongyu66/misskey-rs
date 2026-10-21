@@ -17427,3 +17427,234 @@ async fn admin_emoji_bulk_roundtrip() {
     let (_, list) = post_json(app.clone(), "/api/admin/emoji/list", json!({ "i": token })).await;
     assert_eq!(list, json!([]));
 }
+
+// ---------------------------------------------------------------------------
+// admin-queue slice — admin/queue/* over mk-queue (appended at file end so
+// co-agent appends rebase trivially).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_queue_shape_and_gate() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_queue_shape").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root_token = signup(&app, "root").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_token = signup(&app, "plainqueue").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // no credential → 401 CREDENTIAL_REQUIRED (gate lives in admin::gate)
+    let (s, b) = post_json(app.clone(), "/api/admin/queue/queues", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("1384574d-a912-4b81-8601-c7b1c4085df1")
+    );
+
+    // plain user → 403 moderator gate
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/queues",
+        json!({ "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
+
+    // queues: array of {name, counts, isPaused, metrics} (roster includes the
+    // in-tree kinds even on an empty table)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/queues",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().expect("queues is an array");
+    assert!(!arr.is_empty(), "body: {b}");
+    let delete_account = arr
+        .iter()
+        .find(|q| q["name"] == json!("deleteAccount"))
+        .unwrap_or_else(|| panic!("deleteAccount in roster: {b}"));
+    for key in ["waiting", "active", "completed", "failed", "delayed"] {
+        assert!(
+            delete_account["counts"][key].is_i64(),
+            "counts.{key} present: {b}"
+        );
+    }
+    assert_eq!(delete_account["isPaused"], json!(false));
+    assert!(delete_account["metrics"]["completed"]["data"].is_array());
+
+    // queue-stats on an empty queue → zeroed counts + the PG db block
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/queue-stats",
+        json!({ "i": root_token, "queue": "deleteAccount" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["name"], json!("deleteAccount"));
+    assert_eq!(b["qualifiedName"], json!("deleteAccount"));
+    assert_eq!(b["counts"]["waiting"], json!(0));
+    assert_eq!(b["counts"]["delayed"], json!(0));
+    assert_eq!(b["counts"]["failed"], json!(0));
+    assert_eq!(b["isPaused"], json!(false));
+    assert_eq!(b["db"]["version"], json!("postgres"));
+    assert!(b["db"]["mode"].is_string());
+
+    // jobs on an empty queue → []
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/jobs",
+        json!({
+            "i": root_token,
+            "queue": "deleteAccount",
+            "state": ["wait", "delayed"],
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!([]));
+
+    // stats: the four upstream domain counters
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/stats",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    for domain in ["deliver", "inbox", "db", "objectStorage"] {
+        for key in ["waiting", "active", "completed", "failed", "delayed"] {
+            assert!(b[domain][key].is_i64(), "stats.{domain}.{key}: {b}");
+        }
+    }
+
+    // invalid params: missing queue / bad state array → 400
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/queue/jobs",
+        json!({ "i": root_token, "state": ["wait"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/queue/jobs",
+        json!({ "i": root_token, "queue": "deleteAccount", "state": ["bogus"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // show-job-logs has no log store → honest []
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/show-job-logs",
+        json!({ "i": root_token, "queue": "deleteAccount", "jobId": "1" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!([]));
+}
+
+#[tokio::test]
+async fn admin_queue_enqueue_jobs_remove_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_queue_rt").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root_token = signup(&app, "root").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // enqueue through the mk-queue primitive the workers use
+    let id = mk_queue::QueueHandle::new(pool.clone())
+        .enqueue(
+            "deleteAccount",
+            &json!({ "user": { "id": "u_queue_rt" }, "soft": true }),
+        )
+        .await
+        .unwrap();
+
+    // jobs (wait) → the packed QueueJob
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/jobs",
+        json!({ "i": root_token, "queue": "deleteAccount", "state": ["wait"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().expect("jobs array");
+    assert_eq!(arr.len(), 1, "body: {b}");
+    let job = &arr[0];
+    assert_eq!(job["id"], json!(id.to_string()));
+    assert_eq!(job["name"], json!("deleteAccount"));
+    assert_eq!(job["data"]["user"]["id"], json!("u_queue_rt"));
+    assert_eq!(job["attempts"], json!(0));
+    assert_eq!(job["isFailed"], json!(false));
+    assert!(job["timestamp"].is_i64());
+
+    // show-job
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/show-job",
+        json!({ "i": root_token, "queue": "deleteAccount", "jobId": id.to_string() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["id"], json!(id.to_string()));
+
+    // retry-job → 204 (makes the pending job due; still present)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/queue/retry-job",
+        json!({ "i": root_token, "queue": "deleteAccount", "jobId": id.to_string() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // remove-job → 204 and the queue is empty again
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/queue/remove-job",
+        json!({ "i": root_token, "queue": "deleteAccount", "jobId": id.to_string() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/jobs",
+        json!({
+            "i": root_token,
+            "queue": "deleteAccount",
+            "state": ["wait", "delayed", "failed"],
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!([]));
+
+    // show-job on a missing id is an upstream Error → 500 INTERNAL_ERROR
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/queue/show-job",
+        json!({ "i": root_token, "queue": "deleteAccount", "jobId": id.to_string() }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+}
