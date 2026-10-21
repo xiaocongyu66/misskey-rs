@@ -120,7 +120,7 @@ pub async fn verify_and_route(
         "users",
     ) {
         Some(owner_id) => None,
-        None => match crate::fetch::fetch_actor_key(&parsed.key_id).await {
+        None => match crate::fetch::fetch_actor_key_cached(&parsed.key_id).await {
             Ok(pem) => Some(pem),
             Err(e) => {
                 tracing::info!(target: "dbg_ap", key_id = %parsed.key_id, error = %e, "remote key fetch failed");

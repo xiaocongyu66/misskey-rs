@@ -269,9 +269,7 @@ mod tests {
         // cache cannot collide with another test's entries
         let key_id = format!("http://127.0.0.1:{port}/users/u#main-key");
         let first = fetch_actor_key_cached(&key_id).await.expect("first fetch");
-        let second = fetch_actor_key_cached(&key_id)
-            .await
-            .expect("cached fetch");
+        let second = fetch_actor_key_cached(&key_id).await.expect("cached fetch");
         assert_eq!(first, "TEST-PEM");
         assert_eq!(second, "TEST-PEM");
         assert_eq!(
