@@ -729,10 +729,12 @@ pub async fn update_per_user(
     let mut placeholders = String::new();
     let mut sets = String::new();
     for (n, (col, _)) in deltas.iter().enumerate() {
-        cols.push_str(&format!(", \"___{col}\""));
-        placeholders.push_str(&format!(", ${}", n + 3));
+        // first fragment carries no leading comma (SET , x is a syntax error)
+        let sep = if n == 0 { "" } else { ", " };
+        cols.push_str(&format!("{sep}\"___{col}\""));
+        placeholders.push_str(&format!("{sep}${}", n + 3));
         sets.push_str(&format!(
-            ", \"___{col}\" = \"{table}\".\"___{col}\" + EXCLUDED.\"___{col}\""
+            "{sep}\"___{col}\" = \"{table}\".\"___{col}\" + EXCLUDED.\"___{col}\""
         ));
     }
     let sql = format!(
