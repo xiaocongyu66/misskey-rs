@@ -480,17 +480,21 @@ pub async fn federation_chart(
         r#"SELECT {} FROM "{table}" WHERE "date" = $1"#,
         select_cols.join(", ")
     );
-    let mut slots: Vec<[i16; FEDERATION_KEYS.len()]> = Vec::with_capacity(limit);
+    let mut slots: Vec<(i16, i16, i16, i16, i16, i16, i16, i16)> = Vec::with_capacity(limit);
     for k in (0..limit as i64).rev() {
         let date = end - k * step;
         let row = sqlx::query_as::<_, (i16, i16, i16, i16, i16, i16, i16, i16)>(&sql)
             .bind(date as i32)
             .fetch_optional(pool)
             .await?;
-        slots.push(row.unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]));
+        slots.push(row.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0)));
     }
     // latest-known extrapolation over leading all-zero rows (getChartRaw)
-    let known = slots.iter().rposition(|c| c.iter().any(|v| *v != 0));
+    let known = slots.iter().rposition(|c| {
+        [c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7]
+            .iter()
+            .any(|v| *v != 0)
+    });
     if let Some(last_known) = known {
         let base = slots[slots.len() - 1 - last_known];
         let cut = slots.len() - 1 - last_known;
@@ -500,9 +504,19 @@ pub async fn federation_chart(
     }
     let mut out = serde_json::Map::new();
     for (idx, key) in FEDERATION_KEYS.iter().enumerate() {
+        let get = |c: &(i16, i16, i16, i16, i16, i16, i16, i16)| match idx {
+            0 => c.0,
+            1 => c.1,
+            2 => c.2,
+            3 => c.3,
+            4 => c.4,
+            5 => c.5,
+            6 => c.6,
+            _ => c.7,
+        };
         out.insert(
             (*key).to_string(),
-            serde_json::json!(slots.iter().map(|c| c[idx]).collect::<Vec<_>>()),
+            serde_json::json!(slots.iter().map(|c| get(c)).collect::<Vec<_>>()),
         );
     }
     Ok(serde_json::Value::Object(out))
