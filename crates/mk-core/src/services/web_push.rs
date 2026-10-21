@@ -6,7 +6,9 @@
 //! hand-rolled primitives in [`mk_db::webauthn`]; base64url rides the same
 //! unpadded alphabet those challenges use.
 
-use mk_db::webauthn::{b64url_encode, ecdsa_p256_sha256_sign, p256_pub_from_priv};
+use mk_db::webauthn::{
+    b64url_encode, ecdsa_p256_sha256_sign, p256_ecdh, p256_pub_from_priv, sha256,
+};
 
 /// `{typ: "JWT", alg: "ES256"}.{aud, exp (+12h), sub}` signed ES256 — the
 /// exact token the `t=` field carries. `key` is the 32-byte secret scalar,
@@ -87,6 +89,55 @@ fn fresh_nonce() -> [u8; 32] {
     k
 }
 
+// ==== RFC 5869 HKDF-SHA256 (the RFC 8291 key-schedule half) ====
+
+/// HMAC-SHA256 (RFC 2104) over the vendored SHA-256: ipad/opad blocks.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = ipad.to_vec();
+    inner.extend_from_slice(msg);
+    let ih = sha256(&inner);
+    let mut outer = opad.to_vec();
+    outer.extend_from_slice(&ih);
+    sha256(&outer)
+}
+
+/// HKDF-SHA256 (RFC 5869): extract (HMAC-SHA256 keyed by the salt; all-zero
+/// 32-byte salt when `None`) then expand (`T(i) = HMAC(PRK, T(i-1) || info ||
+/// i)`), first `len` bytes. `len` ≤ 255·32 (the RFC's output cap).
+///
+/// This is the RFC 8291 §4.2/§4.3 schedule's PRK→cek/nonce machinery — the
+/// push payload encryption half lands against it next.
+pub fn hkdf_sha256(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], len: usize) -> Vec<u8> {
+    const HASH_LEN: usize = 32;
+    assert!(len <= 255 * HASH_LEN, "hkdf output over the RFC 5869 cap");
+    let prk = hmac_sha256(salt.unwrap_or(&[0u8; HASH_LEN]), ikm);
+    let mut okm = Vec::with_capacity(len);
+    let mut t: Vec<u8> = Vec::new();
+    let mut counter = 1u8;
+    while okm.len() < len {
+        let mut input = t.clone();
+        input.extend_from_slice(info);
+        input.push(counter);
+        t = hmac_sha256(&prk, &input).to_vec();
+        okm.extend_from_slice(&t);
+        counter += 1;
+    }
+    okm.truncate(len);
+    okm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +188,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_a1() {
+        let okm = hkdf_sha256(
+            &[0x0b; 22],
+            Some(&[
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            ]),
+            &[0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9],
+            42,
+        );
+        assert_eq!(
+            okm,
+            hex(
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                "34007208d5b887185865"
+            )
+        );
+    }
+
+    #[test]
+    fn p256_ecdh_is_symmetric_between_two_scalars() {
+        // two distinct in-range scalars (RFC 6979 A.2.5's + one arbitrary)
+        let a = hex32("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+        let b = hex32("2f2e1d3c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b");
+        let (ax, ay) = p256_pub_from_priv(&a).expect("A");
+        let (bx, by) = p256_pub_from_priv(&b).expect("B");
+        let ab = p256_ecdh(&a, &bx, &by).expect("a·B");
+        let ba = p256_ecdh(&b, &ax, &ay).expect("b·A");
+        assert_eq!(ab, ba);
+        // out-of-range scalars (0 and n) are rejected
+        assert_eq!(p256_ecdh(&[0u8; 32], &bx, &by), None);
+        let n = hex32("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+        assert_eq!(p256_ecdh(&n, &bx, &by), None);
+    }
+
     fn raw_to_der(sig: &[u8]) -> Vec<u8> {
         let mut der = vec![0x30, 0x44, 0x02, 0x20];
         der.extend_from_slice(&sig[..32]);
@@ -151,5 +237,11 @@ mod tests {
             out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
         }
         out
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
     }
 }

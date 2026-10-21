@@ -1484,3 +1484,25 @@ pub fn p256_pub_from_priv(d: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
     let y = mul_mod(&q.y, &inv, &P);
     Some((u256_to_be(&x), u256_to_be(&y)))
 }
+
+/// ECDH P-256: the shared point's affine x — `x( d · Q )` where `Q` is the
+/// peer's uncompressed point (RFC 8291 §8's `(auth_secret, p256dh)` dh half).
+/// Rejects `d` outside (0, n); returns `None` for the point-at-infinity
+/// result (peer point invalid/negative-of-self). No on-curve check — the
+/// caller's `pub_x/pub_y` come from the subscription's decoded key bytes.
+pub fn p256_ecdh(priv_scalar: &[u8; 32], pub_x: &[u8; 32], pub_y: &[u8; 32]) -> Option<[u8; 32]> {
+    let d = be32_to_u256(priv_scalar);
+    if cmp256(&d, &ZERO) != std::cmp::Ordering::Greater
+        || cmp256(&d, &N_P256) != std::cmp::Ordering::Less
+    {
+        return None;
+    }
+    let q = Point {
+        x: be32_to_u256(pub_x),
+        y: be32_to_u256(pub_y),
+        z: ONE,
+    };
+    let shared = scalar_mult(&d, &q);
+    let x = affine_x(&shared)?;
+    Some(u256_to_be(&x))
+}
