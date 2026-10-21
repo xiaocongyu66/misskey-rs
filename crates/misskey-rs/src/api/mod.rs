@@ -1346,9 +1346,14 @@ async fn signup_route(state: &AppState, body: &Value) -> Response {
             let sender = mk_core::services::email::NoopSender;
             let addr = addr.to_string();
             tokio::spawn(async move {
-                let _ = sender
-                    .send_email(&addr, "Verify your email", "<p>code</p>", "code")
-                    .await;
+                let _ = mk_core::services::email::EmailSender::send_email(
+                    &sender,
+                    &addr,
+                    "Verify your email",
+                    "<p>code</p>",
+                    "code",
+                )
+                .await;
             });
         }
     }

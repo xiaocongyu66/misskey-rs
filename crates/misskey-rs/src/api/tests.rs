@@ -15524,7 +15524,7 @@ async fn email_leg_code_round_trip() {
     init_tracing();
     let pool = fresh_pool("mktest_email_leg").await;
     let user_id = mk_types::id::gen_aid_now();
-    sqlx::query(
+    mk_db::sqlx::query(
         r#"INSERT INTO "user" ("id", "username", "usernameLower", "createdAt") VALUES ($1, $2, $2, $3)"#,
     )
     .bind(&user_id)
@@ -15533,7 +15533,7 @@ async fn email_leg_code_round_trip() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ($1)"#)
+    mk_db::sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ($1)"#)
         .bind(&user_id)
         .execute(&pool)
         .await
@@ -15545,7 +15545,7 @@ async fn email_leg_code_round_trip() {
         .unwrap();
     // a wrong code is a miss and flips nothing
     assert!(!mk_core::services::email::verify_email(&pool, &user_id, "xxxxxxxx").await);
-    let (verified, stored): (bool, Option<String>) = sqlx::query_as(
+    let (verified, stored): (bool, Option<String>) = mk_db::mk_db::sqlx::query_as(
         r#"SELECT "emailVerified", "emailVerifyCode" FROM "user_profile" WHERE "userId" = $1"#,
     )
     .bind(&user_id)
@@ -15560,11 +15560,12 @@ async fn email_leg_code_round_trip() {
     );
     // the right code flips the flag and consumes itself
     assert!(mk_core::services::email::verify_email(&pool, &user_id, &code).await);
-    let verified: bool =
-        sqlx::query_as(r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let verified: bool = mk_db::mk_db::sqlx::query_as(
+        r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(verified, "hit flips emailVerified");
 }
