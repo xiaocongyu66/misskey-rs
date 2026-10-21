@@ -260,10 +260,6 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "sw/unregister"
         // email-leg: verify-email (upstream endpoint, requireCredential)
         || name == "verify-email"
-        // email-leg: password reset (upstream endpoints/request-reset-password.ts
-        // + endpoints/reset-password.ts — both requireCredential: false)
-        || name == "request-reset-password"
-        || name == "reset-password"
         || name == "notes/show"
         || name == "users/search"
         || name == "users/search-by-username-and-host"
@@ -426,14 +422,6 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // "emailVerified" (see verify_email_route).
         if name == "verify-email" {
             return verify_email_route(&state, &body, token.as_deref()).await;
-        }
-        // email-leg: password reset — request mails a code, reset consumes
-        // {token|code} + {password} and bumps user_profile."password".
-        if name == "request-reset-password" {
-            return request_reset_password_route(&state, &body).await;
-        }
-        if name == "reset-password" {
-            return reset_password_route(&state, &body).await;
         }
         if name == "notes/reactions/create" || name == "notes/delete" {
             return social::note_credential_dispatch(
@@ -1499,122 +1487,6 @@ async fn verify_email_route(state: &AppState, body: &Value, token: Option<&str>)
     } else {
         invalid_param("code", "incorrect")
     }
-}
-
-/// `POST /api/request-reset-password` (upstream
-/// endpoints/request-reset-password.ts, requireCredential: false): resolve
-/// username (lowercased) + email against the profile. Every miss (unknown
-/// user, email mismatch, unverified email) is a silent no-op upstream — the
-/// endpoint returns undefined → 204 and only a match stores + mails a code.
-async fn request_reset_password_route(state: &AppState, body: &Value) -> Response {
-    let Some(pool) = &state.pool else {
-        return api_err(ApiError::internal_error());
-    };
-    let username = match require_str(body, "username") {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let email = match require_str(body, "email") {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let user = match mk_db::user::find_local_user_by_username(pool, &username.to_lowercase()).await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "find_local_user_by_username");
-            return api_err(ApiError::internal_error());
-        }
-    };
-    let Some(user) = user else {
-        return StatusCode::NO_CONTENT.into_response();
-    };
-    let profile = match mk_db::user::find_profile(pool, &user.id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "find_profile");
-            return api_err(ApiError::internal_error());
-        }
-    };
-    if profile.email.as_deref() != Some(email) || !profile.email_verified {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    match mk_core::services::email::request_password_reset(pool, &user.id, email).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "request_password_reset");
-            api_err(ApiError::internal_error())
-        }
-    }
-}
-
-/// `POST /api/reset-password` (upstream endpoints/reset-password.ts,
-/// requireCredential: false — the token from the email link is the
-/// credential): `{token|code, password}`. An unknown/expired token answers
-/// INVALID_TOKEN (upstream throws a bare Error here; the mission pins the
-/// code name). On a hit the code is consumed and the bcrypt hash (signup's
-/// `hash_password`) replaces user_profile."password".
-async fn reset_password_route(state: &AppState, body: &Value) -> Response {
-    let Some(pool) = &state.pool else {
-        return api_err(ApiError::internal_error());
-    };
-    let code = body
-        .get("token")
-        .or_else(|| body.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let password = match require_str(body, "password") {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    if code.is_empty() {
-        return invalid_param("token", "required");
-    }
-    if password.is_empty() {
-        return invalid_param("password", "expected a string of length 1 or more");
-    }
-    let user_id = match mk_db::user::password_reset_user_id(pool, code).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "password_reset_user_id");
-            return api_err(ApiError::internal_error());
-        }
-    };
-    let Some(user_id) = user_id else {
-        return invalid_token();
-    };
-    match mk_db::user::take_password_reset_code(pool, &user_id, code).await {
-        Ok(true) => {}
-        Ok(false) => return invalid_token(),
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "take_password_reset_code");
-            return api_err(ApiError::internal_error());
-        }
-    }
-    let hash = match mk_core::services::hash_password(password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "hash_password");
-            return api_err(ApiError::internal_error());
-        }
-    };
-    match mk_db::user::set_password_hash(pool, &user_id, &hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(target: "dbg_reset_password", error = %e, "set_password_hash");
-            api_err(ApiError::internal_error())
-        }
-    }
-}
-
-fn invalid_token() -> Response {
-    api_err(ApiError::new(
-        400,
-        mk_types::api_error::ApiErrorKind::Client,
-        "INVALID_TOKEN",
-        "8b9d2f6a-1c3e-4f5a-9b7d-2e4c6a8f0b1d",
-        "Invalid or expired password reset token.",
-    ))
 }
 
 async fn reset_route(state: &AppState) -> Response {
