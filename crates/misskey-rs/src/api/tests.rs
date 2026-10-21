@@ -16606,3 +16606,245 @@ async fn fed2_remote_activity_routing_persists_rows() {
     .unwrap();
     assert_eq!(rows, 0, "undo deleted the following row");
 }
+
+/// admin/roles: create → list → show → assign → unassign → delete
+/// (upstream endpoints/admin/roles/*.ts).
+#[tokio::test]
+async fn admin_roles_crud_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_roles_crud").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+
+    // create (only name is required; everything else keeps its default)
+    let (s, role) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({ "name": "crud-role", "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    assert_eq!(role["name"], json!("crud-role"));
+    assert_eq!(role["isModerator"], json!(false));
+
+    // list sees it (moderator gate passes for the root)
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/roles/list",
+        json!({ "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == json!(role_id)),
+        "body: {list}"
+    );
+
+    // show packs the stored row
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/admin/roles/show",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["id"], json!(role_id));
+    assert_eq!(shown["name"], json!("crud-role"));
+    assert!(shown.get("policies").is_some());
+
+    // assign / unassign (void handlers → 204)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/unassign",
+        json!({ "userId": alice["id"], "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // a plain user is denied the moderator gate
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/roles/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // delete → show answers show.ts NO_SUCH_ROLE (07dc7d34)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/delete",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/roles/show",
+        json!({ "roleId": role_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_ROLE"));
+    assert_eq!(
+        err["error"]["id"],
+        json!("07dc7d34-c0d8-49b7-96c6-db3ce64ee0b3")
+    );
+}
+
+/// admin/ad: create → list → update → delete (upstream
+/// endpoints/admin/ad/*.ts).
+#[tokio::test]
+async fn admin_ad_crud_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_admin_ad_crud").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let r_token = root["token"].as_str().unwrap().to_string();
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let now = now_ms() as i64;
+
+    // create: every required paramDef field
+    let (s, ad) = post_json(
+        app.clone(),
+        "/api/admin/ad/create",
+        json!({
+            "url": "https://example.com/ad",
+            "memo": "first",
+            "place": "square",
+            "priority": "middle",
+            "ratio": 1,
+            "expiresAt": now + 3_600_000,
+            "startsAt": now - 1_000,
+            "imageUrl": "https://example.com/ad.png",
+            "dayOfWeek": 0,
+            "isSensitive": false,
+            "i": r_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {ad}");
+    let ad_id = ad["id"].as_str().unwrap().to_string();
+    assert_eq!(ad["url"], json!("https://example.com/ad"));
+    assert_eq!(ad["place"], json!("square"));
+    assert_eq!(ad["ratio"], json!(1));
+    assert!(ad["expiresAt"].is_string());
+    assert!(ad["startsAt"].is_string());
+
+    // list (default publishing = null → all rows, id DESC)
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id)),
+        "body: {list}"
+    );
+    // publishing=true keeps the live ad
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/ad/list",
+        json!({ "publishing": true, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id))
+    );
+
+    // update is partial (memo only) and answers 204
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/ad/update",
+        json!({ "id": ad_id, "memo": "updated", "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
+    assert_eq!(s, StatusCode::OK);
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == json!(ad_id))
+        .unwrap();
+    assert_eq!(row["memo"], json!("updated"));
+    assert_eq!(row["url"], json!("https://example.com/ad"));
+
+    // non-moderator is denied
+    let (s, err) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // missing rows answer the per-endpoint NO_SUCH_AD ids
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/ad/update",
+        json!({ "id": "x".repeat(10), "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(
+        err["error"]["id"],
+        json!("b7aa1727-1354-47bc-a182-3a9c3973d300")
+    );
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/admin/ad/delete",
+        json!({ "id": "x".repeat(10), "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(
+        err["error"]["id"],
+        json!("ccac9863-3a03-416e-b899-8a64041118b1")
+    );
+
+    // delete → 204 → the list no longer carries it
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/ad/delete",
+        json!({ "id": ad_id, "i": r_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, list) = post_json(app.clone(), "/api/admin/ad/list", json!({ "i": r_token })).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        !list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(ad_id))
+    );
+}

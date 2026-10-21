@@ -52,6 +52,9 @@ mod channel;
 // users/clips) — db paths in mk-db/src/clips.rs (clip/clip_note/
 // clip_favorite tables ship in the 0001 baseline).
 mod clips;
+// i-more-agent: i/* remainder slice 1 (i/favorites, i/gallery/likes,
+// i/pages/likes) — db paths inline in api/i_more.rs (tables ship in 0001).
+mod i_more;
 // announcements-agent: the announcements family (announcements +
 // announcements/show + i/read-announcement + admin/announcements/*) — db
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
@@ -1086,6 +1089,25 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return miauth::gen_token(&state, &body, token).await;
     }
     // ==== END arena-api DISPATCH ARM ====
+
+    // ==== i-more DISPATCH ARM (i/favorites + i/gallery/likes + i/pages/likes) ====
+    // Self-contained block on the clips-arm pattern: method check, body
+    // parsing and token extraction live here; the requireCredential gate +
+    // paged reads in api::i_more. Sits ahead of the M0_ENDPOINTS fallthrough
+    // (these names are not M0), and shadows no earlier arm.
+    if i_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return i_more::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END i-more DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());

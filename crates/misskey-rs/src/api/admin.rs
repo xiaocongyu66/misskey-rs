@@ -45,6 +45,12 @@ const ENDPOINTS: &[&str] = &[
     // arena-api: the api.ts 管理者専用のAPIのアクセス制限 fixture —
     // `SELECT * FROM pg_indexes` behind requireAdmin + the app-token kind.
     "admin/get-index-stats",
+    // admin/ad/* — upstream endpoints/admin/ad/{create,list,update,delete}.ts
+    // (requireModerator; SQL in mk_db::admin).
+    "admin/ad/create",
+    "admin/ad/list",
+    "admin/ad/update",
+    "admin/ad/delete",
 ];
 
 type ApiResult = Result<Response, Response>;
@@ -97,6 +103,10 @@ pub(super) async fn handle(state: &AppState, name: &str, req: Request) -> Respon
         "admin/server-info" => server_info(state, token.as_deref()).await,
         "admin/get-index-stats" => get_index_stats(state, token.as_deref()).await,
         "admin/stats" => stats(state, token.as_deref()).await,
+        "admin/ad/create" => ad_create(state, &body, token.as_deref()).await,
+        "admin/ad/list" => ad_list(state, &body, token.as_deref()).await,
+        "admin/ad/update" => ad_update(state, &body, token.as_deref()).await,
+        "admin/ad/delete" => ad_delete(state, &body, token.as_deref()).await,
         _ => unreachable!("checked against ENDPOINTS above"),
     };
     match result {
@@ -1067,4 +1077,285 @@ async fn stats(state: &AppState, token: Option<&str>) -> ApiResult {
         "driveUsageRemote": 0,
     });
     Ok((StatusCode::OK, Json(resp)).into_response())
+}
+
+// --- admin/ad/* (upstream endpoints/admin/ad/*.ts, requireModerator) ---
+
+/// `update.ts` meta.errors.noSuchAd
+fn no_such_ad_update() -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        "NO_SUCH_AD",
+        "b7aa1727-1354-47bc-a182-3a9c3973d300",
+        "No such ad.",
+    ))
+}
+
+/// `delete.ts` meta.errors.noSuchAd (a distinct id from update's)
+fn no_such_ad_delete() -> Response {
+    api_err(ApiError::new(
+        400,
+        mk_types::api_error::ApiErrorKind::Client,
+        "NO_SUCH_AD",
+        "ccac9863-3a03-416e-b899-8a64041118b1",
+        "No such ad.",
+    ))
+}
+
+/// Required string param (ajv `required` + optional minLength 1).
+fn ad_required_str(body: &Value, key: &str, non_empty: bool) -> Result<String, Response> {
+    match body.get(key) {
+        Some(Value::String(s)) if !non_empty || !s.is_empty() => Ok(s.clone()),
+        Some(Value::String(_)) => Err(invalid_param(key, "must not be empty")),
+        None | Some(Value::Null) => Err(invalid_param(
+            key,
+            &format!("must have required property '{key}'"),
+        )),
+        Some(_) => Err(invalid_param(key, "must be string")),
+    }
+}
+
+/// Required integer param (`{ type: 'integer' }`).
+fn ad_required_int(body: &Value, key: &str) -> Result<i64, Response> {
+    match body.get(key) {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .ok_or_else(|| invalid_param(key, "must be integer")),
+        None | Some(Value::Null) => Err(invalid_param(
+            key,
+            &format!("must have required property '{key}'"),
+        )),
+        Some(_) => Err(invalid_param(key, "must be integer")),
+    }
+}
+
+/// Optional integer param (absent/null → skip).
+fn ad_opt_int(body: &Value, key: &str) -> Result<Option<i64>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| invalid_param(key, "must be integer")),
+        Some(_) => Err(invalid_param(key, "must be integer")),
+    }
+}
+
+/// Optional nullable boolean (`{ type: 'boolean', nullable: true }`).
+fn ad_opt_nullable_bool(body: &Value, key: &str) -> Result<Option<bool>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid_param(key, "must be boolean")),
+    }
+}
+
+/// Optional string param (absent/null → skip).
+fn ad_opt_str(body: &Value, key: &str, non_empty: bool) -> Result<Option<String>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !non_empty || !s.is_empty() => Ok(Some(s.clone())),
+        Some(Value::String(_)) => Err(invalid_param(key, "must not be empty")),
+        Some(_) => Err(invalid_param(key, "must be string")),
+    }
+}
+
+/// Ad response object (identical shape in create/list/update).
+fn pack_ad(row: &mk_db::admin::AdRow) -> Value {
+    json!({
+        "id": row.id,
+        "expiresAt": mk_core::services::signup::ms_to_iso(row.expires_at_ms),
+        "startsAt": mk_core::services::signup::ms_to_iso(row.starts_at_ms),
+        "dayOfWeek": row.day_of_week,
+        "isSensitive": row.is_sensitive,
+        "url": row.url,
+        "imageUrl": row.image_url,
+        "priority": row.priority,
+        "ratio": row.ratio,
+        "place": row.place,
+        "memo": row.memo,
+    })
+}
+
+/// ModerationLogService.log is fire-and-forget upstream — a logging failure
+/// must not fail the (already applied) request.
+async fn log_ad_moderation(
+    pool: &mk_db::sqlx::PgPool,
+    moderator_id: &str,
+    kind: &str,
+    info: Value,
+) {
+    if let Err(e) = mk_db::admin::insert_moderation_log(
+        pool,
+        &mk_types::id::gen_aid_now(),
+        moderator_id,
+        kind,
+        &info,
+    )
+    .await
+    {
+        tracing::error!(target: "dbg_admin", error = %e, "insert_moderation_log[{kind}]");
+    }
+}
+
+/// `POST /api/admin/ad/create` — requireModerator; inserts the ad and
+/// returns the packed row (moderation log `createAd`).
+async fn ad_create(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, Gate::Moderator).await?;
+    let pool = state.pool.as_ref().expect("gated");
+
+    let url = ad_required_str(body, "url", true)?;
+    let memo = ad_required_str(body, "memo", false)?;
+    let place = ad_required_str(body, "place", false)?;
+    let priority = ad_required_str(body, "priority", false)?;
+    let ratio = ad_required_int(body, "ratio")?;
+    let expires_at_ms = ad_required_int(body, "expiresAt")?;
+    let starts_at_ms = ad_required_int(body, "startsAt")?;
+    let image_url = ad_required_str(body, "imageUrl", true)?;
+    let day_of_week = ad_required_int(body, "dayOfWeek")?;
+    let is_sensitive = opt_bool(body, "isSensitive")?.unwrap_or(false);
+
+    let row = mk_db::admin::insert_ad(
+        pool,
+        &mk_db::admin::NewAd {
+            id: mk_types::id::gen_aid_now(),
+            url,
+            image_url,
+            place,
+            priority,
+            ratio: ratio as i32,
+            memo,
+            is_sensitive,
+            day_of_week: day_of_week as i32,
+            expires_at_ms,
+            starts_at_ms,
+        },
+    )
+    .await
+    .map_err(db_err)?;
+
+    let ad = pack_ad(&row);
+    log_ad_moderation(
+        pool,
+        &ctx.me.id,
+        "createAd",
+        json!({ "adId": row.id, "ad": ad.clone() }),
+    )
+    .await;
+    Ok((StatusCode::OK, Json(ad)).into_response())
+}
+
+/// `POST /api/admin/ad/list` — requireModerator; `makePaginationQuery`
+/// (sinceId/untilId then sinceDate/untilDate, AID ids) + optional publishing
+/// window, `limit` default 10.
+async fn ad_list(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let _ctx = gate(state, token, Gate::Moderator).await?;
+    let pool = state.pool.as_ref().expect("gated");
+
+    let limit = parse_limit(body)?;
+    let publishing = ad_opt_nullable_bool(body, "publishing")?;
+
+    let since_id = ad_opt_str(body, "sinceId", false)?.filter(|s| !s.is_empty());
+    let until_id = ad_opt_str(body, "untilId", false)?.filter(|s| !s.is_empty());
+    let since_date = ad_opt_int(body, "sinceDate")?
+        .filter(|ms| *ms != 0)
+        .map(mk_types::id::gen_aid);
+    let until_date = ad_opt_int(body, "untilDate")?
+        .filter(|ms| *ms != 0)
+        .map(mk_types::id::gen_aid);
+    // QueryService.makePaginationQuery precedence: id cursors win, dates are
+    // only consulted when both id cursors are absent.
+    let (since_id, until_id) = match (since_id, until_id) {
+        (Some(s), Some(u)) => (Some(s), Some(u)),
+        (Some(s), None) => (Some(s), None),
+        (None, Some(u)) => (None, Some(u)),
+        (None, None) => (since_date, until_date),
+    };
+
+    let rows = mk_db::admin::list_ads(
+        pool,
+        &mk_db::admin::AdListQuery {
+            since_id: since_id.as_deref(),
+            until_id: until_id.as_deref(),
+            publishing,
+            limit,
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    Ok((
+        StatusCode::OK,
+        Json(json!(rows.iter().map(pack_ad).collect::<Vec<_>>())),
+    )
+        .into_response())
+}
+
+/// `POST /api/admin/ad/update` — requireModerator; role lookup →
+/// NO_SUCH_AD (b7aa1727) → partial update (void → 204) + `updateAd` log.
+async fn ad_update(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, Gate::Moderator).await?;
+    let pool = state.pool.as_ref().expect("gated");
+
+    let id = ad_required_str(body, "id", true)?;
+    let before = mk_db::admin::find_ad(pool, &id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(no_such_ad_update)?;
+
+    let upd = mk_db::admin::AdUpdate {
+        url: ad_opt_str(body, "url", true)?,
+        image_url: ad_opt_str(body, "imageUrl", true)?,
+        place: ad_opt_str(body, "place", false)?,
+        priority: ad_opt_str(body, "priority", false)?,
+        ratio: ad_opt_int(body, "ratio")?.map(|v| v as i32),
+        memo: ad_opt_str(body, "memo", false)?,
+        // `ps.expiresAt ? new Date(...) : undefined` — a zero is skipped.
+        expires_at_ms: ad_opt_int(body, "expiresAt")?.filter(|ms| *ms != 0),
+        starts_at_ms: ad_opt_int(body, "startsAt")?.filter(|ms| *ms != 0),
+        day_of_week: ad_opt_int(body, "dayOfWeek")?.map(|v| v as i32),
+        is_sensitive: opt_bool(body, "isSensitive")?,
+    };
+    mk_db::admin::update_ad(pool, &id, &upd)
+        .await
+        .map_err(db_err)?;
+
+    let after = mk_db::admin::find_ad(pool, &id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(no_such_ad_update)?;
+    log_ad_moderation(
+        pool,
+        &ctx.me.id,
+        "updateAd",
+        json!({
+            "adId": id,
+            "before": pack_ad(&before),
+            "after": pack_ad(&after),
+        }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/admin/ad/delete` — requireModerator; role lookup →
+/// NO_SUCH_AD (ccac9863) → delete (void → 204) + `deleteAd` log.
+async fn ad_delete(state: &AppState, body: &Value, token: Option<&str>) -> ApiResult {
+    let ctx = gate(state, token, Gate::Moderator).await?;
+    let pool = state.pool.as_ref().expect("gated");
+
+    let id = ad_required_str(body, "id", true)?;
+    let ad = mk_db::admin::find_ad(pool, &id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(no_such_ad_delete)?;
+    mk_db::admin::delete_ad(pool, &id).await.map_err(db_err)?;
+    log_ad_moderation(
+        pool,
+        &ctx.me.id,
+        "deleteAd",
+        json!({ "adId": id, "ad": pack_ad(&ad) }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

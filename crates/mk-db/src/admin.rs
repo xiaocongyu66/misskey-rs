@@ -362,3 +362,216 @@ pub async fn pg_server_version(pool: &PgPool) -> Result<String, sqlx::Error> {
         .await?;
     Ok(v)
 }
+
+// --- admin/ad/* (upstream endpoints/admin/ad/{create,list,update,delete}.ts) ---
+
+/// One `ad` row with timestamptz columns normalized to epoch ms (the
+/// `admin.rs` RoleAssignRow convention; `ms_to_iso` renders the response).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AdRow {
+    pub id: String,
+    pub url: String,
+    #[sqlx(rename = "imageUrl")]
+    pub image_url: String,
+    pub place: String,
+    pub priority: String,
+    pub ratio: i32,
+    pub memo: String,
+    #[sqlx(rename = "isSensitive")]
+    pub is_sensitive: bool,
+    #[sqlx(rename = "dayOfWeek")]
+    pub day_of_week: i32,
+    #[sqlx(rename = "expiresAtMs")]
+    pub expires_at_ms: i64,
+    #[sqlx(rename = "startsAtMs")]
+    pub starts_at_ms: i64,
+}
+
+const AD_COLUMNS: &str = r#"
+    "id" AS "id",
+    "url" AS "url",
+    "imageUrl" AS "imageUrl",
+    "place" AS "place",
+    "priority" AS "priority",
+    "ratio"::int AS "ratio",
+    "memo" AS "memo",
+    "isSensitive" AS "isSensitive",
+    "dayOfWeek"::int AS "dayOfWeek",
+    (EXTRACT(EPOCH FROM "expiresAt") * 1000)::bigint AS "expiresAtMs",
+    (EXTRACT(EPOCH FROM "startsAt") * 1000)::bigint AS "startsAtMs"
+"#;
+
+/// `admin/ad/create.ts` insert (id from IdService, all columns required by
+/// the paramDef). `expiresAt`/`startsAt` arrive as epoch ms.
+pub struct NewAd {
+    pub id: String,
+    pub url: String,
+    pub image_url: String,
+    pub place: String,
+    pub priority: String,
+    pub ratio: i32,
+    pub memo: String,
+    pub is_sensitive: bool,
+    pub day_of_week: i32,
+    pub expires_at_ms: i64,
+    pub starts_at_ms: i64,
+}
+
+pub async fn insert_ad(pool: &PgPool, ad: &NewAd) -> Result<AdRow, sqlx::Error> {
+    let sql = format!(
+        r#"INSERT INTO "ad" ("id", "expiresAt", "place", "priority", "url",
+                             "imageUrl", "memo", "ratio", "startsAt", "dayOfWeek",
+                             "isSensitive")
+           VALUES ($1, to_timestamp($2::double precision / 1000), $3, $4, $5,
+                   $6, $7, $8, to_timestamp($9::double precision / 1000), $10,
+                   $11)
+           RETURNING {AD_COLUMNS}"#
+    );
+    sqlx::query_as::<_, AdRow>(&sql)
+        .bind(&ad.id)
+        .bind(ad.expires_at_ms)
+        .bind(&ad.place)
+        .bind(&ad.priority)
+        .bind(&ad.url)
+        .bind(&ad.image_url)
+        .bind(&ad.memo)
+        .bind(ad.ratio)
+        .bind(ad.starts_at_ms)
+        .bind(ad.day_of_week)
+        .bind(ad.is_sensitive)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn find_ad(pool: &PgPool, id: &str) -> Result<Option<AdRow>, sqlx::Error> {
+    let sql = format!(r#"SELECT {AD_COLUMNS} FROM "ad" WHERE "id" = $1"#);
+    sqlx::query_as::<_, AdRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `admin/ad/list.ts` query inputs (`makePaginationQuery` ids + the nullable
+/// `publishing` filter).
+pub struct AdListQuery<'a> {
+    pub since_id: Option<&'a str>,
+    pub until_id: Option<&'a str>,
+    pub publishing: Option<bool>,
+    pub limit: i64,
+}
+
+/// `admin/ad/list.ts`: id pagination (`sinceId` only → ASC, else DESC) and
+/// the publishing window. The false branch keeps TypeORM's
+/// `.andWhere(A).orWhere(B)` precedence — the pagination predicates bind to
+/// the A branch only (upstream parity).
+pub async fn list_ads(pool: &PgPool, q: &AdListQuery<'_>) -> Result<Vec<AdRow>, sqlx::Error> {
+    let mut qb = sqlx::QueryBuilder::new(format!(r#"SELECT {AD_COLUMNS} FROM "ad" WHERE TRUE"#));
+    if let Some(since) = q.since_id {
+        qb.push(r#" AND "id" > "#).push_bind(since);
+    }
+    if let Some(until) = q.until_id {
+        qb.push(r#" AND "id" < "#).push_bind(until);
+    }
+    match q.publishing {
+        Some(true) => {
+            qb.push(r#" AND "expiresAt" > now() AND "startsAt" <= now()"#);
+        }
+        Some(false) => {
+            qb.push(r#" AND "expiresAt" <= now() OR "startsAt" > now()"#);
+        }
+        None => {}
+    }
+    if q.since_id.is_some() && q.until_id.is_none() {
+        qb.push(r#" ORDER BY "id" ASC LIMIT "#);
+    } else {
+        qb.push(r#" ORDER BY "id" DESC LIMIT "#);
+    }
+    qb.push_bind(q.limit);
+    qb.build_query_as::<AdRow>().fetch_all(pool).await
+}
+
+/// Partial `AdService.update` write (absent fields keep their column value).
+#[derive(Default)]
+pub struct AdUpdate {
+    pub url: Option<String>,
+    pub image_url: Option<String>,
+    pub place: Option<String>,
+    pub priority: Option<String>,
+    pub ratio: Option<i32>,
+    pub memo: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub starts_at_ms: Option<i64>,
+    pub day_of_week: Option<i32>,
+    pub is_sensitive: Option<bool>,
+}
+
+impl AdUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.url.is_none()
+            && self.image_url.is_none()
+            && self.place.is_none()
+            && self.priority.is_none()
+            && self.ratio.is_none()
+            && self.memo.is_none()
+            && self.expires_at_ms.is_none()
+            && self.starts_at_ms.is_none()
+            && self.day_of_week.is_none()
+            && self.is_sensitive.is_none()
+    }
+}
+
+pub async fn update_ad(pool: &PgPool, id: &str, upd: &AdUpdate) -> Result<(), sqlx::Error> {
+    if upd.is_empty() {
+        // TypeORM `repository.update(id, {})` — nothing to write.
+        return Ok(());
+    }
+    let mut qb = sqlx::QueryBuilder::new(r#"UPDATE "ad" SET "#);
+    {
+        let mut sep = qb.separated(", ");
+        if let Some(v) = &upd.url {
+            sep.push(r#""url" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = &upd.image_url {
+            sep.push(r#""imageUrl" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = &upd.place {
+            sep.push(r#""place" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = &upd.priority {
+            sep.push(r#""priority" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = upd.ratio {
+            sep.push(r#""ratio" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = &upd.memo {
+            sep.push(r#""memo" = "#).push_bind_unseparated(v);
+        }
+        if let Some(ms) = upd.expires_at_ms {
+            sep.push(r#""expiresAt" = to_timestamp("#);
+            sep.push_bind_unseparated(ms);
+            sep.push_unseparated("::double precision / 1000)");
+        }
+        if let Some(ms) = upd.starts_at_ms {
+            sep.push(r#""startsAt" = to_timestamp("#);
+            sep.push_bind_unseparated(ms);
+            sep.push_unseparated("::double precision / 1000)");
+        }
+        if let Some(v) = upd.day_of_week {
+            sep.push(r#""dayOfWeek" = "#).push_bind_unseparated(v);
+        }
+        if let Some(v) = upd.is_sensitive {
+            sep.push(r#""isSensitive" = "#).push_bind_unseparated(v);
+        }
+    }
+    qb.push(r#" WHERE "id" = "#).push_bind(id);
+    qb.build().execute(pool).await?;
+    Ok(())
+}
+
+pub async fn delete_ad(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "ad" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
