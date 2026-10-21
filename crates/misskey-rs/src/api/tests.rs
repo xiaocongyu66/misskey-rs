@@ -15545,7 +15545,7 @@ async fn email_leg_code_round_trip() {
         .unwrap();
     // a wrong code is a miss and flips nothing
     assert!(!mk_core::services::email::verify_email(&pool, &user_id, "xxxxxxxx").await);
-    let (verified, stored): (bool, Option<String>) = mk_db::mk_db::sqlx::query_as(
+    let (verified, stored): (bool, Option<String>) = mk_db::sqlx::query_as(
         r#"SELECT "emailVerified", "emailVerifyCode" FROM "user_profile" WHERE "userId" = $1"#,
     )
     .bind(&user_id)
@@ -15560,12 +15560,11 @@ async fn email_leg_code_round_trip() {
     );
     // the right code flips the flag and consumes itself
     assert!(mk_core::services::email::verify_email(&pool, &user_id, &code).await);
-    let verified: bool = mk_db::mk_db::sqlx::query_as(
-        r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#,
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let verified: bool =
+        mk_db::sqlx::query_as(r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#)
+            .bind(&user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(verified, "hit flips emailVerified");
 }
