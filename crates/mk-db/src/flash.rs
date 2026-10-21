@@ -61,9 +61,9 @@ pub async fn insert_flash(pool: &PgPool, n: &NewFlash<'_>) -> Result<(), sqlx::E
         "#,
     )
     .bind(n.id)
-    .bind(n.user_id)
     .bind(n.title)
     .bind(n.summary)
+    .bind(n.user_id)
     .bind(n.script)
     .bind(n.permissions)
     .bind(n.visibility)
