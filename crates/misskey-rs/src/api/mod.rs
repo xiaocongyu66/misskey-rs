@@ -310,6 +310,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // allowGet + cacheSec ride the upstream meta, POST-only like the
         // other lanes in this arm)
         || name == "charts/notes"
+        // charts-users: same guest-ok shape (endpoints/charts/users.ts)
+        || name == "charts/users"
         // freq-agent: users/get-frequently-replied-users slice + requisites
         // (pinned-users; users/notes and admin/update-meta pinnedUsers note)
         || name == "users/get-frequently-replied-users"
