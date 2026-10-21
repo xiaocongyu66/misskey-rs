@@ -967,14 +967,12 @@ pub async fn insert_note_favorite(
     user_id: &str,
     note_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#,
-    )
-    .bind(id)
-    .bind(user_id)
-    .bind(note_id)
-    .execute(pool)
-    .await?;
+    sqlx::query(r#"INSERT INTO "note_favorite" ("id", "userId", "noteId") VALUES ($1, $2, $3)"#)
+        .bind(id)
+        .bind(user_id)
+        .bind(note_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -1054,13 +1052,11 @@ pub async fn find_renotes_by_user(
     user_id: &str,
     renote_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(
-        r#"SELECT "id" FROM "note" WHERE "userId" = $1 AND "renoteId" = $2"#,
-    )
-    .bind(user_id)
-    .bind(renote_id)
-    .fetch_all(pool)
-    .await
+    sqlx::query_scalar(r#"SELECT "id" FROM "note" WHERE "userId" = $1 AND "renoteId" = $2"#)
+        .bind(user_id)
+        .bind(renote_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// notes/renotes db path: rows whose renoteId is the given note (the endpoint
