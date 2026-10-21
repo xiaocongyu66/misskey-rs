@@ -175,7 +175,7 @@ pub fn encrypt_payload(
     use aes_gcm::{Aes128Gcm, Nonce};
 
     // p256dh = base64url(0x04 || x || y) of the subscription's client key
-    let p256dh = mk_db::webauthn::b64url_decode(p256dh_b64).ok()?;
+    let p256dh = mk_db::webauthn::b64url_decode(p256dh_b64)?;
     if p256dh.len() != 65 || p256dh[0] != 0x04 {
         return None;
     }
@@ -183,7 +183,7 @@ pub fn encrypt_payload(
     client_x.copy_from_slice(&p256dh[1..33]);
     let mut client_y = [0u8; 32];
     client_y.copy_from_slice(&p256dh[33..65]);
-    let auth = mk_db::webauthn::b64url_decode(auth_b64).ok()?;
+    let auth = mk_db::webauthn::b64url_decode(auth_b64)?;
 
     let (eph_x, eph_y) = mk_db::webauthn::p256_pub_from_priv(keypair)?;
     let shared = mk_db::webauthn::p256_ecdh(keypair, &client_x, &client_y)?;
