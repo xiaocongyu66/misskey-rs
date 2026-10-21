@@ -15446,13 +15446,8 @@ async fn push_send_list_by_user_row_shape_and_type_filter() {
     assert!(!b.send_read_message);
 
     // filter: readAllNotifications attempts only the opted-in row
-    let attempted = mk_core::push_deliver::send_to_user(
-        &pool,
-        &uid,
-        "readAllNotifications",
-        &json!({}),
-    )
-    .await;
+    let attempted =
+        mk_core::push_deliver::send_to_user(&pool, &uid, "readAllNotifications", &json!({})).await;
     assert_eq!(attempted, 1, "non-opted row filtered out");
     // 'note' (the notify_note_to_followers wiring type) attempts every row
     let attempted =
@@ -15474,7 +15469,10 @@ async fn push_send_dead_endpoint_swallowed_note_still_200s() {
     let app = crate::build_router(test_state(pool.clone()));
     let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
     let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
-    let (a_id, a_token) = (alice["id"].as_str().unwrap(), alice["token"].as_str().unwrap());
+    let (a_id, a_token) = (
+        alice["id"].as_str().unwrap(),
+        alice["token"].as_str().unwrap(),
+    );
     let b_id = bob["id"].as_str().unwrap();
 
     // bob follows alice → the note-notify fanout (and its push leg) reaches him
@@ -15562,12 +15560,11 @@ async fn email_leg_code_round_trip() {
     );
     // the right code flips the flag and consumes itself
     assert!(mk_core::services::email::verify_email(&pool, &user_id, &code).await);
-    let verified: bool = sqlx::query_as(
-        r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#,
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let verified: bool =
+        sqlx::query_as(r#"SELECT "emailVerified" FROM "user_profile" WHERE "userId" = $1"#)
+            .bind(&user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(verified, "hit flips emailVerified");
 }
