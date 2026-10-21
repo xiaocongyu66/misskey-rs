@@ -66,13 +66,13 @@ pub async fn update_note(
                "___{prefix}_diffs_reply", "___{prefix}_diffs_withFile")
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT ("date") DO UPDATE SET
-               "___{prefix}_total" = "___{prefix}_total" + EXCLUDED."___{prefix}_total",
-               "___{prefix}_inc" = "___{prefix}_inc" + EXCLUDED."___{prefix}_inc",
-               "___{prefix}_dec" = "___{prefix}_dec" + EXCLUDED."___{prefix}_dec",
-               "___{prefix}_diffs_normal" = "___{prefix}_diffs_normal" + EXCLUDED."___{prefix}_diffs_normal",
-               "___{prefix}_diffs_renote" = "___{prefix}_diffs_renote" + EXCLUDED."___{prefix}_diffs_renote",
-               "___{prefix}_diffs_reply" = "___{prefix}_diffs_reply" + EXCLUDED."___{prefix}_diffs_reply",
-               "___{prefix}_diffs_withFile" = "___{prefix}_diffs_withFile" + EXCLUDED."___{prefix}_diffs_withFile""#
+               "___{prefix}_total" = "{table}"."___{prefix}_total" + EXCLUDED."___{prefix}_total",
+               "___{prefix}_inc" = "{table}"."___{prefix}_inc" + EXCLUDED."___{prefix}_inc",
+               "___{prefix}_dec" = "{table}"."___{prefix}_dec" + EXCLUDED."___{prefix}_dec",
+               "___{prefix}_diffs_normal" = "{table}"."___{prefix}_diffs_normal" + EXCLUDED."___{prefix}_diffs_normal",
+               "___{prefix}_diffs_renote" = "{table}"."___{prefix}_diffs_renote" + EXCLUDED."___{prefix}_diffs_renote",
+               "___{prefix}_diffs_reply" = "{table}"."___{prefix}_diffs_reply" + EXCLUDED."___{prefix}_diffs_reply",
+               "___{prefix}_diffs_withFile" = "{table}"."___{prefix}_diffs_withFile" + EXCLUDED."___{prefix}_diffs_withFile""#
     );
     sqlx::query(&sql)
         .bind(date as i32)
