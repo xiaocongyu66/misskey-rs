@@ -25,7 +25,6 @@
 //! in `mk-db` and ride `ms_to_iso` here.
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -101,13 +100,7 @@ fn opt_bool(body: &Value, key: &str) -> Result<Option<bool>, Response> {
     }
 }
 
-fn int_param(
-    body: &Value,
-    key: &str,
-    default: i64,
-    min: i64,
-    max: i64,
-) -> Result<i64, Response> {
+fn int_param(body: &Value, key: &str, default: i64, min: i64, max: i64) -> Result<i64, Response> {
     match body.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(v) => {
@@ -258,9 +251,9 @@ fn software_suspended(meta: &MetaHostLists, row: &InstanceRow) -> bool {
 
 /// `InstanceEntityService.pack(instance, me)`.
 fn pack_instance(row: &InstanceRow, meta: &MetaHostLists, moderator: bool) -> Value {
-    let software_suspended = software_suspended(meta, row);
-    let is_suspended = row.suspension_state != "none" || software_suspended;
-    let suspension_state = if row.suspension_state == "none" && software_suspended {
+    let is_software_suspended = software_suspended(meta, row);
+    let is_suspended = row.suspension_state != "none" || is_software_suspended;
+    let suspension_state = if row.suspension_state == "none" && is_software_suspended {
         "softwareSuspended"
     } else {
         row.suspension_state.as_str()
@@ -319,12 +312,8 @@ pub(crate) async fn handle(
         "federation/instances" => instances(pool, body, me_id.as_deref(), &meta).await,
         "federation/show-instance" => show_instance(pool, body, me_id.as_deref(), &meta).await,
         "federation/stats" => stats(pool, body, me_id.as_deref(), &meta).await,
-        "federation/followers" => {
-            edges(state, pool, true, body, me_id.as_deref()).await
-        }
-        "federation/following" => {
-            edges(state, pool, false, body, me_id.as_deref()).await
-        }
+        "federation/followers" => edges(state, pool, true, body, me_id.as_deref()).await,
+        "federation/following" => edges(state, pool, false, body, me_id.as_deref()).await,
         "federation/users" => users(state, pool, body, me_id.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
@@ -411,7 +400,10 @@ async fn instances(
         Err(e) => return db_err("list_instances", e),
     };
     let moderator = super::viewer_is_moderator(pool, me_id).await;
-    let out: Vec<Value> = rows.iter().map(|r| pack_instance(r, meta, moderator)).collect();
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| pack_instance(r, meta, moderator))
+        .collect();
     (StatusCode::OK, Json(json!(out))).into_response()
 }
 
@@ -452,10 +444,20 @@ async fn stats(
         Err(e) => return db_err("federation_stats", e),
     };
     let moderator = super::viewer_is_moderator(pool, me_id).await;
-    let got_sub: i64 = st.top_sub.iter().map(|r| i64::from(r.followers_count)).sum();
-    let got_pub: i64 = st.top_pub.iter().map(|r| i64::from(r.following_count)).sum();
+    let got_sub: i64 = st
+        .top_sub
+        .iter()
+        .map(|r| i64::from(r.followers_count))
+        .sum();
+    let got_pub: i64 = st
+        .top_pub
+        .iter()
+        .map(|r| i64::from(r.following_count))
+        .sum();
     let pack = |rows: &[InstanceRow]| -> Vec<Value> {
-        rows.iter().map(|r| pack_instance(r, meta, moderator)).collect()
+        rows.iter()
+            .map(|r| pack_instance(r, meta, moderator))
+            .collect()
     };
     let result = json!({
         "topSubInstances": pack(&st.top_sub),

@@ -169,6 +169,10 @@ pub(crate) mod oauth;
 // notes/create poll branch + the delete-account endpoints; pub(crate):
 // main.rs spawns the worker.
 pub(crate) mod queue_processors;
+// federation/* domain: instances/show-instance/stats + host-filtered
+// followers/following/users reads (upstream endpoints/federation/*.ts @
+// ea2c3aed; `update-remote-user` needs the AP fetch lane and stays out).
+mod federation_more;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -590,6 +594,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         }
         return users_show(&state, &body, token).await;
     }
+
+    // ==== admin-abuse DISPATCH ARM (admin/abuse-user-reports + resolve +
+    // forward + abuse-report/notification-recipient/*) ====
+    // Noses in ahead of the arena-synalio arm: admin_abuse owns the full
+    // admin abuse family (requireModerator via the shared admin::gate);
+    // users/report-abuse and the system-webhook names keep falling through.
+    // Method check, body parsing and token extraction live here.
+    if admin_abuse::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_abuse::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-abuse DISPATCH ARM ====
 
     // ==== arena-synalio DISPATCH ARM (admin/system-webhook/* + the abuse
     // report webhook suite + users/report-abuse) ====
@@ -1447,6 +1471,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return i_more::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END i-more DISPATCH ARM ====
+
+    // ==== federation DISPATCH ARM (federation/*) ====
+    // Self-contained block on the clips-arm pattern: method check, body parse
+    // and token extraction live here; the reads (instance pack + stats +
+    // host-filtered edges/users) in api::federation_more, SQL in
+    // mk-db/src/federation.rs. Sits ahead of the M0 fallthrough and shadows
+    // no earlier arm.
+    if federation_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return federation_more::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END federation DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
@@ -6552,6 +6596,13 @@ mod admin_queue;
 /// `mk-db/src/emoji.rs`. mod.rs only registers the module and the dispatch
 /// arm above (ahead of the admin/* catch-all).
 mod admin_emoji;
+
+/// `admin/abuse-*` family (abuse reports list/resolve/forward + the
+/// abuse-report notification-recipient CRUD). Module file `api/admin_abuse.rs`
+/// owns the endpoint table + handlers and the shared requireModerator gate;
+/// SQL lives in `mk-db/src/abuse.rs`. mod.rs only registers the module and the
+/// dispatch arm above (ahead of the admin/* catch-all).
+mod admin_abuse;
 
 /// `admin/relays/*` family (upstream `endpoints/admin/relays/*.ts` over
 /// `core/RelayService.ts`). Module file `api/admin_relays.rs` owns the

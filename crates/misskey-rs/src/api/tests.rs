@@ -19268,215 +19268,138 @@ async fn i_authorized_apps_lists_only_callers_apps() {
     assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
 }
 
-// ==== pages-agent slice: pages/{create,show,like,my,liked,featured,
-// update,unlike,delete} (upstream endpoints/pages/*; page/page_like) ====
+/// `admin/relays/*`: add → list → remove roundtrip over the 0001 `relay`
+/// table, duplicate inbox → 500 (upstream uncaught UNIQUE violation),
+/// non-admin 403 (requireModerator gate), invalid URL 400.
 #[tokio::test]
-async fn pages_arena_crud_like_list() {
+async fn admin_relays_roundtrip() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkpages_arena").await;
-    mk_db::run_migrations(&pool).await.unwrap();
-    let app = crate::build_router(test_state(pool));
+    let pool = fresh_pool("mkadmin_relays_rt").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let root_token = signup(&app, "root").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_token =
+        signup(&app, &format!("plainrelay{}", mk_types::id::gen_aid_now())).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
-    let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
-    let (b_token, _) = channels_signup(app.clone(), "bobby").await;
-
-    // requireCredential gate (auth before paramDef)
-    let (s, body) = post_json(app.clone(), "/api/pages/create", json!({ "name": "x" })).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
-
-    // create with the full upstream param set (name required, rest defaulted)
-    let content = json!([{
-        "id": "2be9a64b-5ada-43a3-85f3-ec3429551ded",
-        "text": "Hello World!",
-        "type": "text"
-    }]);
-    let variables = json!([{ "name": "x", "type": "string", "value": "y" }]);
-    let (s, page) = post_json(
+    // non-admin → 403 moderator ROLE_PERMISSION_DENIED
+    let (s, b) = post_json(
         app.clone(),
-        "/api/pages/create",
-        json!({
-            "name": "my-page",
-            "title": "My Page",
-            "summary": "sum",
-            "content": content,
-            "variables": variables,
-            "script": "return 1;",
-            "eyeCatchingImageId": null,
-            "font": "serif",
-            "alignCenter": true,
-            "hideTitleWhenPinned": true,
-            "i": a_token,
-        }),
+        "/api/admin/relays/list",
+        json!({ "i": plain_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {page}");
-    assert_eq!(page["name"], json!("my-page"));
-    assert_eq!(page["title"], json!("My Page"));
-    assert_eq!(page["summary"], json!("sum"));
-    assert_eq!(page["content"], content);
-    assert_eq!(page["variables"], variables);
-    assert_eq!(page["font"], json!("serif"));
-    assert_eq!(page["alignCenter"], json!(true));
-    assert_eq!(page["hideTitleWhenPinned"], json!(true));
-    assert_eq!(page["eyeCatchingImage"], Value::Null);
-    assert_eq!(page["userId"], json!(a_id));
-    assert_eq!(page["likedCount"], json!(0));
-    assert!(page["createdAt"].is_string());
-    assert!(page["updatedAt"].is_string());
-    assert_eq!(page["user"]["username"], json!("alice"));
-    // create packs without me → no isLiked key
-    assert!(page.get("isLiked").is_none(), "create pack: {page}");
-    let page_id = page["id"].as_str().unwrap().to_string();
-
-    // show guest → no isLiked; show with bob → isLiked false
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["name"], json!("my-page"));
-    assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
-    let (s, shown) = post_json(
-        app.clone(),
-        "/api/pages/show",
-        json!({ "pageId": page_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["isLiked"], json!(false));
-
-    // owner cannot like their own page
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/pages/like",
-        json!({ "pageId": page_id, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("YOUR_PAGE"));
-
-    // bob likes → 204; duplicate → ALREADY_LIKED
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/pages/like",
-        json!({ "pageId": page_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/pages/like",
-        json!({ "pageId": page_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("ALREADY_LIKED"));
-
-    let (s, shown) = post_json(
-        app.clone(),
-        "/api/pages/show",
-        json!({ "pageId": page_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["likedCount"], json!(1));
-    assert_eq!(shown["isLiked"], json!(true));
-
-    // pages/my (me pack → isLiked false for alice) + pages/liked (bob)
-    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {mine}");
-    let mine = mine.as_array().unwrap();
-    assert_eq!(mine.len(), 1, "my: {mine:?}");
-    assert_eq!(mine[0]["id"], json!(page_id));
-    assert_eq!(mine[0]["isLiked"], json!(false));
-    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": b_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {mine}");
-    assert!(mine.as_array().unwrap().is_empty(), "bob my: {mine}");
-    let (s, liked) = post_json(app.clone(), "/api/pages/liked", json!({ "i": b_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {liked}");
-    let liked = liked.as_array().unwrap();
-    assert_eq!(liked.len(), 1, "liked: {liked:?}");
-    assert_eq!(liked[0]["id"], json!(page_id));
-    assert_eq!(liked[0]["isLiked"], json!(true));
-
-    // featured surfaces liked pages (guest-ok)
-    let (s, featured) = post_json(app.clone(), "/api/pages/featured", json!({})).await;
-    assert_eq!(s, StatusCode::OK, "body: {featured}");
-    let featured = featured.as_array().unwrap();
-    assert_eq!(featured.len(), 1, "featured: {featured:?}");
-    assert_eq!(featured[0]["id"], json!(page_id));
-
-    // update is owner-only and returns 204
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/pages/update",
-        json!({ "pageId": page_id, "title": "nope", "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/pages/update",
-        json!({ "pageId": page_id, "title": "Renamed", "font": "sans-serif", "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["title"], json!("Renamed"));
-    assert_eq!(shown["font"], json!("sans-serif"));
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
     assert_eq!(
-        shown["content"], content,
-        "content survives a partial update"
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
     );
 
-    // unlike → 204; a second unlike → NOT_LIKED; count back to 0
-    let (s, _) = post_json(
+    // empty list
+    let (s, b) = post_json(
         app.clone(),
-        "/api/pages/unlike",
-        json!({ "pageId": page_id, "i": b_token }),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/pages/unlike",
-        json!({ "pageId": page_id, "i": b_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("NOT_LIKED"));
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
-    assert_eq!(s, StatusCode::OK, "body: {shown}");
-    assert_eq!(shown["likedCount"], json!(0));
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!([]));
 
-    // delete is owner/moderator-only; afterwards show → NO_SUCH_PAGE
-    let (s, body) = post_json(
+    // invalid url → INVALID_URL 400 (upstream https-only check)
+    let (s, b) = post_json(
         app.clone(),
-        "/api/pages/delete",
-        json!({ "pageId": page_id, "i": b_token }),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": "http://relay.example/inbox" }),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
-    let (s, _) = post_json(
-        app.clone(),
-        "/api/pages/delete",
-        json!({ "pageId": page_id, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, body) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("NO_SUCH_PAGE"));
-    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
-    assert_eq!(s, StatusCode::OK, "body: {mine}");
-    assert!(
-        mine.as_array().unwrap().is_empty(),
-        "my after delete: {mine}"
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_URL"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("fb8c92d3-d4e5-44e7-b3d4-800d5cef8b2c")
     );
+
+    // add → 200 relay entity, status requesting
+    let inbox = "https://relay.example/inbox";
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let relay_id = b["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("relay id: {b}"))
+        .to_string();
+    assert!(!relay_id.is_empty(), "body: {b}");
+    assert_eq!(b["inbox"], json!(inbox));
+    assert_eq!(b["status"], json!("requesting"));
+
+    // list → the single row
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {b}");
+    assert_eq!(arr[0]["id"], json!(relay_id));
+    assert_eq!(arr[0]["inbox"], json!(inbox));
+    assert_eq!(arr[0]["status"], json!("requesting"));
+
+    // duplicate inbox → 500 (UNIQUE btree, upstream uncaught insert error)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1, "body: {b}");
+
+    // remove by inbox → 204, list empty
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/remove",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // remove unknown inbox → 500 (upstream `throw new Error('relay not found')`)
+    let (s, b) = post_json(
+        app,
+        "/api/admin/relays/remove",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
 }
 
 /// `get-avatar-decorations` + `admin/avatar-decorations/*`: admin CRUD
@@ -19854,307 +19777,417 @@ async fn gallery_arena_crud_like_list() {
     );
 }
 
-/// `admin/relays/*`: add → list → remove roundtrip over the 0001 `relay`
-/// table, duplicate inbox → 500 (upstream uncaught UNIQUE violation),
-/// non-admin 403 (requireModerator gate), invalid URL 400.
+// ==== pages-agent slice: pages/{create,show,like,my,liked,featured,
+// update,unlike,delete} (upstream endpoints/pages/*; page/page_like) ====
 #[tokio::test]
-async fn admin_relays_roundtrip() {
+async fn pages_arena_crud_like_list() {
     if std::env::var("DATABASE_URL").is_err() {
         return;
     }
     init_tracing();
-    let pool = fresh_pool("mkadmin_relays_rt").await;
-    let app = crate::build_router(test_state(pool.clone()));
-    let root_token = signup(&app, "root").await["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let plain_token =
-        signup(&app, &format!("plainrelay{}", mk_types::id::gen_aid_now())).await["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    let pool = mk_db::test_support::fresh_db("mkpages_arena").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
 
-    // non-admin → 403 moderator ROLE_PERMISSION_DENIED
-    let (s, b) = post_json(
+    let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
+    let (b_token, _) = channels_signup(app.clone(), "bobby").await;
+
+    // requireCredential gate (auth before paramDef)
+    let (s, body) = post_json(app.clone(), "/api/pages/create", json!({ "name": "x" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // create with the full upstream param set (name required, rest defaulted)
+    let content = json!([{
+        "id": "2be9a64b-5ada-43a3-85f3-ec3429551ded",
+        "text": "Hello World!",
+        "type": "text"
+    }]);
+    let variables = json!([{ "name": "x", "type": "string", "value": "y" }]);
+    let (s, page) = post_json(
         app.clone(),
-        "/api/admin/relays/list",
-        json!({ "i": plain_token }),
+        "/api/pages/create",
+        json!({
+            "name": "my-page",
+            "title": "My Page",
+            "summary": "sum",
+            "content": content,
+            "variables": variables,
+            "script": "return 1;",
+            "eyeCatchingImageId": null,
+            "font": "serif",
+            "alignCenter": true,
+            "hideTitleWhenPinned": true,
+            "i": a_token,
+        }),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
-    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
-    assert_eq!(
-        b["error"]["id"],
-        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
-    );
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    assert_eq!(page["name"], json!("my-page"));
+    assert_eq!(page["title"], json!("My Page"));
+    assert_eq!(page["summary"], json!("sum"));
+    assert_eq!(page["content"], content);
+    assert_eq!(page["variables"], variables);
+    assert_eq!(page["font"], json!("serif"));
+    assert_eq!(page["alignCenter"], json!(true));
+    assert_eq!(page["hideTitleWhenPinned"], json!(true));
+    assert_eq!(page["eyeCatchingImage"], Value::Null);
+    assert_eq!(page["userId"], json!(a_id));
+    assert_eq!(page["likedCount"], json!(0));
+    assert!(page["createdAt"].is_string());
+    assert!(page["updatedAt"].is_string());
+    assert_eq!(page["user"]["username"], json!("alice"));
+    // create packs without me → no isLiked key
+    assert!(page.get("isLiked").is_none(), "create pack: {page}");
+    let page_id = page["id"].as_str().unwrap().to_string();
 
-    // empty list
-    let (s, b) = post_json(
+    // show guest → no isLiked; show with bob → isLiked false
+    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["name"], json!("my-page"));
+    assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
+    let (s, shown) = post_json(
         app.clone(),
-        "/api/admin/relays/list",
-        json!({ "i": root_token }),
+        "/api/pages/show",
+        json!({ "pageId": page_id, "i": b_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {b}");
-    assert_eq!(b, json!([]));
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["isLiked"], json!(false));
 
-    // invalid url → INVALID_URL 400 (upstream https-only check)
-    let (s, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/add",
-        json!({ "i": root_token, "inbox": "http://relay.example/inbox" }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
-    assert_eq!(b["error"]["code"], json!("INVALID_URL"));
-    assert_eq!(
-        b["error"]["id"],
-        json!("fb8c92d3-d4e5-44e7-b3d4-800d5cef8b2c")
-    );
-
-    // add → 200 relay entity, status requesting
-    let inbox = "https://relay.example/inbox";
-    let (s, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/add",
-        json!({ "i": root_token, "inbox": inbox }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {b}");
-    let relay_id = b["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("relay id: {b}"))
-        .to_string();
-    assert!(!relay_id.is_empty(), "body: {b}");
-    assert_eq!(b["inbox"], json!(inbox));
-    assert_eq!(b["status"], json!("requesting"));
-
-    // list → the single row
-    let (s, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/list",
-        json!({ "i": root_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {b}");
-    let arr = b.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {b}");
-    assert_eq!(arr[0]["id"], json!(relay_id));
-    assert_eq!(arr[0]["inbox"], json!(inbox));
-    assert_eq!(arr[0]["status"], json!("requesting"));
-
-    // duplicate inbox → 500 (UNIQUE btree, upstream uncaught insert error)
-    let (s, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/add",
-        json!({ "i": root_token, "inbox": inbox }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
-    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
-    let (_, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/list",
-        json!({ "i": root_token }),
-    )
-    .await;
-    assert_eq!(b.as_array().unwrap().len(), 1, "body: {b}");
-
-    // remove by inbox → 204, list empty
-    let (s, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/remove",
-        json!({ "i": root_token, "inbox": inbox }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
-    let (_, b) = post_json(
-        app.clone(),
-        "/api/admin/relays/list",
-        json!({ "i": root_token }),
-    )
-    .await;
-    assert_eq!(b, json!([]));
-
-    // remove unknown inbox → 500 (upstream `throw new Error('relay not found')`)
-    let (s, b) = post_json(
-        app,
-        "/api/admin/relays/remove",
-        json!({ "i": root_token, "inbox": inbox }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
-    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
-}
-
-/// `following/invalidate` + `following/requests/list` (upstream
-/// endpoints/following/{invalidate,requests/list}.ts):
-/// follow → ALREADY_FOLLOWING → invalidate (edge + counters swept) →
-/// invalidate again (silent no-op); pending requests list packs the
-/// requester as UserDetailedNotMe and only for the followee.
-#[tokio::test]
-async fn social_follow_invalidate_and_requests_list() {
-    if std::env::var("DATABASE_URL").is_err() {
-        return;
-    }
-    init_tracing();
-    let pool = fresh_pool("mksocial_invalidate").await;
-    let uname_a = format!("socinv_a{}", mk_types::id::gen_aid_now());
-    let uname_b = format!("socinv_b{}", mk_types::id::gen_aid_now());
-    let app = crate::build_router(test_state(pool.clone()));
-
-    let a = signup(&app, &uname_a).await;
-    let b = signup(&app, &uname_b).await;
-    let (a_id, a_token) = (a["id"].as_str().unwrap(), a["token"].as_str().unwrap());
-    let (b_id, b_token) = (b["id"].as_str().unwrap(), b["token"].as_str().unwrap());
-
-    // auth gate: no credential → CREDENTIAL_REQUIRED
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/following/invalidate",
-        json!({ "userId": b_id }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
-
-    // follow → edge + counters
+    // owner cannot like their own page
     let (s, body) = post_json(
         app.clone(),
-        "/api/following/create",
-        json!({ "userId": b_id, "i": a_token }),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": a_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    assert_eq!(body["isFollowing"], json!(true));
-    let (follower, followee): (String, String) = mk_db::sqlx::query_as(
-        r#"SELECT "followerId", "followeeId" FROM "following" WHERE "followerId" = $1"#,
-    )
-    .bind(a_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(follower, a_id);
-    assert_eq!(followee, b_id);
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("YOUR_PAGE"));
 
-    // already following → 400 ALREADY_FOLLOWING
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/following/create",
-        json!({ "userId": b_id, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("ALREADY_FOLLOWING"));
-
-    // invalidate → packed followee, edge + counters swept
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/following/invalidate",
-        json!({ "userId": b_id, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    assert_eq!(body["id"], json!(b_id));
-    assert_eq!(body["isFollowing"], json!(false));
-    assert_eq!(
-        count_rows(
-            &pool,
-            r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
-            a_id,
-            b_id
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar_i64(
-            &pool,
-            r#"SELECT "followingCount"::bigint FROM "user" WHERE "id" = $1"#,
-            a_id
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar_i64(
-            &pool,
-            r#"SELECT "followersCount"::bigint FROM "user" WHERE "id" = $1"#,
-            b_id
-        )
-        .await,
-        0
-    );
-
-    // invalidate again → silent no-op (unlike following/delete's 400)
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/following/invalidate",
-        json!({ "userId": b_id, "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "body: {body}");
-    assert_eq!(body["isFollowing"], json!(false));
-
-    // unknown target → findOneByOrFail → 500 INTERNAL_ERROR
-    let (s, err) = post_json(
-        app.clone(),
-        "/api/following/invalidate",
-        json!({ "userId": "zzzzzzzzzzzz", "i": a_token }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {err}");
-    assert_eq!(err["error"]["code"], json!("INTERNAL_ERROR"));
-
-    // lock b, then a follows → pending follow_request (no edge)
+    // bob likes → 204; duplicate → ALREADY_LIKED
     let (s, _) = post_json(
         app.clone(),
-        "/api/i/update",
-        json!({ "isLocked": true, "i": b_token }),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": b_token }),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
+    assert_eq!(s, StatusCode::NO_CONTENT);
     let (s, body) = post_json(
         app.clone(),
-        "/api/following/create",
-        json!({ "userId": b_id, "i": a_token }),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_LIKED"));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(1));
+    assert_eq!(shown["isLiked"], json!(true));
+
+    // pages/my (me pack → isLiked false for alice) + pages/liked (bob)
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    let mine = mine.as_array().unwrap();
+    assert_eq!(mine.len(), 1, "my: {mine:?}");
+    assert_eq!(mine[0]["id"], json!(page_id));
+    assert_eq!(mine[0]["isLiked"], json!(false));
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    assert!(mine.as_array().unwrap().is_empty(), "bob my: {mine}");
+    let (s, liked) = post_json(app.clone(), "/api/pages/liked", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {liked}");
+    let liked = liked.as_array().unwrap();
+    assert_eq!(liked.len(), 1, "liked: {liked:?}");
+    assert_eq!(liked[0]["id"], json!(page_id));
+    assert_eq!(liked[0]["isLiked"], json!(true));
+
+    // featured surfaces liked pages (guest-ok)
+    let (s, featured) = post_json(app.clone(), "/api/pages/featured", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {featured}");
+    let featured = featured.as_array().unwrap();
+    assert_eq!(featured.len(), 1, "featured: {featured:?}");
+    assert_eq!(featured[0]["id"], json!(page_id));
+
+    // update is owner-only and returns 204
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/update",
+        json!({ "pageId": page_id, "title": "nope", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/update",
+        json!({ "pageId": page_id, "title": "Renamed", "font": "sans-serif", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["title"], json!("Renamed"));
+    assert_eq!(shown["font"], json!("sans-serif"));
+    assert_eq!(
+        shown["content"], content,
+        "content survives a partial update"
+    );
+
+    // unlike → 204; a second unlike → NOT_LIKED; count back to 0
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/unlike",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/unlike",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NOT_LIKED"));
+    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(0));
+
+    // delete is owner/moderator-only; afterwards show → NO_SUCH_PAGE
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/delete",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/delete",
+        json!({ "pageId": page_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_PAGE"));
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    assert!(
+        mine.as_array().unwrap().is_empty(),
+        "my after delete: {mine}"
+    );
+}
+
+/// federation/*: the instance list filters, show-instance by host, the stats
+/// counts, and the host-filtered users/followers/following reads.
+#[tokio::test]
+async fn federation_instances_show_stats_and_host_lists() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkfederation").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // Two instances: one healthy, one manually suspended.
+    for (id, host, state) in [
+        ("i1", "remote.example", "none"),
+        ("i2", "suspended.example", "manuallySuspended"),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "instance"
+                 ("id", "firstRetrievedAt", "host", "usersCount", "notesCount",
+                  "followingCount", "followersCount", "isNotResponding",
+                  "softwareName", "softwareVersion", "suspensionState")
+               VALUES ($1, now(), $2, 3, 7, 1, 1, false,
+                       'misskey', '13.0.0', $3::public.instance_suspensionstate_enum)"#,
+        )
+        .bind(id)
+        .bind(host)
+        .bind(state)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // federation/instances: full list + the host/suspended/blocked filters.
+    let (s, body) = post_json(app.clone(), "/api/federation/instances", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "body: {body}");
+    let remote = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["host"] == json!("remote.example"))
+        .expect("remote instance listed");
+    assert_eq!(remote["usersCount"], json!(3));
+    assert_eq!(remote["notesCount"], json!(7));
+    assert_eq!(remote["followingCount"], json!(1));
+    assert_eq!(remote["followersCount"], json!(1));
+    assert_eq!(remote["softwareName"], json!("misskey"));
+    assert_eq!(remote["softwareVersion"], json!("13.0.0"));
+    assert_eq!(remote["isSuspended"], json!(false));
+    assert_eq!(remote["suspensionState"], json!("none"));
+    assert_eq!(remote["latestRequestReceivedAt"], Value::Null);
+    assert_eq!(remote["moderationNote"], Value::Null);
+    assert!(remote["firstRetrievedAt"].is_string());
+
+    let (_, body) = post_json(
+        app.clone(),
+        "/api/federation/instances",
+        json!({ "host": "remote" }),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1, "body: {body}");
+    assert_eq!(body[0]["host"], json!("remote.example"));
+
+    let (_, body) = post_json(
+        app.clone(),
+        "/api/federation/instances",
+        json!({ "suspended": true }),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1, "body: {body}");
+    assert_eq!(body[0]["host"], json!("suspended.example"));
+    assert_eq!(body[0]["isSuspended"], json!(true));
+    assert_eq!(body[0]["suspensionState"], json!("manuallySuspended"));
+
+    // empty meta.blockedHosts + blocked=true → upstream's `1=0`.
+    let (_, body) = post_json(
+        app.clone(),
+        "/api/federation/instances",
+        json!({ "blocked": true }),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 0, "body: {body}");
+
+    // federation/show-instance: by host; missing → null → 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/federation/show-instance",
+        json!({ "host": "remote.example" }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
-    let (req_follower, req_followee): (String, String) = mk_db::sqlx::query_as(
-        r#"SELECT "followerId", "followeeId" FROM "follow_request" WHERE "followeeId" = $1"#,
+    assert_eq!(body["host"], json!("remote.example"));
+    assert_eq!(body["usersCount"], json!(3));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/federation/show-instance",
+        json!({ "host": "missing.example" }),
     )
-    .bind(b_id)
-    .fetch_one(&pool)
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // Seed users/profiles + following edges for stats + host lists.
+    for uid in ["u1", "u2", "u3", "u4", "u5"] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "user" ("id", "username", "usernameLower")
+               VALUES ($1, $1, $1)"#,
+        )
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        mk_db::sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ($1)"#)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // A remote user row (federation/users).
+    mk_db::sqlx::query(
+        r#"INSERT INTO "user" ("id", "username", "usernameLower", "host")
+           VALUES ('ru1', 'bob', 'bob', 'remote.example')"#,
+    )
+    .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(req_follower, a_id);
-    assert_eq!(req_followee, b_id);
+    mk_db::sqlx::query(r#"INSERT INTO "user_profile" ("userId") VALUES ('ru1')"#)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    // followee sees the requester packed
+    // f1-f3: remote followees (followers endpoint / all_sub_count);
+    // f4-f5: remote followers (following endpoint / all_pub_count).
+    for (id, follower, followee, follower_host, followee_host) in [
+        ("f1", "u1", "u2", None, Some("remote.example")),
+        ("f2", "u1", "u3", None, Some("remote.example")),
+        ("f3", "u1", "u4", None, Some("remote.example")),
+        ("f4", "u2", "u1", Some("remote.example"), None),
+        ("f5", "u3", "u1", Some("remote.example"), None),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "following" ("id", "followerId", "followeeId",
+                                        "followerHost", "followeeHost")
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(id)
+        .bind(follower)
+        .bind(followee)
+        .bind(follower_host)
+        .bind(followee_host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // federation/stats: top instances by followers/following + the totals.
+    let (s, body) = post_json(app.clone(), "/api/federation/stats", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let subs = body["topSubInstances"].as_array().unwrap();
+    assert_eq!(subs.len(), 1, "body: {body}");
+    assert_eq!(subs[0]["host"], json!("remote.example"));
+    assert_eq!(body["otherFollowersCount"], json!(2)); // 3 remote edges - 1 top
+    let pubs = body["topPubInstances"].as_array().unwrap();
+    assert_eq!(pubs.len(), 1, "body: {body}");
+    assert_eq!(pubs[0]["host"], json!("remote.example"));
+    assert_eq!(body["otherFollowingCount"], json!(1)); // 2 remote edges - 1 top
+
+    // federation/users: only rows with the exact host.
     let (s, body) = post_json(
         app.clone(),
-        "/api/following/requests/list",
-        json!({ "i": b_token }),
+        "/api/federation/users",
+        json!({ "host": "remote.example" }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "body: {body}");
-    assert_eq!(arr[0]["id"], json!(a_id));
-    assert_eq!(arr[0]["username"], json!(uname_a));
+    assert_eq!(body.as_array().unwrap().len(), 1, "body: {body}");
+    assert_eq!(body[0]["id"], json!("ru1"));
+    assert_eq!(body[0]["host"], json!("remote.example"));
+    assert_eq!(body[0]["username"], json!("bob"));
 
-    // limit is honoured; the requester's own list is empty
+    // federation/followers: followeeHost = host, public visibility.
     let (s, body) = post_json(
         app.clone(),
-        "/api/following/requests/list",
-        json!({ "i": b_token, "limit": 1 }),
+        "/api/federation/followers",
+        json!({ "host": "remote.example" }),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
-    assert_eq!(body.as_array().unwrap().len(), 1);
-    let (s, body) = post_json(app, "/api/following/requests/list", json!({ "i": a_token })).await;
+    assert_eq!(body.as_array().unwrap().len(), 3, "body: {body}");
+    assert_eq!(body[0]["followeeId"], json!("u4")); // id DESC
+    assert_eq!(body[0]["followee"]["id"], json!("u4"));
+    assert!(body[0].get("follower").is_none());
+
+    // federation/following: followerHost = host.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/federation/following",
+        json!({ "host": "remote.example" }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
-    assert_eq!(body, json!([]));
+    assert_eq!(body.as_array().unwrap().len(), 2, "body: {body}");
+    assert_eq!(body[0]["followeeId"], json!("u1"));
 }
