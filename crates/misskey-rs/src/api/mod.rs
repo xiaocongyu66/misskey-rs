@@ -1551,6 +1551,63 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END gallery-agent DISPATCH ARM ====
 
+    // ==== fetch/proxy DISPATCH ARM (fetch-rss + fetch-external-resources +
+    // page-push) ====
+    // Self-contained block on the pages-arm pattern. fetch-rss is guest-ok
+    // and allowGet upstream, so GET is accepted for it only (query params are
+    // percent-decoded into the body object); the other two requireCredential.
+    // The endpoint bodies + upstream error tables live in api::fetch_more.
+    if fetch_more::handles(name.as_str()) {
+        let get_ok = name == "fetch-rss" && method == Method::GET;
+        if method != Method::POST && !get_ok {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = if get_ok {
+            let query = req.uri().query().unwrap_or_default();
+            let mut map = serde_json::Map::new();
+            if let Ok(url) = reqwest::Url::parse(&format!("http://localhost/?{query}")) {
+                for (k, v) in url.query_pairs() {
+                    map.insert(k.into_owned(), Value::String(v.into_owned()));
+                }
+            }
+            Value::Object(map)
+        } else {
+            match parse_json_body(req).await {
+                Ok(b) => b,
+                Err(resp) => return resp,
+            }
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        let unauthenticated = token.is_none();
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        let mut resp =
+            fetch_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+        // upstream meta.cacheSec (fetch-rss: 180) on unauthenticated GET
+        // successes: `Cache-Control: public, max-age=180`.
+        if get_ok && unauthenticated && resp.status() == StatusCode::OK {
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=180"),
+            );
+        }
+        return resp;
+    }
+    // ==== END fetch/proxy DISPATCH ARM ====
+
     // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
     // gallery/posts/create) ====
     // The beforeAll create fixtures the pinned test/e2e/fetch-resource.ts
@@ -6943,3 +7000,11 @@ mod stream_auth;
 /// apOrHtml arms) and the pages{,/flash,{,gallery}/posts}/create fixtures;
 /// mod.rs only registers the module and the single dispatch arm above.
 pub(crate) mod fetch_resource;
+
+/// fetch/proxy endpoints (upstream `endpoints/fetch-rss.ts`,
+/// `fetch-external-resources.ts`, `page-push.ts`). Module file
+/// `api/fetch_more.rs` owns URL normalization, the minimal RSS/Atom parser,
+/// the external-resource JSON + sha512 hash check and the page-push
+/// existence check; mod.rs only registers the module and the dispatch arm
+/// above.
+pub(crate) mod fetch_more;

@@ -21408,6 +21408,275 @@ async fn i_registry_and_signin_history_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// fetch/proxy endpoints (fetch-rss / fetch-external-resources / page-push)
+// ---------------------------------------------------------------------------
+
+/// Ephemeral local HTTP/1.1 server answering every request with `body`.
+/// Returns the bound port. Requests are drained then closed (`Connection:
+/// close`) so reqwest sees a complete response.
+async fn spawn_http_server(body: String, content_type: &'static str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn fetch_rss_validates_url_and_maps_fetch_errors() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkfetch_rss_err").await;
+    let app = crate::build_router(test_state(pool));
+
+    // normalizeUrl rejects empty / unparseable / non-http(s) / credentialed.
+    for url in [
+        "",
+        "not a URL",
+        "ftp://example.com/feed.xml",
+        "https://user@example.com/feed.xml",
+        "https://user:password@example.com/feed.xml",
+    ] {
+        let (s, b) = post_json(app.clone(), "/api/fetch-rss", json!({ "url": url })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "url={url:?}: {b}");
+        assert_eq!(b["error"]["code"], json!("INVALID_URL"), "url={url:?}: {b}");
+        assert_eq!(
+            b["error"]["id"],
+            json!("89b7ee05-ccfc-4bdd-9b13-61172fd1e06c"),
+            "url={url:?}: {b}"
+        );
+    }
+
+    // Missing / non-string url → paramDef INVALID_PARAM.
+    let (s, b) = post_json(app.clone(), "/api/fetch-rss", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+    let (s, b) = post_json(app.clone(), "/api/fetch-rss", json!({ "url": 1 })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+
+    // An unreachable port collapses into FETCH_RSS_FAILED (422), never leaking
+    // the transport error. Port 1 is never listened on.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-rss",
+        json!({ "url": "http://127.0.0.1:1/feed.xml" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+    assert_eq!(b["error"]["code"], json!("FETCH_RSS_FAILED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("8db5d3d8-31d7-452f-b0cc-ca3b8925de12"),
+        "{b}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_rss_parses_a_local_rss_feed() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkfetch_rss_ok").await;
+    let app = crate::build_router(test_state(pool));
+
+    let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Test Feed</title><link>https://example.com/</link><description>Feed desc</description><item><title>First</title><link>https://example.com/1</link><pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate><description>&lt;p&gt;Hello &amp; welcome&lt;/p&gt;</description><guid>g1</guid></item><item><title>Second</title><link>https://example.com/2</link></item></channel></rss>"#;
+    let port = spawn_http_server(xml.to_string(), "application/rss+xml").await;
+
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-rss",
+        json!({ "url": format!("http://127.0.0.1:{port}/feed.xml") }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["title"], json!("Test Feed"), "{b}");
+    assert_eq!(b["link"], json!("https://example.com/"), "{b}");
+    assert_eq!(b["description"], json!("Feed desc"), "{b}");
+    let items = b["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "{b}");
+    assert_eq!(items[0]["title"], json!("First"));
+    assert_eq!(items[0]["link"], json!("https://example.com/1"));
+    assert_eq!(items[0]["pubDate"], json!("Mon, 01 Jan 2024 00:00:00 GMT"));
+    assert_eq!(items[0]["guid"], json!("g1"));
+    assert_eq!(items[0]["contentSnippet"], json!("Hello & welcome"));
+    assert_eq!(items[1]["title"], json!("Second"));
+}
+
+#[tokio::test]
+async fn fetch_external_resources_schema_and_hash() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    use sha2::{Digest, Sha512};
+
+    init_tracing();
+    let pool = fresh_pool("mkfetch_ext").await;
+    let app = crate::build_router(test_state(pool));
+    let username = format!("ext{}", mk_types::id::gen_aid_now());
+    let signed = signup(&app, &username).await;
+    let token = signed["token"].as_str().unwrap().to_string();
+
+    // requireCredential.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-external-resources",
+        json!({ "url": "http://127.0.0.1:1/x", "hash": "00" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // Missing hash → INVALID_PARAM (upstream paramDef requires both).
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-external-resources",
+        json!({ "url": "http://127.0.0.1:1/x", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+
+    // Missing/blank type or data → EXT_RESOURCE_RETURNED_INVALID_SCHEMA.
+    let port = spawn_http_server(json!({ "foo": 1 }).to_string(), "application/json").await;
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-external-resources",
+        json!({
+            "url": format!("http://127.0.0.1:{port}/x"),
+            "hash": "00",
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(
+        b["error"]["code"],
+        json!("EXT_RESOURCE_RETURNED_INVALID_SCHEMA"),
+        "{b}"
+    );
+
+    // sha512 mismatch → EXT_RESOURCE_HASH_DIDNT_MATCH.
+    let data = "hello\r\nworld";
+    let port = spawn_http_server(
+        json!({ "type": "text/plain", "data": data }).to_string(),
+        "application/json",
+    )
+    .await;
+    let url = format!("http://127.0.0.1:{port}/x");
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-external-resources",
+        json!({ "url": url, "hash": "deadbeef", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(
+        b["error"]["code"],
+        json!("EXT_RESOURCE_HASH_DIDNT_MATCH"),
+        "{b}"
+    );
+
+    // Matching hash (CRLF normalized to LF) → { type, data }.
+    let digest = Sha512::digest(b"hello\nworld");
+    let mut hex = String::new();
+    for byte in digest.iter() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/fetch-external-resources",
+        json!({ "url": url, "hash": hex, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b, json!({ "type": "text/plain", "data": data }));
+}
+
+#[tokio::test]
+async fn page_push_validates_page_and_returns_204() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkpage_push").await;
+    let app = crate::build_router(test_state(pool));
+    let username = format!("push{}", mk_types::id::gen_aid_now());
+    let signed = signup(&app, &username).await;
+    let token = signed["token"].as_str().unwrap().to_string();
+
+    let (s, page) = post_json(
+        app.clone(),
+        "/api/pages/create",
+        json!({ "name": "pushme", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{page}");
+    let page_id = page["id"].as_str().unwrap().to_string();
+
+    // requireCredential.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/page-push",
+        json!({ "pageId": page_id, "event": "ping" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // Existing page → 204 (no event fan-out wired in this slice).
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/page-push",
+        json!({ "pageId": page_id, "event": "ping", "var": { "x": 1 }, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+
+    // Unknown page → NO_SUCH_PAGE with the upstream id.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/page-push",
+        json!({ "pageId": "no-such-page", "event": "ping", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_PAGE"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("4a13ad31-6729-46b4-b9af-e86b265c2e74"),
+        "{b}"
+    );
+
+    // Missing event → INVALID_PARAM.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/page-push",
+        json!({ "pageId": page_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_PARAM"));
+}
+
+// ---------------------------------------------------------------------------
 // retention + export-custom-emojis (endpoints/retention.ts,
 // endpoints/export-custom-emojis.ts — api::retention_export)
 // ---------------------------------------------------------------------------
