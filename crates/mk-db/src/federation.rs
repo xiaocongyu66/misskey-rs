@@ -180,7 +180,8 @@ pub async fn list_instances(
     ));
 
     if let Some(pattern) = q.host_like {
-        qb.push(r#" AND "host" LIKE "#).push_bind(pattern.to_string());
+        qb.push(r#" AND "host" LIKE "#)
+            .push_bind(pattern.to_string());
     }
 
     match q.blocked {
@@ -302,16 +303,14 @@ pub async fn stats(pool: &PgPool, limit: i64) -> Result<FederationStats, sqlx::E
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    let all_sub_count: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM "following" WHERE "followeeHost" IS NOT NULL"#,
-    )
-    .fetch_one(pool)
-    .await?;
-    let all_pub_count: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM "following" WHERE "followerHost" IS NOT NULL"#,
-    )
-    .fetch_one(pool)
-    .await?;
+    let all_sub_count: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM "following" WHERE "followeeHost" IS NOT NULL"#)
+            .fetch_one(pool)
+            .await?;
+    let all_pub_count: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM "following" WHERE "followerHost" IS NOT NULL"#)
+            .fetch_one(pool)
+            .await?;
     Ok(FederationStats {
         top_sub,
         top_pub,
@@ -342,7 +341,11 @@ pub async fn list_edges_by_host(
     } else {
         "followerHost"
     };
-    let owner_col = if followers { "followeeId" } else { "followerId" };
+    let owner_col = if followers {
+        "followeeId"
+    } else {
+        "followerId"
+    };
     let vis_col = if followers {
         "followersVisibility"
     } else {
@@ -363,9 +366,7 @@ pub async fn list_edges_by_host(
     );
     if !moderator {
         match me_id {
-            None => sql.push_str(&format!(
-                r#" AND ownerProfile."{vis_col}" = 'public'"#
-            )),
+            None => sql.push_str(&format!(r#" AND ownerProfile."{vis_col}" = 'public'"#)),
             Some(_) => sql.push_str(&format!(
                 r#" AND (ownerProfile."{vis_col}" = 'public'
                          OR f."{owner_col}" = $5
