@@ -130,6 +130,12 @@ pub mod relay;
 // ship in the 0001 baseline — no migration.
 pub mod invite;
 pub mod promo;
+// hashtags arena: hashtag counter reads + `__chart__hashtag` trend fallback
+// (both tables ship in the 0001 baseline — no migration)
+pub mod hashtag;
+// auth arena: auth_session + app join behind auth/session/show (0001
+// baseline — no migration)
+pub mod auth;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await
