@@ -338,3 +338,33 @@ pub async fn update_role(pool: &PgPool, id: &str, upd: &RoleUpdate) -> Result<()
     qb.build().execute(pool).await?;
     Ok(())
 }
+
+/// `endpoints/roles/list.ts` — `rolesRepository.findBy({isPublic: true,
+/// isExplorable: true})` with optional id paging (the endpoint returns every
+/// public explorable role; the pager is an additive convenience).
+pub async fn list_public_explorable_role_packs(
+    pool: &PgPool,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<RolePackRow>, sqlx::Error> {
+    let dir = if since_id.is_some() && until_id.is_none() {
+        "ASC"
+    } else {
+        "DESC"
+    };
+    let sql = format!(
+        r#"SELECT {} FROM "role" role
+           WHERE role."isPublic" = TRUE AND role."isExplorable" = TRUE
+             AND ($1::text IS NULL OR role."id" < $1)
+             AND ($2::text IS NULL OR role."id" > $2)
+           ORDER BY role."id" {dir} LIMIT $3"#,
+        ROLE_PACK_COLUMNS
+    );
+    sqlx::query_as::<_, RolePackRow>(&sql)
+        .bind(until_id)
+        .bind(since_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}

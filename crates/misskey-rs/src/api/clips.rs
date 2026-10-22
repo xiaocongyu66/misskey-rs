@@ -324,7 +324,7 @@ async fn pack_clip(
     Ok(v)
 }
 
-async fn pack_clips(
+pub(crate) async fn pack_clips(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     rows: &[mk_db::clips::ClipRow],

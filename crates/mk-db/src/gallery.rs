@@ -260,3 +260,30 @@ pub async fn list_featured(
         .fetch_all(pool)
         .await
 }
+
+/// `endpoints/users/gallery/posts.ts` — every gallery post by `user_id`,
+/// paged on id with the makePaginationQuery direction rule.
+pub async fn list_by_user(
+    pool: &PgPool,
+    user_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<GalleryPostRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {POST_COLS} FROM "gallery_post"
+           WHERE "userId" = $1
+             AND ($2::text IS NULL OR "id" > $2)
+             AND ($3::text IS NULL OR "id" < $3)
+           ORDER BY "id" {}
+           LIMIT $4"#,
+        order_dir(since_id, until_id)
+    );
+    sqlx::query_as::<_, GalleryPostRow>(&sql)
+        .bind(user_id)
+        .bind(since_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}

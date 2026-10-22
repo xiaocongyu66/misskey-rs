@@ -518,3 +518,22 @@ mod tests {
         assert!(!CLIP_VIS_GUEST.contains('$'));
     }
 }
+
+/// `endpoints/notes/clips.ts` — the public clips that contain the note
+/// (`clipNotes.findBy({noteId})` → `clips.findBy({id: In(...), isPublic:
+/// true})`; the ordering is undefined upstream, newest-id first here).
+pub async fn public_clips_for_note(
+    pool: &PgPool,
+    note_id: &str,
+) -> Result<Vec<ClipRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {CLIP_COLS_QUALIFIED} FROM "clip_note" cn
+           INNER JOIN "clip" ON "clip"."id" = cn."clipId"
+           WHERE cn."noteId" = $1 AND "clip"."isPublic" = TRUE
+           ORDER BY "clip"."id" DESC"#
+    );
+    sqlx::query_as::<_, ClipRow>(&sql)
+        .bind(note_id)
+        .fetch_all(pool)
+        .await
+}

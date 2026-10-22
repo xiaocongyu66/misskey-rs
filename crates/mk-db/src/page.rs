@@ -320,3 +320,31 @@ pub async fn list_featured(
         .fetch_all(pool)
         .await
 }
+
+/// `endpoints/users/pages.ts` — public pages created by `user_id`, paged on
+/// id with the makePaginationQuery direction rule.
+pub async fn list_by_user(
+    pool: &PgPool,
+    user_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<PageRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {PAGE_COLS} FROM "page"
+           WHERE "userId" = $1
+             AND "visibility" = 'public'
+             AND ($2::text IS NULL OR "id" > $2)
+             AND ($3::text IS NULL OR "id" < $3)
+           ORDER BY "id" {}
+           LIMIT $4"#,
+        order_dir(since_id, until_id)
+    );
+    sqlx::query_as::<_, PageRow>(&sql)
+        .bind(user_id)
+        .bind(since_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}

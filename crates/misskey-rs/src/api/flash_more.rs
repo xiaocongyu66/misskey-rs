@@ -254,7 +254,7 @@ async fn pack_flash(
     Ok(out)
 }
 
-async fn pack_many(
+pub(crate) async fn pack_many(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     rows: &[mk_db::flash::FlashRow],

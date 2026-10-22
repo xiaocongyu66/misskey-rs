@@ -88,6 +88,11 @@ mod i_more;
 // handlers; SQL lives in mk-db/src/{registry,signin}.rs (both tables ship in
 // the 0001 baseline).
 mod i_registry;
+// i-export-hooks arena: i/export-{antennas,notes} (upstream enqueues a zip
+// export job; this rewrite answers the caller's rows as JSON — documented in
+// api/i_export_hooks.rs) + the i/webhooks/{create,delete,list,show,update,
+// test} family over the 0001 `webhook` table.
+mod i_export_hooks;
 // announcements-agent: the announcements family (announcements +
 // announcements/show + i/read-announcement + admin/announcements/*) — db
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
@@ -109,6 +114,13 @@ mod note_extras;
 // reactions/delete, renotes, conversation, children, state, unrenote
 // (tables: note_favorite / note_reaction / note ship in 0001).
 mod notes_more;
+// notes-users2: notes/clips + notes/show-partial-bulk +
+// users/{flashs,gallery/posts,pages} + roles/{list,show} (upstream
+// endpoints/{notes/clips,notes/show-partial-bulk,users/flashs,
+// users/gallery/posts,users/pages,roles/list,roles/show}.ts). Reuses the
+// existing Clip/Flash/GalleryPost/Page/Role packs; SQL appended to
+// mk-db/src/{clips,flash,gallery,page,roles}.rs.
+mod notes_users2;
 // note-agent: drive/files/update (drive/files/update.ts semantics; db part
 // in mk-db/src/drive_note.rs)
 mod drive_note;
@@ -1418,6 +1430,42 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END clips-agent DISPATCH ARM ====
 
+    // ==== notes-users2 DISPATCH ARM (notes/clips + show-partial-bulk +
+    // users/{flashs,gallery/posts,pages} + roles/{list,show}) ====
+    // Self-contained block on the clips-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the optional-me resolution + endpoint bodies in api::notes_users2
+    // (db paths in mk-db/src/{clips,flash,gallery,page,roles}.rs). None of
+    // the 7 names collide with an earlier arm ("notes/clips" is not
+    // clips::handles' "clips/notes"; roles/* is disjoint from admin/roles/*).
+    if notes_users2::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return notes_users2::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END notes-users2 DISPATCH ARM ====
+
     // ==== arena-exports DISPATCH ARM (i/export-clips + drive/files trio) ====
     // Self-contained block on the clips-arm pattern: method check, body
     // parsing and token extraction live in this arm; the requireCredential
@@ -1783,6 +1831,40 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return i_registry::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END i-registry DISPATCH ARM ====
+
+    // ==== i-export-hooks DISPATCH ARM (i/export-{antennas,notes} +
+    // i/webhooks/*) ====
+    // Self-contained block on the i-registry pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential gate + handlers in api::i_export_hooks (all SQL
+    // inline over the 0001 `webhook`/`antenna`/`note` tables). Sits ahead of
+    // the M0_ENDPOINTS fallthrough and shadows no earlier arm.
+    if i_export_hooks::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        return i_export_hooks::handle(
+            &state,
+            name.as_str(),
+            &body,
+            token,
+            credential_declared,
+        )
+        .await;
+    }
+    // ==== END i-export-hooks DISPATCH ARM ====
 
     // ==== federation DISPATCH ARM (federation/*) ====
     // Self-contained block on the clips-arm pattern: method check, body parse

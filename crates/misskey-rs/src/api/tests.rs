@@ -22893,3 +22893,280 @@ async fn admin_misc2_slice2_roundtrip() {
     let stored = mk_db::admin::meta_policies(&pool).await.unwrap().unwrap();
     assert_eq!(stored["canPublicNote"], json!(false));
 }
+
+// ==== notes/users/roles remainder slice (api::notes_users2) ====
+
+#[tokio::test]
+async fn notes_clips_lists_public_clips_containing_note() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_notes_clips").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nuc{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+
+    let (s, nv) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "clip target", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note: {nv}");
+    let note_id = nv["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, cv) = post_json(
+        app.clone(),
+        "/api/clips/create",
+        json!({ "name": "public clip", "isPublic": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "clip: {cv}");
+    let clip_id = cv["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/clips/add-note",
+        json!({ "clipId": clip_id, "noteId": note_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // guest-ok: returns the public clip, no me-gated keys
+    let (s, out) = post_json(app.clone(), "/api/notes/clips", json!({ "noteId": note_id })).await;
+    assert_eq!(s, StatusCode::OK, "notes/clips: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "notes/clips: {out}");
+    assert_eq!(arr[0]["id"], json!(clip_id));
+    assert!(arr[0].get("isFavorited").is_none(), "guest pack: {out}");
+
+    let (s, e) = post_json(app, "/api/notes/clips", json!({ "noteId": "xxxxxx" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "missing note: {e}");
+    assert_eq!(e["error"]["code"], json!("NO_SUCH_NOTE"), "missing note: {e}");
+}
+
+#[tokio::test]
+async fn notes_show_partial_bulk_returns_minimal_packs() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_bulk").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nub{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+    let user_id = mk_db::user::find_local_user_id_by_token(&pool, &token)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (s, nv) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "bulk note", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note: {nv}");
+    let note_id = nv["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, out) = post_json(
+        app,
+        "/api/notes/show-partial-bulk",
+        json!({ "noteIds": [note_id, "xxxxxx"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "bulk: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "bulk: {out}");
+    assert_eq!(arr[0]["id"], json!(note_id));
+    assert_eq!(arr[0]["text"], json!("bulk note"));
+    assert_eq!(arr[0]["userId"], json!(user_id));
+    assert!(arr[0]["createdAt"].is_string(), "bulk: {out}");
+}
+
+#[tokio::test]
+async fn users_flashs_lists_public_flashes_of_user() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_flashs").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nuf{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+    let user_id = mk_db::user::find_local_user_id_by_token(&pool, &token)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (s, fv) = post_json(
+        app.clone(),
+        "/api/flash/create",
+        json!({ "title": "play", "summary": "s", "script": "", "permissions": [], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "flash: {fv}");
+    let flash_id = fv["id"].as_str().unwrap().to_string();
+
+    let (s, out) = post_json(app, "/api/users/flashs", json!({ "userId": user_id })).await;
+    assert_eq!(s, StatusCode::OK, "flashs: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "flashs: {out}");
+    assert_eq!(arr[0]["id"], json!(flash_id));
+    assert_eq!(arr[0]["title"], json!("play"));
+    assert!(arr[0].get("isLiked").is_none(), "no me: {out}");
+}
+
+#[tokio::test]
+async fn users_gallery_posts_lists_posts_of_user() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_gallery").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nug{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+    let user_id = mk_db::user::find_local_user_id_by_token(&pool, &token)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (s, gv) = post_json(
+        app.clone(),
+        "/api/gallery/posts/create",
+        json!({ "title": "shot", "fileIds": [], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "gallery create: {gv}");
+    let post_id = gv["id"].as_str().unwrap().to_string();
+
+    let (s, out) = post_json(app, "/api/users/gallery/posts", json!({ "userId": user_id })).await;
+    assert_eq!(s, StatusCode::OK, "gallery posts: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "gallery posts: {out}");
+    assert_eq!(arr[0]["id"], json!(post_id));
+    assert_eq!(arr[0]["title"], json!("shot"));
+}
+
+#[tokio::test]
+async fn users_pages_lists_public_pages_of_user() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_pages").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nup{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+    let user_id = mk_db::user::find_local_user_id_by_token(&pool, &token)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (s, pv) = post_json(
+        app.clone(),
+        "/api/pages/create",
+        json!({ "name": "about", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "page create: {pv}");
+    let page_id = pv["id"].as_str().unwrap().to_string();
+
+    let (s, out) = post_json(app, "/api/users/pages", json!({ "userId": user_id })).await;
+    assert_eq!(s, StatusCode::OK, "pages: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "pages: {out}");
+    assert_eq!(arr[0]["id"], json!(page_id));
+    assert_eq!(arr[0]["name"], json!("about"));
+    assert!(arr[0].get("isLiked").is_none(), "no me: {out}");
+}
+
+#[tokio::test]
+async fn roles_list_and_show_public_explorable() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_roles").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("nur{}", mk_types::id::gen_aid_now());
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+
+    let (s, rv) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({ "name": "Explorable", "isPublic": true, "isExplorable": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "role create: {rv}");
+    let role_id = rv["id"].as_str().unwrap().to_string();
+
+    // guest-ok list (mission contract) — the role renders with usersCount 0.
+    let (s, out) = post_json(app.clone(), "/api/roles/list", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "roles/list: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "roles/list: {out}");
+    assert_eq!(arr[0]["id"], json!(role_id));
+    assert_eq!(arr[0]["usersCount"], json!(0));
+    assert_eq!(arr[0]["isExplorable"], json!(true));
+
+    // authenticated list agrees.
+    let (s, out) = post_json(app.clone(), "/api/roles/list", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "roles/list auth: {out}");
+    assert_eq!(out.as_array().unwrap().len(), 1);
+
+    // show by id, guest-ok; unknown → NO_SUCH_ROLE with the upstream id.
+    let (s, out) = post_json(app.clone(), "/api/roles/show", json!({ "roleId": role_id })).await;
+    assert_eq!(s, StatusCode::OK, "roles/show: {out}");
+    assert_eq!(out["id"], json!(role_id));
+    let (s, e) = post_json(app, "/api/roles/show", json!({ "roleId": "xxxxxx" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "roles/show missing: {e}");
+    assert_eq!(e["error"]["code"], json!("NO_SUCH_ROLE"));
+    assert_eq!(
+        e["error"]["id"],
+        json!("de5502bf-009a-4639-86c1-fec349e46dcb")
+    );
+}

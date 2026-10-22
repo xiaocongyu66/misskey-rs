@@ -346,3 +346,31 @@ pub async fn list_my_likes(
         .fetch_all(pool)
         .await
 }
+
+/// `endpoints/users/flashs.ts` — public flashes created by `user_id`, paged
+/// on id with the makePaginationQuery direction rule.
+pub async fn list_by_user(
+    pool: &PgPool,
+    user_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<FlashRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {FLASH_COLS} FROM "flash"
+           WHERE "userId" = $1
+             AND "visibility" = 'public'
+             AND ($2::text IS NULL OR "id" > $2)
+             AND ($3::text IS NULL OR "id" < $3)
+           ORDER BY "id" {}
+           LIMIT $4"#,
+        order_dir(since_id, until_id)
+    );
+    sqlx::query_as::<_, FlashRow>(&sql)
+        .bind(user_id)
+        .bind(since_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}

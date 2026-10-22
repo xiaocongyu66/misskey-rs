@@ -293,7 +293,7 @@ async fn pack_post(
     Ok(out)
 }
 
-async fn pack_many(
+pub(crate) async fn pack_many(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     rows: &[mk_db::gallery::GalleryPostRow],
