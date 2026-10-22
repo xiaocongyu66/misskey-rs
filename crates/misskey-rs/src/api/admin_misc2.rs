@@ -110,7 +110,7 @@ fn internal() -> Response {
     api_err(ApiError::internal_error())
 }
 
-fn db_err(e: sqlx::Error) -> Response {
+fn db_err(e: mk_db::sqlx::Error) -> Response {
     tracing::error!(target: "dbg_admin_misc2", error = %e, "db");
     internal()
 }
@@ -271,9 +271,20 @@ async fn captcha_save(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check {
 }
 
 async fn verify_siteverify(url: &str, secret: &str, response: &str) -> Check {
+    // reqwest is built without the json/form features; send the form body
+    // ourselves and parse the JSON text.
+    let body = format!(
+        "secret={}&response={}",
+        urlencode(secret),
+        urlencode(response)
+    );
     let resp = reqwest::Client::new()
         .post(url)
-        .form(&[("secret", secret), ("response", response)])
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
         .send()
         .await
         .map_err(|e| {
@@ -283,7 +294,8 @@ async fn verify_siteverify(url: &str, secret: &str, response: &str) -> Check {
     if !resp.status().is_success() {
         return Err(request_failed());
     }
-    let v: Value = resp.json().await.map_err(|_| request_failed())?;
+    let text = resp.text().await.map_err(|_| request_failed())?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| request_failed())?;
     if v.get("success").and_then(|s| s.as_bool()) != Some(true) {
         return Err(verification_failed());
     }
@@ -295,9 +307,11 @@ async fn verify_mcaptcha(instance_url: &str, sitekey: &str, secret: &str, token:
         "{}/api/v1/pow/siteverify",
         instance_url.trim_end_matches('/')
     );
+    let body = json!({ "key": sitekey, "secret": secret, "token": token }).to_string();
     let resp = reqwest::Client::new()
         .post(url)
-        .json(&json!({ "key": sitekey, "secret": secret, "token": token }))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .await
         .map_err(|e| {
@@ -307,11 +321,28 @@ async fn verify_mcaptcha(instance_url: &str, sitekey: &str, secret: &str, token:
     if resp.status() != reqwest::StatusCode::OK {
         return Err(request_failed());
     }
-    let v: Value = resp.json().await.map_err(|_| request_failed())?;
+    let text = resp.text().await.map_err(|_| request_failed())?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| request_failed())?;
     if v.get("valid").and_then(|s| s.as_bool()) != Some(true) {
         return Err(verification_failed());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// RFC 3986 application/x-www-form-urlencoded escaping (the captcha response
+/// tokens are opaque and may carry `+`/`/`/`=`).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
