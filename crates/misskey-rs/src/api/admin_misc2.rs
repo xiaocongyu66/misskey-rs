@@ -570,32 +570,33 @@ async fn ensure_proxy_account(pool: &mk_db::sqlx::PgPool) -> Check<String> {
     {
         return Ok(id);
     }
-    let outcome =
-        mk_core::services::build_signup("system.proxy", &mk_types::id::gen_aid_now(), None, None)
-            .map_err(|_| internal())?;
+    // SignupService validation rejects '.', so build the account directly like
+    // SystemAccountService.createCorrespondingUser does (generated token +
+    // keypair + password hash).
+    let user_id = mk_types::id::gen_aid_now();
+    let token = mk_core::services::signup::generate_native_user_token();
+    let password_hash = mk_core::services::signup::hash_password(&mk_types::id::gen_aid_now())
+        .map_err(|_| internal())?;
+    let (public_key, private_key) =
+        mk_core::services::signup::generate_rsa_keypair_pem().map_err(|_| internal())?;
     let new_user = mk_db::user::NewUser {
-        id: &outcome.user_id,
-        username: &outcome.username,
-        username_lower: &outcome.username_lower,
-        name: outcome.name.as_deref(),
-        host: outcome.host.as_deref(),
-        token: &outcome.token,
-        password_hash: &outcome.password_hash,
-        public_key: &outcome.public_key,
-        private_key: &outcome.private_key,
+        id: &user_id,
+        username: "system.proxy",
+        username_lower: "system.proxy",
+        name: None,
+        host: None,
+        token: &token,
+        password_hash: &password_hash,
+        public_key: &public_key,
+        private_key: &private_key,
     };
     mk_db::user::insert_new_user(pool, &new_user)
         .await
         .map_err(db_err)?;
-    mk_db::admin::insert_system_account(
-        pool,
-        &mk_types::id::gen_aid_now(),
-        &outcome.user_id,
-        "proxy",
-    )
-    .await
-    .map_err(db_err)?;
-    Ok(outcome.user_id)
+    mk_db::admin::insert_system_account(pool, &mk_types::id::gen_aid_now(), &user_id, "proxy")
+        .await
+        .map_err(db_err)?;
+    Ok(user_id)
 }
 
 /// `admin/update-proxy-account.ts` → `SystemAccountService
