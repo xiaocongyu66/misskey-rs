@@ -390,6 +390,17 @@ pub async fn list_edges_by_host(
     q.fetch_all(pool).await
 }
 
+/// The `user."host"` column for one id (the shared user pack hardcodes
+/// `host: None`, so the federation lanes stamp the real host on remote rows).
+pub async fn user_host(pool: &PgPool, id: &str) -> Result<Option<String>, sqlx::Error> {
+    let host: Option<Option<String>> =
+        sqlx::query_scalar(r#"SELECT "host" FROM "user" WHERE "id" = $1"#)
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(host.flatten())
+}
+
 /// `federation/users`: user ids with `host = :host`, paginated by the same
 /// makePaginationQuery bounds.
 pub async fn list_user_ids_by_host(

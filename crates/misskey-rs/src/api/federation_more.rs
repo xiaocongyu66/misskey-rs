@@ -548,7 +548,16 @@ async fn pack_following(
         .await
         .map_err(|e| db_err("pack_following find_user_by_id", e))?;
     if let Some(row) = followee {
-        item["followee"] = super::ff_vis::pack_edge_user(state, pool, row, me_id).await?;
+        let mut packed = super::ff_vis::pack_edge_user(state, pool, row, me_id).await?;
+        // The shared user pack hardcodes `host: None`; federation edges pack
+        // the real remote host (the following row's denormalized host may
+        // differ from the followee's own for `federation/following`).
+        match mk_db::federation::user_host(pool, &edge.followee_id).await {
+            Ok(Some(host)) => packed["host"] = json!(host),
+            Ok(None) => {}
+            Err(e) => return Err(db_err("pack_following user_host", e)),
+        }
+        item["followee"] = packed;
     }
     Ok(item)
 }
@@ -606,7 +615,12 @@ async fn users(
         };
         let Some(row) = row else { continue };
         match super::ff_vis::pack_edge_user(state, pool, row, me_id).await {
-            Ok(v) => out.push(v),
+            Ok(mut v) => {
+                // rows came from `WHERE "host" = $1`, so stamp the real host
+                // the shared pack leaves None.
+                v["host"] = json!(host);
+                out.push(v);
+            }
             Err(r) => return r,
         }
     }
