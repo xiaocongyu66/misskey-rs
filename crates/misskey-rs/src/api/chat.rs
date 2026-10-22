@@ -18,8 +18,16 @@
 //! - Moderator overrides on show/members/message-show are not ported (the
 //!   role engine has no isModerator probe on this path); owner/member/
 //!   invitation scoping matches upstream for ordinary users.
-//! - `chat/messages/react` / `unreact` are intentionally not routed yet (the
-//!   `reactions` column exists; reaction writes land in a later slice).
+//! - `chat/messages/react` / `unreact` store `"<userId>/<reaction>"` entries
+//!   in the `reactions` array (ChatService.react/unreact). Access failures
+//!   collapse to NO_SUCH_MESSAGE like upstream (existence is not disclosed).
+//!   Custom `:name:` emojis are accepted without a local emoji-registry
+//!   check; other unicode input is normalized through
+//!   `social::normalize_reaction` (invalid input falls back to ❤ instead of
+//!   upstream's generic 500).
+//! - `chat/messages/search` mirrors `ChatService.searchMessages` (LOWER(text)
+//!   LIKE with `sqlLikeEscape`); `chat/read-all` is a 204 no-op because the
+//!   `newChatMessagesExists:*` markers exist only in Redis upstream.
 //! - Chat streams/notifications (`publishChat*Stream`, push, 3s unread
 //!   fanout) have no port-side consumer and stay out.
 
@@ -52,6 +60,10 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/messages/room-timeline",
     "chat/messages/show",
     "chat/messages/delete",
+    "chat/messages/react",
+    "chat/messages/unreact",
+    "chat/messages/search",
+    "chat/read-all",
     "chat/history",
 ];
 
@@ -431,6 +443,10 @@ pub(crate) async fn handle(
         "chat/messages/room-timeline" => messages_room_timeline(state, pool, body, &me_id).await,
         "chat/messages/show" => messages_show(state, pool, body, &me_id).await,
         "chat/messages/delete" => messages_delete(pool, body, &me_id).await,
+        "chat/messages/react" => messages_react(pool, body, &me_id).await,
+        "chat/messages/unreact" => messages_unreact(pool, body, &me_id).await,
+        "chat/messages/search" => messages_search(state, pool, body, &me_id).await,
+        "chat/read-all" => Ok(ok_empty()),
         "chat/history" => chat_history(state, pool, body, &me_id).await,
         _ => Ok(api_err(ApiError::unknown_endpoint())),
     };
@@ -1034,6 +1050,147 @@ async fn messages_delete(
         .await
         .map_err(|e| db_err("messages_delete", e))?;
     Ok(ok_empty())
+}
+
+/// ChatService.react/unreact reaction normalization: a custom `:name:` /
+/// `:name@.:` shortcode is stored verbatim (the port has no chat emoji
+/// registry to validate it against); anything else goes through the shared
+/// note-reaction normalizer (ZWJ kept, \ufe0f stripped).
+fn chat_reaction(input: &str) -> String {
+    if let Some(inner) = input.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+        let name = inner.strip_suffix("@.").unwrap_or(inner);
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '+' | '-'))
+        {
+            return format!(":{name}:");
+        }
+    }
+    super::social::normalize_reaction(input)
+}
+
+/// Shared react/unreact access gate: message must exist and, for room
+/// messages, the caller must own or belong to the room. Failures collapse to
+/// the endpoint's NO_SUCH_MESSAGE (upstream hides existence via
+/// ChatMessageAccessError).
+async fn reaction_target(
+    pool: &mk_db::sqlx::PgPool,
+    message_id: &str,
+    me_id: &str,
+    error_id: &str,
+) -> Result<ChatMessageRow, Response> {
+    let message = mk_db::chat::find_message(pool, message_id)
+        .await
+        .map_err(|e| db_err("reaction find_message", e))?
+        .ok_or_else(|| no_such_message(error_id))?;
+    if let Some(room_id) = &message.to_room_id {
+        let room = mk_db::chat::find_room(pool, room_id)
+            .await
+            .map_err(|e| db_err("reaction find_room", e))?
+            .ok_or_else(|| no_such_message(error_id))?;
+        let member = room.owner_id == me_id
+            || mk_db::chat::membership_exists(pool, room_id, me_id)
+                .await
+                .map_err(|e| db_err("reaction membership", e))?;
+        if !member {
+            return Err(no_such_message(error_id));
+        }
+    }
+    Ok(message)
+}
+
+/// chat/messages/react — ChatService.react (`array_append`).
+async fn messages_react(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    const ERR: &str = "9b5839b9-0ba0-4351-8c35-37082093d200";
+    let message_id = required_id(body, "messageId")?;
+    let reaction =
+        opt_str(body, "reaction").ok_or_else(|| invalid_param("reaction", "required"))?;
+    let message = reaction_target(pool, message_id, me_id, ERR).await?;
+    if message.from_user_id == me_id {
+        return Err(no_such_message(ERR));
+    }
+    if message.to_room_id.is_none() && message.to_user_id.as_deref() != Some(me_id) {
+        return Err(no_such_message(ERR));
+    }
+    if message.reactions.len() >= 100 {
+        // MAX_REACTIONS_PER_MESSAGE (ChatService.ts L35) — upstream throws a
+        // generic Error, which the API layer turns into INTERNAL_ERROR.
+        return Err(api_err(ApiError::internal_error()));
+    }
+    let pair = format!("{me_id}/{}", chat_reaction(reaction));
+    mk_db::chat::add_reaction(pool, &message.id, &pair)
+        .await
+        .map_err(|e| db_err("messages_react", e))?;
+    Ok(ok_empty())
+}
+
+/// chat/messages/unreact — ChatService.unreact (`array_remove`); unlike
+/// react this does not forbid the sender's own message.
+async fn messages_unreact(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    const ERR: &str = "c39ea42f-e3ca-428a-ad57-390e0a711595";
+    let message_id = required_id(body, "messageId")?;
+    let reaction =
+        opt_str(body, "reaction").ok_or_else(|| invalid_param("reaction", "required"))?;
+    let message = reaction_target(pool, message_id, me_id, ERR).await?;
+    if message.to_room_id.is_none()
+        && message.from_user_id != me_id
+        && message.to_user_id.as_deref() != Some(me_id)
+    {
+        return Err(no_such_message(ERR));
+    }
+    let pair = format!("{me_id}/{}", chat_reaction(reaction));
+    mk_db::chat::remove_reaction(pool, &message.id, &pair)
+        .await
+        .map_err(|e| db_err("messages_unreact", e))?;
+    Ok(ok_empty())
+}
+
+/// chat/messages/search — ChatService.searchMessages (LOWER(text) LIKE).
+async fn messages_search(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    const NO_SUCH_ROOM: &str = "460b3669-81b0-4dc9-a997-44442141bf83";
+    let query = match opt_str(body, "query") {
+        Some(q) if !q.is_empty() && q.chars().count() <= 256 => q,
+        Some(_) => return Err(invalid_param("query", "must be 1..256 characters")),
+        None => return Err(invalid_param("query", "required (1..256 characters)")),
+    };
+    let limit = limit_param(body, 10)?;
+    let user_id = opt_str(body, "userId");
+    let room_id = opt_str(body, "roomId");
+    if let Some(room_id) = room_id {
+        let room = mk_db::chat::find_room(pool, room_id)
+            .await
+            .map_err(|e| db_err("messages_search find_room", e))?
+            .ok_or_else(|| no_such_room(NO_SUCH_ROOM))?;
+        let member = room.owner_id == me_id
+            || mk_db::chat::membership_exists(pool, room_id, me_id)
+                .await
+                .map_err(|e| db_err("messages_search membership", e))?;
+        if !member {
+            return Err(no_such_room(NO_SUCH_ROOM));
+        }
+    }
+    let rows = mk_db::chat::search_messages(pool, me_id, query, limit, user_id, room_id)
+        .await
+        .map_err(|e| db_err("messages_search", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(pack_message_detailed(state, pool, row, me_id).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
 }
 
 /// chat/history — latest per 1on1 counterpart (room: false) or per joined

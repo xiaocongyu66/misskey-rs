@@ -22250,3 +22250,100 @@ async fn ap_sw_misc_bubble_game_ranking() {
     assert_eq!(rows[0]["user"]["id"], json!(alice_id));
     assert!(rows[0]["id"].as_str().is_some());
 }
+
+// chat/messages/{react,unreact,search} — the ChatService reaction + search
+// roundtrip (upstream chat/messages/*.ts).
+#[tokio::test]
+async fn chat_react_search_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_react").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("cra")).await;
+    let bob = signup(&app, &uname("crb")).await;
+    let a_id = alice["id"].as_str().unwrap().to_string();
+    let b_id = bob["id"].as_str().unwrap().to_string();
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bt = bob["token"].as_str().unwrap().to_string();
+
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "reactroom", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/create",
+        json!({ "roomId": room_id, "userId": b_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/join",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, msg) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-room",
+        json!({ "toRoomId": room_id, "text": "needle in haystack", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {msg}");
+    let msg_id = msg["id"].as_str().unwrap().to_string();
+
+    // react as alice (not the sender)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/messages/react",
+        json!({ "messageId": msg_id, "reaction": "👍", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "react");
+    // sender's own message cannot be reacted to
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/chat/messages/react",
+        json!({ "messageId": msg_id, "reaction": "👍", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+
+    // search finds it, scoped to the room
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/chat/messages/search",
+        json!({ "query": "needle", "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let hits = body.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "body: {body}");
+    assert_eq!(hits[0]["id"], json!(msg_id));
+
+    // unreact clears the pair
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/messages/unreact",
+        json!({ "messageId": msg_id, "reaction": "👍", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "unreact");
+    let (_, body) = post_json(
+        app.clone(),
+        "/api/chat/messages/search",
+        json!({ "query": "haystack", "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(a_id, alice["id"].as_str().unwrap());
+}

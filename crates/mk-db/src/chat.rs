@@ -586,3 +586,70 @@ pub async fn room_history(
     .fetch_all(pool)
     .await
 }
+
+// ==== reactions + search (chat/messages/{react,unreact,search}) ====
+
+/// ChatService.react: append the `{userId}/{reaction}` pair (deduped).
+pub async fn add_reaction(pool: &PgPool, message_id: &str, pair: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "chat_message" SET "reactions" = array_append("reactions", $2)
+           WHERE "id" = $1 AND NOT ($2 = ANY("reactions"))"#,
+    )
+    .bind(message_id)
+    .bind(pair)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// ChatService.unreact: `array_remove`.
+pub async fn remove_reaction(
+    pool: &PgPool,
+    message_id: &str,
+    pair: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "chat_message" SET "reactions" = array_remove("reactions", $2)
+           WHERE "id" = $1"#,
+    )
+    .bind(message_id)
+    .bind(pair)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// ChatService.searchMessages: LOWER(text) LIKE over messages the caller can
+/// see (own 1on1 side, or a room they belong to), newest first.
+pub async fn search_messages(
+    pool: &PgPool,
+    me_id: &str,
+    query: &str,
+    limit: i64,
+    user_id: Option<&str>,
+    room_id: Option<&str>,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatMessageRow>(&format!(
+        r#"SELECT {MESSAGE_COLS} FROM "chat_message" m
+           WHERE (
+                 m."fromUserId" = $1
+                 OR m."toUserId" = $1
+                 OR m."toRoomId" IN (
+                     SELECT "roomId" FROM "chat_room_membership" WHERE "userId" = $1
+                 )
+               )
+             AND m."text" IS NOT NULL
+             AND lower(m."text") LIKE '%' || lower($2) || '%'
+             AND ($3::varchar IS NULL OR m."fromUserId" = $3 OR m."toUserId" = $3)
+             AND ($4::varchar IS NULL OR m."toRoomId" = $4)
+           ORDER BY m."id" DESC
+           LIMIT $5"#
+    ))
+    .bind(me_id)
+    .bind(query)
+    .bind(user_id)
+    .bind(room_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
