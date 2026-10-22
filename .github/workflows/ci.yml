@@ -176,6 +176,7 @@ jobs:
         run: |
           cargo test --workspace -- --test-threads=1 \
             --skip admin_accounts_roundtrip \
+            --skip hashtags_users_tag_normalization_and_sort \
             --skip admin_ad_crud_roundtrip \
             --skip admin_drive_roundtrip \
             --skip admin_emoji_bulk_roundtrip \
@@ -272,5 +273,13 @@ jobs:
             --skip gallery_arena_crud_like_list \
             --skip hashtags_search_matches_prefix \
             --skip hashtags_show_list_trend_and_auth_session_show \
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
+      - name: Test (isolated hashtags users)
+        # batch 2 wedges here right after the migrations start, so run it
+        # alone to tell "test itself hangs" from "batch context wedges it".
+        run: |
+          cargo test --workspace -- --test-threads=1 \
+            hashtags_users_tag_normalization_and_sort
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
