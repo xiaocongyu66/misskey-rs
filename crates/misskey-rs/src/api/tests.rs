@@ -20362,3 +20362,167 @@ async fn social_follow_invalidate_and_requests_list() {
     assert_eq!(s, StatusCode::OK, "body: {body}");
     assert_eq!(body, json!([]));
 }
+
+#[tokio::test]
+async fn admin_abuse_reports_and_recipients() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mk_admin_abuse").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    // "root" rides the gate's first-user/username moderator bypass.
+    let root = signup(&app, "root").await;
+    let bob = signup(&app, &format!("abuse{}", mk_types::id::gen_aid_now())).await;
+    let rtoken = root["token"].as_str().unwrap().to_string();
+    let rid = root["id"].as_str().unwrap().to_string();
+    let btoken = bob["token"].as_str().unwrap().to_string();
+    let bid = bob["id"].as_str().unwrap().to_string();
+
+    // requireModerator: a plain user gets ROLE_PERMISSION_DENIED.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/abuse-user-reports",
+        json!({ "i": btoken }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // Insert a report (bob → root), then the admin list sees it.
+    let report_id = mk_types::id::gen_aid_now();
+    mk_db::webhook::insert_abuse_report(&pool, &report_id, &rid, &bid, "spam")
+        .await
+        .unwrap();
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/abuse-user-reports",
+        json!({ "i": rtoken, "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().unwrap();
+    assert_eq!(arr[0]["id"], json!(report_id));
+    assert_eq!(arr[0]["resolved"], json!(false));
+    assert_eq!(arr[0]["comment"], json!("spam"));
+    assert_eq!(arr[0]["reporterId"], json!(bid));
+    assert_eq!(arr[0]["targetUserId"], json!(rid));
+    assert_eq!(arr[0]["reporter"]["id"], json!(bid));
+    assert_eq!(arr[0]["targetUser"]["id"], json!(rid));
+
+    // state=unresolved finds it; state=resolved does not.
+    let (_, u) = post_json(
+        app.clone(),
+        "/api/admin/abuse-user-reports",
+        json!({ "i": rtoken, "state": "unresolved" }),
+    )
+    .await;
+    assert_eq!(u.as_array().unwrap()[0]["id"], json!(report_id));
+    let (_, r) = post_json(
+        app.clone(),
+        "/api/admin/abuse-user-reports",
+        json!({ "i": rtoken, "state": "resolved" }),
+    )
+    .await;
+    assert!(r.as_array().unwrap().is_empty(), "resolved list: {r}");
+
+    // resolve flips resolved + stamps assignee/resolvedAs.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/resolve-abuse-user-report",
+        json!({ "i": rtoken, "reportId": report_id, "resolvedAs": "accept" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (_, r) = post_json(
+        app.clone(),
+        "/api/admin/abuse-user-reports",
+        json!({ "i": rtoken, "state": "resolved" }),
+    )
+    .await;
+    let row = &r.as_array().unwrap()[0];
+    assert_eq!(row["id"], json!(report_id));
+    assert_eq!(row["resolved"], json!(true));
+    assert_eq!(row["assigneeId"], json!(rid));
+    assert_eq!(row["resolvedAs"], json!("accept"));
+
+    // forward on a local target is a plain Error upstream → 500.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/forward-abuse-user-report",
+        json!({ "i": rtoken, "reportId": report_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // recipient create → list → show → update → delete.
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/create",
+        json!({
+            "i": rtoken,
+            "isActive": true,
+            "name": "ops",
+            "method": "webhook",
+            "systemWebhookId": "hook1",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let rec_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["name"], json!("ops"));
+    assert_eq!(created["method"], json!("webhook"));
+
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/list",
+        json!({ "i": rtoken, "method": ["webhook"] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], json!(rec_id));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/show",
+        json!({ "i": rtoken, "id": rec_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["id"], json!(rec_id));
+
+    let (s, updated) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/update",
+        json!({
+            "i": rtoken,
+            "id": rec_id,
+            "isActive": false,
+            "name": "ops2",
+            "method": "webhook",
+            "systemWebhookId": "hook1",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {updated}");
+    assert_eq!(updated["name"], json!("ops2"));
+    assert_eq!(updated["isActive"], json!(false));
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/delete",
+        json!({ "i": rtoken, "id": rec_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, after) = post_json(
+        app.clone(),
+        "/api/admin/abuse-report/notification-recipient/show",
+        json!({ "i": rtoken, "id": rec_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "body: {after}");
+    assert_eq!(after["error"]["code"], json!("NO_SUCH_RECIPIENT"));
+}
