@@ -16,9 +16,6 @@ use crate::ratelimit::Limit;
 
 // social-agent: follow/mute/block/renote social actions (M2 truthful slice)
 mod social;
-// following-agent: following/invalidate + following/requests/list (the
-// remaining following/* names; db paths in mk-db/src/following.rs)
-mod following_more;
 // freq-agent: users/get-frequently-replied-users + pinned-users (users.ts
 // census slice) — db paths in mk-db/src/freq.rs; the users/notes guest path
 // and the admin/update-meta pinnedUsers slice ride along as requisites.
@@ -980,43 +977,6 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         }
         return social::route(&state, name.as_str(), &body, token, credential_declared).await;
     }
-
-    // ==== following-agent DISPATCH ARM (following/invalidate +
-    // following/requests/list) ====
-    // Self-contained block on the social-arm pattern: method check, body
-    // parsing, token extraction and the credential-declared probe live here;
-    // requireCredential gates + endpoint bodies in api::following_more (db
-    // paths in mk-db/src/following.rs). Neither name collides with an
-    // earlier arm (social::SOCIAL_ENDPOINTS owns only the create/delete/
-    // requests accept|cancel verbs), so this arm shadows nothing.
-    if following_more::handles(name.as_str()) {
-        if method != Method::POST {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        let headers = req.headers().clone();
-        let body = match parse_json_body(req).await {
-            Ok(b) => b,
-            Err(resp) => return resp,
-        };
-        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
-        let credential_declared = body.get("i").is_some()
-            || headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.starts_with("Bearer "))
-                .unwrap_or(false);
-        let token = extract_token(&body, &headers);
-        if token.is_none() {
-            if let Some(v) = body.get("i") {
-                if v.as_str().is_none() {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-            }
-        }
-        return following_more::handle(&state, name.as_str(), &body, token, credential_declared)
-            .await;
-    }
-    // ==== END following-agent DISPATCH ARM ====
 
     // ==== channels DISPATCH ARM (channels/* slice) ====
     // channels-agent: all 13 `channels/*` names route into api::channel on
