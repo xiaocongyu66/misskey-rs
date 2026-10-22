@@ -22650,3 +22650,154 @@ async fn admin_misc2_roundtrip() {
         Some("watch this one")
     );
 }
+
+/// slice 2 of the admin misc family: `admin/unset-mfa`, `admin/send-email`
+/// (SMTP-unconfigured no-op), `admin/update-abuse-user-report`,
+/// `admin/show-moderation-logs` and `admin/roles/update-default-policies`
+/// (plus the admin-gate 403s).
+#[tokio::test]
+async fn admin_misc2_slice2_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkmisc2b").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, &uname("misc2a")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let root_id = root["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("misc2b")).await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // Admin-only names → 403 for a plain user.
+    let (s, _b) = post_json(
+        app.clone(),
+        "/api/admin/show-moderation-logs",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _b) = post_json(
+        app.clone(),
+        "/api/admin/roles/update-default-policies",
+        json!({ "policies": {}, "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // unset-mfa: passkey row + TOTP/passwordless flags cleared.
+    mk_db::sqlx::query(
+        r#"INSERT INTO "user_security_key" ("id","userId","publicKey","name")
+           VALUES ($1,$2,'pk','key')"#,
+    )
+    .bind(mk_types::id::gen_aid_now())
+    .bind(&bob_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    mk_db::sqlx::query(
+        r#"UPDATE "user_profile" SET "twoFactorEnabled"=TRUE, "usePasswordLessLogin"=TRUE
+           WHERE "userId"=$1"#,
+    )
+    .bind(&bob_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/unset-mfa",
+        json!({ "userId": bob_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "unset-mfa: {body}");
+    let enabled: bool = mk_db::sqlx::query_scalar(
+        r#"SELECT "twoFactorEnabled" FROM "user_profile" WHERE "userId"=$1"#,
+    )
+    .bind(&bob_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let keys: i64 = mk_db::sqlx::query_scalar(
+        r#"SELECT count(*) FROM "user_security_key" WHERE "userId"=$1"#,
+    )
+    .bind(&bob_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!enabled && keys == 0, "mfa state: enabled={enabled} keys={keys}");
+
+    // send-email with no meta.smtpHost → EmailService no-op, 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/send-email",
+        json!({ "to": "a@b.test", "subject": "hi", "text": "body", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "send-email: {body}");
+
+    // update-abuse-user-report writes moderationNote.
+    mk_db::sqlx::query(
+        r#"INSERT INTO "abuse_user_report"
+           ("id","targetUserId","reporterId","comment","resolved","forwarded","moderationNote")
+           VALUES ($1,$2,$3,'bad',FALSE,FALSE,'')"#,
+    )
+    .bind("r1")
+    .bind(&bob_id)
+    .bind(&root_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/update-abuse-user-report",
+        json!({ "reportId": "r1", "moderationNote": "seen", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "update report: {body}");
+    let note: String = mk_db::sqlx::query_scalar(
+        r#"SELECT "moderationNote" FROM "abuse_user_report" WHERE "id"='r1'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(note, "seen");
+
+    // show-moderation-logs packs the row + its user.
+    let log_id = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "moderation_log" ("id","userId","type","info")
+           VALUES ($1,$2,'testLog','{"x":1}'::jsonb)"#,
+    )
+    .bind(&log_id)
+    .bind(&root_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s, logs) = post_json(
+        app.clone(),
+        "/api/admin/show-moderation-logs",
+        json!({ "limit": 10, "type": "testLog", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "logs: {logs}");
+    let arr = logs.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], json!(log_id));
+    assert_eq!(arr[0]["userId"], json!(root_id));
+    assert_eq!(arr[0]["user"]["id"], json!(root_id));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // roles/update-default-policies writes meta.policies.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/roles/update-default-policies",
+        json!({ "policies": { "canPublicNote": false }, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "policies: {body}");
+    let stored = mk_db::admin::meta_policies(&pool).await.unwrap().unwrap();
+    assert_eq!(stored["canPublicNote"], json!(false));
+}

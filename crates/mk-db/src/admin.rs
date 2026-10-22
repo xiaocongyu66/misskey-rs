@@ -435,6 +435,215 @@ pub async fn update_captcha_meta(
     Ok(())
 }
 
+/// `admin/unset-mfa.ts` transaction: drop every passkey then disable
+/// TOTP / passwordless login on the profile.
+pub async fn unset_mfa(pool: &PgPool, user_id: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(r#"DELETE FROM "user_security_key" WHERE "userId" = $1"#)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        r#"UPDATE "user_profile"
+           SET "twoFactorSecret" = NULL, "twoFactorBackupSecret" = NULL,
+               "twoFactorEnabled" = FALSE, "usePasswordLessLogin" = FALSE
+           WHERE "userId" = $1"#,
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// `admin/send-email.ts` transport source (`meta.smtp*`, upstream
+/// `EmailService` nodemailer config).
+#[derive(Debug, Default)]
+pub struct SmtpConfig {
+    pub host: Option<String>,
+    pub port: Option<i32>,
+    pub user: Option<String>,
+    pub pass: Option<String>,
+    pub secure: bool,
+}
+
+pub async fn smtp_config(pool: &PgPool) -> Result<SmtpConfig, sqlx::Error> {
+    let row: Option<(
+        Option<String>,
+        Option<i32>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+    )> = sqlx::query_as(
+        r#"SELECT "smtpHost", "smtpPort", "smtpUser", "smtpPass", "smtpSecure"
+           FROM "meta" LIMIT 1"#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((host, port, user, pass, secure)) => SmtpConfig {
+            host,
+            port,
+            user,
+            pass,
+            secure: secure.unwrap_or(false),
+        },
+        None => SmtpConfig::default(),
+    })
+}
+
+/// `AbuseReportService.update` write leg (`update-abuse-user-report.ts`).
+pub async fn update_report_note(
+    pool: &PgPool,
+    report_id: &str,
+    note: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(r#"UPDATE "abuse_user_report" SET "moderationNote" = $2 WHERE "id" = $1"#)
+        .bind(report_id)
+        .bind(note)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// `admin/roles/update-default-policies.ts` → `metaService.update({policies})`.
+pub async fn set_meta_policies(
+    pool: &PgPool,
+    policies: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO "meta" ("id", "policies") VALUES ('x', $1::jsonb)
+           ON CONFLICT ("id") DO UPDATE SET "policies" = EXCLUDED."policies""#,
+    )
+    .bind(serde_json::to_string(policies).unwrap_or_else(|_| "null".to_string()))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `system_account` lookup by type (`SystemAccountService.fetch`).
+pub async fn system_account_user_id(
+    pool: &PgPool,
+    account_type: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "userId" FROM "system_account" WHERE "type" = $1"#)
+        .bind(account_type)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `SystemAccountService.createCorrespondingUser` tail: the system_account
+/// link + the system-user flags (upstream creates the user with isBot/isLocked).
+pub async fn insert_system_account(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    account_type: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(r#"INSERT INTO "system_account" ("id", "userId", "type") VALUES ($1, $2, $3)"#)
+        .bind(id)
+        .bind(user_id)
+        .bind(account_type)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(r#"UPDATE "user" SET "isBot" = TRUE, "isLocked" = TRUE WHERE "id" = $1"#)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// `SystemAccountService.updateCorrespondingUserProfile` profile leg.
+pub async fn set_profile_description(
+    pool: &PgPool,
+    user_id: &str,
+    description: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "user_profile" SET "description" = $2 WHERE "userId" = $1"#)
+        .bind(user_id)
+        .bind(description)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `admin/show-moderation-logs.ts` row (`ModerationLogEntityService.pack`
+/// reads id/userId/type/info; createdAt is derived from the AID).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ModerationLogRow {
+    pub id: String,
+    #[sqlx(rename = "userId")]
+    pub user_id: String,
+    #[sqlx(rename = "type")]
+    pub log_type: String,
+    pub info: serde_json::Value,
+}
+
+pub struct ModerationLogQuery<'a> {
+    pub limit: i64,
+    pub since_id: Option<&'a str>,
+    pub until_id: Option<&'a str>,
+    pub order_asc: bool,
+    pub log_type: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+    pub search: Option<&'a str>,
+}
+
+/// `QueryService.makePaginationQuery` + the type/userId/search filters.
+/// Date bounds are converted to AID bounds by the api layer (mk-db stays free
+/// of the mk-types dependency).
+pub async fn list_moderation_logs(
+    pool: &PgPool,
+    q: &ModerationLogQuery<'_>,
+) -> Result<Vec<ModerationLogRow>, sqlx::Error> {
+    let mut sql = String::from(
+        r#"SELECT "id", "userId", "type", "info" FROM "moderation_log" WHERE TRUE"#,
+    );
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(v) = q.since_id {
+        binds.push(v.to_string());
+        sql.push_str(&format!(r#" AND "id" > ${}"#, binds.len()));
+    }
+    if let Some(v) = q.until_id {
+        binds.push(v.to_string());
+        sql.push_str(&format!(r#" AND "id" < ${}"#, binds.len()));
+    }
+    if let Some(t) = q.log_type {
+        binds.push(t.to_string());
+        sql.push_str(&format!(r#" AND "type" = ${}"#, binds.len()));
+    }
+    if let Some(u) = q.user_id {
+        binds.push(u.to_string());
+        sql.push_str(&format!(r#" AND "userId" = ${}"#, binds.len()));
+    }
+    if let Some(s) = q.search {
+        binds.push(format!("%{}%", like_escape(s)));
+        sql.push_str(&format!(r#" AND "info"::text ILIKE ${}"#, binds.len()));
+    }
+    let order = if q.order_asc { "ASC" } else { "DESC" };
+    sql.push_str(&format!(
+        r#" ORDER BY "id" {} LIMIT ${}"#,
+        order,
+        binds.len() + 1
+    ));
+    let mut query = sqlx::query_as::<_, ModerationLogRow>(&sql);
+    for b in &binds {
+        query = query.bind(b);
+    }
+    query.bind(q.limit).fetch_all(pool).await
+}
+
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// ("user"."lastActiveDate" as epoch-ms, "isHibernated") for the
 /// admin/show-user response (the M1 LocalUserRow carries neither).
 pub async fn user_moderation_columns(
