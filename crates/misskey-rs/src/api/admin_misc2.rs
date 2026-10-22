@@ -687,8 +687,8 @@ async fn show_moderation_logs(state: &AppState, pool: &mk_db::sqlx::PgPool, body
     // are converted to AID bounds at the api layer (mk-db has no mk-types dep).
     let (since_id, until_id) = if raw_since_id.is_some() || raw_until_id.is_some() {
         (
-            raw_since_id.map(str::to_string),
-            raw_until_id.map(str::to_string),
+            raw_since_id.map(|v| v.to_string()),
+            raw_until_id.map(|v| v.to_string()),
         )
     } else {
         (
