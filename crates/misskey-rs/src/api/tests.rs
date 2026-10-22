@@ -19837,7 +19837,13 @@ async fn pages_arena_crud_like_list() {
     assert_eq!(page["likedCount"], json!(0));
     assert!(page["createdAt"].is_string());
     assert!(page["updatedAt"].is_string());
-    assert_eq!(page["user"]["username"], json!("alice"));
+    // channels_signup suffixes the username with an aid, so match the prefix.
+    assert!(
+        page["user"]["username"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("alice")),
+        "page user: {page}"
+    );
     // create packs without me → no isLiked key
     assert!(page.get("isLiked").is_none(), "create pack: {page}");
     let page_id = page["id"].as_str().unwrap().to_string();

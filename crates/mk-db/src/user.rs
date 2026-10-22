@@ -250,7 +250,9 @@ pub struct LocalUserRow {
     pub also_known_as: Option<String>,
 }
 
-pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", "token", "isSuspended", "isDeleted", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat", "movedToUri", "alsoKnownAs""#;
+// `token` is NULL for remote users (only local accounts carry one); coalesce
+// so `find_user_by_id` can pack host'd rows instead of failing the decode.
+pub const LOCAL_USER_COLS: &str = r#""id", "username", "usernameLower", "name", COALESCE("token", '') AS "token", "isSuspended", "isDeleted", "isLocked", "isExplorable", "hideOnlineStatus", "chatScope", "avatarUrl", "avatarBlurhash", "avatarDecorations", "bannerUrl", "bannerBlurhash", "avatarId", "bannerId", "followersCount", "followingCount", "notesCount", "isBot", "isCat", "movedToUri", "alsoKnownAs""#;
 
 pub async fn find_local_user_by_username(
     pool: &PgPool,
