@@ -18967,3 +18967,209 @@ async fn users_lists_list_owner_public_and_guest_gates() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
 }
+
+// ==== i-more slice 2: i/flashs + i/flash/likes + i/authorized-apps ====
+
+/// `i/flashs`: the caller's flash rows (id DESC), other users' excluded.
+#[tokio::test]
+async fn i_flashs_lists_only_callers_flashs() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_flashs").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("flsa{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("flsb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let f1 = mk_types::id::gen_aid_now();
+    let f2 = mk_types::id::gen_aid_now();
+    for (fid, uid, title) in [(&f1, aid, "alice flash"), (&f2, bid, "bob flash")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "flash" ("id", "updatedAt", "title", "summary",
+                                     "userId", "script")
+               VALUES ($1, now(), $2, $2, $3, 'return 1;')"#,
+        )
+        .bind(fid)
+        .bind(title)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(app.clone(), "/api/i/flashs", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(f1));
+    assert_eq!(arr[0]["title"], json!("alice flash"));
+    assert_eq!(arr[0]["summary"], json!("alice flash"));
+    assert_eq!(arr[0]["script"], json!("return 1;"));
+    assert_eq!(arr[0]["visibility"], json!("public"));
+    assert_eq!(arr[0]["userId"], json!(aid));
+    assert_eq!(arr[0]["likedCount"], json!(0));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // cursors: untilId=f1 is exclusive → empty; sinceId=f1 → no newer row
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/flashs",
+        json!({ "i": at, "untilId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/flashs",
+        json!({ "i": at, "sinceId": f1 }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // other user's token only sees their own flash
+    let (_, b) = post_json(app.clone(), "/api/i/flashs", json!({ "i": bob["token"] })).await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(f2));
+
+    // requireCredential: no token → CREDENTIAL_REQUIRED
+    let (s, b) = post_json(app, "/api/i/flashs", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
+/// `i/flash/likes`: the caller's flash_like rows joined to the liked flash.
+#[tokio::test]
+async fn i_flash_likes_lists_only_callers_likes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_flash_likes").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("flla{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("fllb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let p1 = mk_types::id::gen_aid_now();
+    let p2 = mk_types::id::gen_aid_now();
+    for (pid, title) in [(&p1, "liked by alice"), (&p2, "liked by bob")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "flash" ("id", "updatedAt", "title", "summary",
+                                     "userId", "script")
+               VALUES ($1, now(), $2, $2, $3, 'return 1;')"#,
+        )
+        .bind(pid)
+        .bind(title)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let l1 = mk_types::id::gen_aid_now();
+    let l2 = mk_types::id::gen_aid_now();
+    for (lid, uid, pid) in [(&l1, aid, &p1), (&l2, bid, &p2)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "flash_like" ("id", "userId", "flashId")
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(lid)
+        .bind(uid)
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(app.clone(), "/api/i/flash/likes", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(l1));
+    assert_eq!(arr[0]["flash"]["id"], json!(p1));
+    assert_eq!(arr[0]["flash"]["title"], json!("liked by alice"));
+    assert_eq!(arr[0]["flash"]["userId"], json!(bid));
+    assert!(arr[0]["createdAt"].is_string());
+
+    // other user sees only their own like
+    let (_, b) = post_json(app, "/api/i/flash/likes", json!({ "i": bob["token"] })).await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(l2));
+    assert_eq!(b[0]["flash"]["id"], json!(p2));
+}
+
+/// `i/authorized-apps`: the caller's app rows (id DESC, secret included),
+/// other users' apps excluded.
+#[tokio::test]
+async fn i_authorized_apps_lists_only_callers_apps() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_more_apps").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("appa{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("appb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let aid = alice["id"].as_str().unwrap();
+    let bid = bob["id"].as_str().unwrap();
+
+    let a1 = mk_types::id::gen_aid_now();
+    let a2 = mk_types::id::gen_aid_now();
+    for (id, uid, name, callback, secret) in [
+        (
+            &a1,
+            aid,
+            "alice app",
+            Some("https://example.com/cb"),
+            "secret-alice",
+        ),
+        (&a2, bid, "bob app", None, "secret-bob"),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "app" ("id", "userId", "secret", "name",
+                                   "description", "permission", "callbackUrl")
+               VALUES ($1, $2, $3, $4, '', $5, $6)"#,
+        )
+        .bind(id)
+        .bind(uid)
+        .bind(secret)
+        .bind(name)
+        .bind(vec!["read:account".to_string()])
+        .bind(callback)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, body) = post_json(app.clone(), "/api/i/authorized-apps", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(a1));
+    assert_eq!(arr[0]["name"], json!("alice app"));
+    assert_eq!(arr[0]["callbackUrl"], json!("https://example.com/cb"));
+    assert_eq!(arr[0]["permission"], json!(["read:account"]));
+    assert_eq!(arr[0]["secret"], json!("secret-alice"));
+
+    // other user sees only their own app (null callbackUrl stays null)
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/i/authorized-apps",
+        json!({ "i": bob["token"] }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1);
+    assert_eq!(b[0]["id"], json!(a2));
+    assert_eq!(b[0]["callbackUrl"], Value::Null);
+
+    // requireCredential: no token → CREDENTIAL_REQUIRED
+    let (s, b) = post_json(app, "/api/i/authorized-apps", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}

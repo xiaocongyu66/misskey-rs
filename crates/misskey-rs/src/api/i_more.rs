@@ -1,26 +1,41 @@
 //! The `i/*` remainder — slice 1: `i/favorites`, `i/gallery/likes`,
 //! `i/pages/likes` (upstream `endpoints/i/{favorites,gallery/likes,pages/
-//! likes}.ts`).
+//! likes}.ts`), plus slice 2: `i/flashs`, `i/flash/likes` (upstream
+//! `endpoints/i/{flashs,flash/likes}.ts`) and `i/authorized-apps`
+//! (`endpoints/i/authorized-apps.ts`).
 //!
-//! All three are `requireCredential: true` paged reads over a like/favorite
-//! table owned by the caller:
-//! - `i/favorites`     → `note_favorite` (id/userId/noteId; the 0001 baseline
+//! All are `requireCredential: true` reads over rows owned by the caller:
+//! - `i/favorites`       → `note_favorite` (id/userId/noteId; the 0001 baseline
 //!   has no createdAt column — upstream derives it from the aid id, same as
 //!   every other table here);
-//! - `i/gallery/likes` → `gallery_like` joined to `gallery_post`;
-//! - `i/pages/likes`   → `page_like` joined to `page`.
+//! - `i/gallery/likes`   → `gallery_like` joined to `gallery_post`;
+//! - `i/pages/likes`     → `page_like` joined to `page`;
+//! - `i/flashs`          → `flash` rows where userId = caller;
+//! - `i/flash/likes`     → `flash_like` joined to `flash`;
+//! - `i/authorized-apps` → `app` rows where userId = caller.
 //!
-//! ParamDef mirrors upstream: `limit` (integer 1..=100, default 10) +
-//! `sinceId`/`untilId` (misskey:id cursors, exclusive). Rows order by id DESC
-//! (`id < untilId` / `id > sinceId`), the same makePaginationQuery shape the
-//! other paged reads use.
+//! `i/pinned-users` is deliberately not implemented: upstream reads the
+//! caller's `user.pinnedUsers` column, which the 0001 baseline does not
+//! carry (the only `pinnedUsers` array in this schema is the instance-wide
+//! `meta.pinnedUsers`, owned by the freq/admin lane). Per the slice brief the
+//! `i/authorized-apps` fallback is ported instead.
+//!
+//! The paged endpoints mirror the upstream paramDef: `limit` (integer
+//! 1..=100, default 10) + `sinceId`/`untilId` (misskey:id cursors, exclusive).
+//! Rows order by id DESC (`id < untilId` / `id > sinceId`), the same
+//! makePaginationQuery shape the other paged reads use. `i/authorized-apps`
+//! takes no parameters upstream and returns the caller's apps id DESC.
 //!
 //! RESPONSE SHAPE: an array of entity-shaped objects. Minimal documented
 //! fields: favorites `{ id, createdAt, noteId }`, gallery likes `{ id,
 //! createdAt, post: { id, title, description, userId, fileIds,
 //! isSensitive, likedCount, tags } }`, page likes `{ id, createdAt, page:
-//! { id, title, name, userId, visibility, likedCount } }`. Upstream packs the
-//! full Note/GalleryPost/Page entities; the nested here is the identity
+//! { id, title, name, userId, visibility, likedCount } }`, flashs `{ id,
+//! createdAt, title, summary, script, visibility, userId, likedCount }`,
+//! flash likes `{ id, createdAt, flash: <same Flash shape> }`, authorized
+//! apps `{ id, name, callbackUrl, permission, secret }` (secret included
+//! because the caller owns the app). Upstream packs the full
+//! Note/GalleryPost/Page/Flash entities; the nested here is the identity
 //! subset (no user pack / files expansion) — documented divergence, the same
 //! minimal-pack convention used by the other slice modules.
 //!
@@ -38,7 +53,14 @@ use crate::error::{ApiError, api_err};
 
 /// The endpoint names routed into this module (single source of truth for the
 /// `// i-more` dispatch arm in mod.rs).
-pub(crate) const ENDPOINTS: &[&str] = &["i/favorites", "i/gallery/likes", "i/pages/likes"];
+pub(crate) const ENDPOINTS: &[&str] = &[
+    "i/favorites",
+    "i/gallery/likes",
+    "i/pages/likes",
+    "i/flashs",
+    "i/flash/likes",
+    "i/authorized-apps",
+];
 
 pub(crate) fn handles(name: &str) -> bool {
     ENDPOINTS.contains(&name)
@@ -56,8 +78,12 @@ pub(crate) async fn handle(
         return internal();
     };
     let result: Check<Response> = async {
-        // requireCredential (upstream meta on all three names).
+        // requireCredential (upstream meta on every name routed here).
         let me_id = super::social::require_checked_user(pool, token.as_deref(), false).await?;
+        // `i/authorized-apps` has an empty upstream paramDef (no paging).
+        if name == "i/authorized-apps" {
+            return authorized_apps(pool, &me_id).await;
+        }
         let (limit, since_id, until_id) = paging(body)?;
         match name {
             "i/favorites" => {
@@ -82,6 +108,26 @@ pub(crate) async fn handle(
             }
             "i/pages/likes" => {
                 pages_likes(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
+            }
+            "i/flashs" => {
+                flashs(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
+            }
+            "i/flash/likes" => {
+                flash_likes(
                     pool,
                     &me_id,
                     limit,
@@ -311,6 +357,135 @@ async fn pages_likes(
                     "visibility": r.get::<String, _>("visibility"),
                     "likedCount": r.get::<i32, _>("likedCount"),
                 },
+            })
+        })
+        .collect();
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// FlashEntityService.pack identity subset (see the module docs). The id is
+/// passed in so the joined `i/flash/likes` query can reuse this with its
+/// aliased `flashId`.
+fn flash_json(r: &mk_db::sqlx::postgres::PgRow, id: String) -> Value {
+    use mk_db::sqlx::Row;
+    json!({
+        "id": id,
+        "createdAt": created_at(&id),
+        "title": r.get::<String, _>("title"),
+        "summary": r.get::<String, _>("summary"),
+        "script": r.get::<String, _>("script"),
+        "visibility": r.get::<String, _>("visibility"),
+        "userId": r.get::<String, _>("userId"),
+        "likedCount": r.get::<i32, _>("likedCount"),
+    })
+}
+
+/// `endpoints/i/flashs.ts` — Flashs.find({ userId: me.id }), id DESC.
+async fn flashs(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Check<Response> {
+    let rows = mk_db::sqlx::query(
+        r#"SELECT "id", "title", "summary", "script", "visibility", "userId",
+                  "likedCount"
+           FROM "flash"
+           WHERE "userId" = $1
+             AND ($2::text IS NULL OR "id" < $2)
+             AND ($3::text IS NULL OR "id" > $3)
+           ORDER BY "id" DESC
+           LIMIT $4"#,
+    )
+    .bind(me_id)
+    .bind(until_id)
+    .bind(since_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_err("i/flashs", e))?;
+
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            use mk_db::sqlx::Row;
+            let id: String = r.get("id");
+            flash_json(r, id)
+        })
+        .collect();
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// `endpoints/i/flash/likes.ts` — FlashLikes.find({ userId: me.id }) joined
+/// to the liked flash, id DESC.
+async fn flash_likes(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Check<Response> {
+    let rows = mk_db::sqlx::query(
+        r#"SELECT fl."id", f."id" AS "flashId", f."title", f."summary",
+                  f."script", f."visibility", f."userId", f."likedCount"
+           FROM "flash_like" fl
+           INNER JOIN "flash" f ON f."id" = fl."flashId"
+           WHERE fl."userId" = $1
+             AND ($2::text IS NULL OR fl."id" < $2)
+             AND ($3::text IS NULL OR fl."id" > $3)
+           ORDER BY fl."id" DESC
+           LIMIT $4"#,
+    )
+    .bind(me_id)
+    .bind(until_id)
+    .bind(since_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_err("i/flash/likes", e))?;
+
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            use mk_db::sqlx::Row;
+            let id: String = r.get("id");
+            let flash_id: String = r.get("flashId");
+            json!({
+                "id": id,
+                "createdAt": created_at(&id),
+                "flash": flash_json(r, flash_id),
+            })
+        })
+        .collect();
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// `endpoints/i/authorized-apps.ts` — Apps.find({ userId: me.id }) id DESC,
+/// AppEntityService.pack (secret is included because the caller is the
+/// owner).
+async fn authorized_apps(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response> {
+    let rows = mk_db::sqlx::query(
+        r#"SELECT "id", "name", "callbackUrl", "permission", "secret"
+           FROM "app"
+           WHERE "userId" = $1
+           ORDER BY "id" DESC"#,
+    )
+    .bind(me_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_err("i/authorized-apps", e))?;
+
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            use mk_db::sqlx::Row;
+            json!({
+                "id": r.get::<String, _>("id"),
+                "name": r.get::<String, _>("name"),
+                "callbackUrl": r.get::<Option<String>, _>("callbackUrl"),
+                "permission": r.get::<Vec<String>, _>("permission"),
+                "secret": r.get::<String, _>("secret"),
             })
         })
         .collect();
