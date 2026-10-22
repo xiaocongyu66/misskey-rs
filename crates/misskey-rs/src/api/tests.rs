@@ -20455,6 +20455,20 @@ async fn admin_abuse_reports_and_recipients() {
     .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
 
+    // The recipient's systemWebhookId carries an FK to system_webhook.
+    let hook_id = mk_types::id::gen_aid_now();
+    mk_db::webhook::insert_system_webhook(
+        &pool,
+        &hook_id,
+        "abuse hook",
+        "https://example.com/hook",
+        "secret",
+        &["abuseReport".to_string()],
+        true,
+    )
+    .await
+    .unwrap();
+
     // recipient create → list → show → update → delete.
     let (s, created) = post_json(
         app.clone(),
@@ -20464,7 +20478,7 @@ async fn admin_abuse_reports_and_recipients() {
             "isActive": true,
             "name": "ops",
             "method": "webhook",
-            "systemWebhookId": "hook1",
+            "systemWebhookId": hook_id.clone(),
         }),
     )
     .await;
@@ -20501,7 +20515,7 @@ async fn admin_abuse_reports_and_recipients() {
             "isActive": false,
             "name": "ops2",
             "method": "webhook",
-            "systemWebhookId": "hook1",
+            "systemWebhookId": hook_id.clone(),
         }),
     )
     .await;
