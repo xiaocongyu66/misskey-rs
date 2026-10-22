@@ -20733,3 +20733,431 @@ async fn invite_promo_roundtrip() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("NO_SUCH_NOTE"));
 }
+
+// admin/federation/* + admin/reset-password: update-instance flips
+// suspensionState (none ↔ manuallySuspended) + persists moderationNote,
+// remove-all-following drops only the target host's edges (both directions),
+// delete-all-files drops only that host's drive files, reset-password
+// rehashes the profile password, admin/delete-account flips the target's
+// isDeleted, and a plain user hits 403 ROLE_PERMISSION_DENIED (upstream
+// endpoints/admin/federation/*.ts + admin/{reset-password,delete-account}.ts,
+// requireAdmin).
+#[tokio::test]
+async fn admin_federation_ops_and_reset_password() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadminfedops").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // First signup stamps meta.rootUserId → admin gate bypass.
+    let root = signup(&app, &uname("afo")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let plain = signup(&app, &uname("afp")).await;
+    let plain_token = plain["token"].as_str().unwrap().to_string();
+    let target_id = plain["id"].as_str().unwrap().to_string();
+
+    // Two remote instances (suspensionState defaults to none).
+    for (id, host) in [("afo1", "remote-a.example"), ("afo2", "remote-b.example")] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "instance" ("id", "firstRetrievedAt", "host")
+               VALUES ($1, now(), $2)"#,
+        )
+        .bind(id)
+        .bind(host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Plain user → ROLE_PERMISSION_DENIED (requireAdmin).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/federation/update-instance",
+        json!({ "host": "remote-a.example", "isSuspended": true, "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "non-admin: {body}");
+    assert_eq!(
+        body["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61")
+    );
+
+    // update-instance: none → manuallySuspended + moderationNote.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/federation/update-instance",
+        json!({
+            "host": "remote-a.example",
+            "isSuspended": true,
+            "moderationNote": "spam",
+            "i": root_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "suspend: {body}");
+    let (state, note): (String, String) = mk_db::sqlx::query_as(
+        r#"SELECT ("suspensionState"::text), "moderationNote"
+           FROM "instance" WHERE "host" = 'remote-a.example'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "manuallySuspended");
+    assert_eq!(note, "spam");
+
+    // Unsuspend flips back to none; a null moderationNote keeps the old one.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/federation/update-instance",
+        json!({
+            "host": "remote-a.example",
+            "isSuspended": false,
+            "moderationNote": Value::Null,
+            "i": root_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "unsuspend: {body}");
+    let (state, note): (String, String) = mk_db::sqlx::query_as(
+        r#"SELECT ("suspensionState"::text), "moderationNote"
+           FROM "instance" WHERE "host" = 'remote-a.example'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "none");
+    assert_eq!(note, "spam");
+
+    // Unknown host → upstream's plain Error → 500.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/federation/update-instance",
+        json!({ "host": "nope.example", "isSuspended": true, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // following edges: two touching remote-a (one per direction), one on
+    // remote-b — only remote-a's edges go.
+    for (id, follower, followee, follower_host, followee_host) in [
+        ("afe1", "u1", "u2", None, Some("remote-a.example")),
+        ("afe2", "u2", "u1", Some("remote-a.example"), None),
+        ("afe3", "u1", "u2", None, Some("remote-b.example")),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "following" ("id", "followerId", "followeeId",
+                                        "followerHost", "followeeHost")
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(id)
+        .bind(follower)
+        .bind(followee)
+        .bind(follower_host)
+        .bind(followee_host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/federation/remove-all-following",
+        json!({ "host": "remote-a.example", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "remove-all-following: {body}");
+    let left: Vec<String> = mk_db::sqlx::query_scalar(
+        r#"SELECT "id" FROM "following" ORDER BY "id""#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, vec!["afe3".to_string()], "only remote-b edge stays");
+
+    // drive files: one remote-a, one remote-b, one local (NULL userHost).
+    for (id, user_host) in [
+        ("afd1", Some("remote-a.example")),
+        ("afd2", Some("remote-b.example")),
+        ("afd3", None),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "drive_file"
+                 ("id", "userId", "userHost", "md5", "name", "type", "size",
+                  "storedInternal", "url")
+               VALUES ($1, NULL, $2, 'x', 'f', 'text/plain', 1, false,
+                       'http://example.com/f')"#,
+        )
+        .bind(id)
+        .bind(user_host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/federation/delete-all-files",
+        json!({ "host": "remote-a.example", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "delete-all-files: {body}");
+    let left: Vec<String> = mk_db::sqlx::query_scalar(
+        r#"SELECT "id" FROM "drive_file" ORDER BY "id""#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        left,
+        vec!["afd2".to_string(), "afd3".to_string()],
+        "remote-a file removed, remote-b + local stay"
+    );
+
+    // refresh-remote-instance-metadata: existing → 204, unknown → 500.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/federation/refresh-remote-instance-metadata",
+        json!({ "host": "remote-a.example", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/federation/refresh-remote-instance-metadata",
+        json!({ "host": "nope.example", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // reset-password: profile password now verifies the new value only.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/reset-password",
+        json!({ "userId": target_id, "password": "newpass", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "reset-password: {body}");
+    let hash: String = mk_db::sqlx::query_scalar(
+        r#"SELECT "password" FROM "user_profile" WHERE "userId" = $1"#,
+    )
+    .bind(&target_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(mk_core::services::verify_password("newpass", &hash).unwrap());
+    assert!(!mk_core::services::verify_password("test", &hash).unwrap());
+
+    // admin/delete-account flips isDeleted (DeleteAccountService soft delete).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/delete-account",
+        json!({ "userId": target_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "delete-account: {body}");
+    let is_deleted: bool = mk_db::sqlx::query_scalar(
+        r#"SELECT "isDeleted" FROM "user" WHERE "id" = $1"#,
+    )
+    .bind(&target_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(is_deleted, "target row flagged deleted");
+}
+
+// hashtags/{trend,show,list} over the 0001 hashtag/__chart__hashtag tables +
+// auth/session/show over a seeded auth_session/app pair. The empty-chart trend
+// leg runs before any hashtag row exists, so the fallback stays empty too.
+#[tokio::test]
+async fn hashtags_show_list_trend_and_auth_session_show() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_hashtags_auth").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // Empty chart + empty hashtag table → [].
+    let (s, body) = post_json(app.clone(), "/api/hashtags/trend", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!([]));
+
+    // Seed a hashtag row → hashtags/show packs the seven counters.
+    mk_db::sqlx::query(
+        r#"INSERT INTO "hashtag"
+           ("id", "name", "mentionedUsersCount", "mentionedLocalUsersCount",
+            "mentionedRemoteUsersCount", "attachedUsersCount",
+            "attachedLocalUsersCount", "attachedRemoteUsersCount")
+           VALUES ('h1', 'tag1', 5, 4, 1, 3, 2, 1)"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // normalizeForSearch lowercases the query tag.
+    let (s, body) = post_json(app.clone(), "/api/hashtags/show", json!({ "tag": "Tag1" })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["tag"], json!("tag1"));
+    assert_eq!(body["mentionedUsersCount"], json!(5));
+    assert_eq!(body["mentionedLocalUsersCount"], json!(4));
+    assert_eq!(body["attachedLocalUsersCount"], json!(2));
+
+    let (s, body) = post_json(app.clone(), "/api/hashtags/show", json!({ "tag": "nope" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_HASHTAG"));
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/hashtags/list",
+        json!({ "sort": "-mentionedUsers", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body[0]["tag"], json!("tag1"));
+
+    // A current-hour chart row → trend ranks it with a 20-slot series and the
+    // window-max usersCount (2 local + 3 remote).
+    let hour = mk_db::charts::bucket("hour", mk_db::charts::now_ms());
+    mk_db::sqlx::query(
+        r#"INSERT INTO "__chart__hashtag" ("date", "group", "___local_users", "___remote_users")
+           VALUES ($1, 'tag1', 2, 3)"#,
+    )
+    .bind(hour as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s, body) = post_json(app.clone(), "/api/hashtags/trend", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body[0]["tag"], json!("tag1"));
+    assert_eq!(body[0]["usersCount"], json!(5));
+    assert_eq!(body[0]["chart"].as_array().map(Vec::len), Some(20));
+
+    // auth/session/show for a seeded session + app.
+    mk_db::sqlx::query(
+        r#"INSERT INTO "app" ("id", "secret", "name", "description", "permission", "callbackUrl")
+           VALUES ('app1', 'sekret', 'Test App', '', '{}'::varchar[], 'https://cb.example')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "auth_session" ("id", "token", "userId", "appId")
+           VALUES ('sess1', 'tok1', NULL, 'app1')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/auth/session/show",
+        json!({ "token": "tok1" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["id"], json!("sess1"));
+    assert_eq!(body["token"], json!("tok1"));
+    assert_eq!(body["app"]["id"], json!("app1"));
+    assert_eq!(body["app"]["name"], json!("Test App"));
+    assert_eq!(body["app"]["callbackUrl"], json!("https://cb.example"));
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/auth/session/show",
+        json!({ "token": "missing" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_SESSION"));
+}
+
+// admin/{meta,get-table-stats,get-index-stats,get-user-ips} (upstream
+// endpoints/admin/*.ts, requireAdmin): the meta facade still answers, the
+// stats reads expose real pg_stat_* rows, get-user-ips replays a signin row
+// as {ip, createdAt}, and a plain user gets ROLE_PERMISSION_DENIED.
+#[tokio::test]
+async fn admin_stats_reads_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadminstats").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, &uname("admsa")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let root_id = root["id"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("admsb")).await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    // admin/meta still returns the detailed row through the delegated handler.
+    let (s, meta) = post_json(app.clone(), "/api/admin/meta", json!({ "i": root_token })).await;
+    assert_eq!(s, StatusCode::OK, "meta: {meta}");
+    assert_eq!(meta["uri"], json!("http://127.0.0.1:3000"));
+
+    // get-table-stats → non-empty pg_stat_user_tables array.
+    let (s, tables) = post_json(
+        app.clone(),
+        "/api/admin/get-table-stats",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "table stats: {tables}");
+    let table_rows = tables.as_array().expect("table stats array");
+    assert!(!table_rows.is_empty(), "table stats: {tables}");
+    assert!(
+        table_rows.iter().any(|r| r["relname"] == json!("user")),
+        "user table: {tables}"
+    );
+
+    // get-index-stats → pg_stat_user_indexes shape {table, index, size, scans}.
+    let (s, indexes) = post_json(
+        app.clone(),
+        "/api/admin/get-index-stats",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "index stats: {indexes}");
+    let index_rows = indexes.as_array().expect("index stats array");
+    assert!(!index_rows.is_empty(), "index stats: {indexes}");
+    for row in index_rows {
+        assert!(row.get("table").is_some(), "index row: {row}");
+        assert!(row.get("index").is_some(), "index row: {row}");
+        assert!(row.get("size").is_some(), "index row: {row}");
+        assert!(row.get("scans").is_some(), "index row: {row}");
+    }
+
+    // get-user-ips after a signin insert → [{ip, createdAt}] (newest first).
+    let signin_id = mk_types::id::gen_aid_now();
+    mk_db::user::insert_signin(&pool, &signin_id, &root_id, "203.0.113.9", true)
+        .await
+        .unwrap();
+    let (s, ips) = post_json(
+        app.clone(),
+        "/api/admin/get-user-ips",
+        json!({ "userId": root_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "user ips: {ips}");
+    let ip_rows = ips.as_array().expect("user ips array");
+    assert_eq!(ip_rows.len(), 1, "user ips: {ips}");
+    assert_eq!(ip_rows[0]["ip"], json!("203.0.113.9"));
+    assert!(ip_rows[0]["createdAt"].is_string(), "createdAt: {ips}");
+
+    // Plain user → 403 ROLE_PERMISSION_DENIED (administrator-gate id).
+    let (s, denied) = post_json(
+        app.clone(),
+        "/api/admin/get-table-stats",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "non-admin: {denied}");
+    assert_eq!(denied["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        denied["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61"),
+        "non-admin: {denied}"
+    );
+}

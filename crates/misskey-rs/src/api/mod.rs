@@ -82,6 +82,12 @@ mod pages_more;
 // i-more-agent: i/* remainder slice 1 (i/favorites, i/gallery/likes,
 // i/pages/likes) — db paths inline in api/i_more.rs (tables ship in 0001).
 mod i_more;
+// i-registry arena: i/registry/{get,set,remove,get-all,get-detail,keys} +
+// i/signin-history (upstream endpoints/i/registry/*.ts +
+// endpoints/i/signin-history.ts). The module owns the endpoint table and
+// handlers; SQL lives in mk-db/src/{registry,signin}.rs (both tables ship in
+// the 0001 baseline).
+mod i_registry;
 // announcements-agent: the announcements family (announcements +
 // announcements/show + i/read-announcement + admin/announcements/*) — db
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
@@ -178,6 +184,14 @@ pub(crate) mod queue_processors;
 // followers/following/users reads (upstream endpoints/federation/*.ts @
 // ea2c3aed; `update-remote-user` needs the AP fetch lane and stays out).
 mod federation_more;
+// hashtags-agent: hashtags/{trend,show,list} (upstream endpoints/hashtags/*;
+// db paths in mk-db/src/hashtag.rs — hashtag + __chart__hashtag ship in the
+// 0001 baseline). hashtags/users stays out (UserDetailed pack).
+mod hashtags;
+// auth-agent: auth/session/show (upstream endpoints/auth/session/show.ts; db
+// paths in mk-db/src/auth.rs — auth_session + app ship in the 0001 baseline).
+// session/userkey + accept stay out (app-secret / OAuth consent handshake).
+mod auth_more;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -913,6 +927,37 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END admin-drive DISPATCH ARM ====
 
+    // ==== admin-fedops DISPATCH ARM (admin/federation/* + admin/reset-password) ====
+    // Noses in ahead of the admin/* catch-all (admin-relays convention):
+    // api::admin_fedops owns update-instance/remove-all-following/
+    // delete-all-files/refresh-remote-instance-metadata + reset-password;
+    // admin/delete-account stays in api::delete_account. Method check, body
+    // parsing and token extraction live here; the shared requireAdmin gate
+    // and handlers live in api::admin_fedops (SQL in mk-db/src/admin.rs).
+    if admin_fedops::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_fedops::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-fedops DISPATCH ARM ====
+
+    // ==== admin-stats DISPATCH ARM (admin/meta + stats reads) ====
+    // Noses in ahead of the admin/* catch-all (admin-fedops convention):
+    // api::admin_stats owns admin/meta plus get-table-stats/get-index-stats/
+    // get-user-ips; every other admin/* name keeps falling through. Method
+    // check, body parsing and token resolution live in the module.
+    if admin_stats::handles(name.as_str()) {
+        return admin_stats::handle(&state, name.as_str(), req).await;
+    }
+    // ==== END admin-stats DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -1554,6 +1599,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END i-more DISPATCH ARM ====
 
+    // ==== i-registry DISPATCH ARM (i/registry/* + i/signin-history) ====
+    // Self-contained block on the i-more pattern: method check, body parsing
+    // and token extraction live here; the requireCredential gate + handlers
+    // in api::i_registry (SQL in mk-db/src/{registry,signin}.rs). Sits ahead
+    // of the M0_ENDPOINTS fallthrough (none of these names are M0) and
+    // shadows no earlier arm.
+    if i_registry::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return i_registry::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END i-registry DISPATCH ARM ====
+
     // ==== federation DISPATCH ARM (federation/*) ====
     // Self-contained block on the clips-arm pattern: method check, body parse
     // and token extraction live here; the reads (instance pack + stats +
@@ -1573,6 +1638,44 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return federation_more::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END federation DISPATCH ARM ====
+
+    // ==== hashtags DISPATCH ARM (hashtags/*) ====
+    // Self-contained block: method check, body parsing and token extraction
+    // live here; the guest-ok handlers in api::hashtags (SQL in
+    // mk-db/src/hashtag.rs). `hashtags/trend` is allowGet upstream, so GET is
+    // accepted for that name only; the body is empty for GET (no params).
+    if hashtags::handles(name.as_str()) {
+        let get_ok = name == "hashtags/trend" && method == Method::GET;
+        if method != Method::POST && !get_ok {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return hashtags::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END hashtags DISPATCH ARM ====
+
+    // ==== auth DISPATCH ARM (auth/*) ====
+    // Same block shape; auth/session/show is guest-ok (the session token is a
+    // body param, not the request credential) — api::auth_more, SQL in
+    // mk-db/src/auth.rs.
+    if auth_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return auth_more::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END auth DISPATCH ARM ====
 
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
@@ -6702,6 +6805,15 @@ mod admin_accounts;
 /// admin/* catch-all).
 mod admin_relays;
 
+/// `admin/federation/*` + `admin/reset-password` family (upstream
+/// `endpoints/admin/federation/*.ts` and `endpoints/admin/reset-password.ts`).
+/// Module file `api/admin_fedops.rs` owns the endpoint table + handlers and
+/// the shared requireAdmin gate; SQL lives in `mk-db/src/admin.rs`.
+/// `admin/delete-account` stays in api::delete_account (DeleteAccountService).
+/// mod.rs only registers the module and the dispatch arm above (ahead of the
+/// admin/* catch-all).
+mod admin_fedops;
+
 /// `admin/drive/*` + `admin/delete-all-files-of-a-user` family (upstream
 /// `endpoints/admin/drive/*.ts` and `endpoints/admin/delete-all-files-of-a-
 /// user.ts`). Module file `api/admin_drive.rs` owns the endpoint table +
@@ -6709,6 +6821,14 @@ mod admin_relays;
 /// `mk-db/src/drive.rs`. mod.rs only registers the module and the dispatch
 /// arm above (ahead of the admin/* catch-all).
 mod admin_drive;
+
+/// `admin/{meta,get-table-stats,get-index-stats,get-user-ips}` reads
+/// (upstream `endpoints/admin/*.ts`). Module file `api/admin_stats.rs` owns
+/// the endpoint table + handlers and delegates `admin/meta` to the detailed
+/// `api::admin` implementation; SQL lives in `mk-db/src/admin.rs`. mod.rs
+/// only registers the module and the dispatch arm above (ahead of the
+/// admin/* catch-all).
+mod admin_stats;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file

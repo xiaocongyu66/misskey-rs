@@ -588,3 +588,131 @@ pub async fn find_user_id_by_email(
         .fetch_optional(pool)
         .await
 }
+
+/// `admin/get-table-stats.ts` — the upstream query verbatim: per-table live
+/// row counts from the stats collector.
+pub async fn table_stats(pool: &PgPool) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    sqlx::query_as(r#"SELECT relname, n_live_tup FROM pg_stat_user_tables"#)
+        .fetch_all(pool)
+        .await
+}
+
+/// `admin/get-index-stats.ts` — index sizes from `pg_stat_user_indexes`
+/// (relname/indexrelname/pg_size_pretty/index scan count, largest first).
+pub async fn index_stats(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT relname, indexrelname,
+                  pg_size_pretty(pg_relation_size(indexrelid)),
+                  idx_scan
+           FROM pg_stat_user_indexes
+           ORDER BY pg_relation_size(indexrelid) DESC"#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// `admin/get-user-ips.ts` — signin rows for one user, newest first (the
+/// signin AID carries the timestamp; the table has no createdAt column).
+pub async fn user_ips(
+    pool: &PgPool,
+    user_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT "id", "ip" FROM "signin"
+           WHERE "userId" = $1 ORDER BY "id" DESC LIMIT $2 OFFSET $3"#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// `admin/federation/update-instance.ts` + `refresh-remote-instance-metadata.ts`:
+/// the instance row slice those handlers need (`findOneBy({ host })`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InstanceFederationRow {
+    pub id: String,
+    #[sqlx(rename = "suspensionState")]
+    pub suspension_state: String,
+}
+
+/// `instancesRepository.findOneBy({ host })` for the federation admin arms.
+pub async fn find_instance_for_federation(
+    pool: &PgPool,
+    host: &str,
+) -> Result<Option<InstanceFederationRow>, sqlx::Error> {
+    sqlx::query_as::<_, InstanceFederationRow>(
+        r#"SELECT "id", ("suspensionState"::text) AS "suspensionState"
+           FROM "instance" WHERE "host" = $1 LIMIT 1"#,
+    )
+    .bind(host)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `InstanceService.suspend` / `unsuspend`: `suspensionState =
+/// manuallySuspended` / `none` (the pinned enum has no bare `suspended`).
+pub async fn set_instance_suspension(
+    pool: &PgPool,
+    instance_id: &str,
+    suspended: bool,
+) -> Result<(), sqlx::Error> {
+    let state = if suspended {
+        "manuallySuspended"
+    } else {
+        "none"
+    };
+    sqlx::query(
+        r#"UPDATE "instance"
+           SET "suspensionState" = ($2::text)::public.instance_suspensionstate_enum
+           WHERE "id" = $1"#,
+    )
+    .bind(instance_id)
+    .bind(state)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `update-instance.ts`: `instancesRepository.update(id, { moderationNote })`.
+pub async fn set_instance_moderation_note(
+    pool: &PgPool,
+    instance_id: &str,
+    note: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "instance" SET "moderationNote" = $2 WHERE "id" = $1"#)
+        .bind(instance_id)
+        .bind(note)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `remove-all-following.ts`: two `followingsRepository.delete` calls, one
+/// per direction (`followerHost` then `followeeHost`).
+pub async fn delete_following_by_host(pool: &PgPool, host: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "following" WHERE "followerHost" = $1"#)
+        .bind(host)
+        .execute(pool)
+        .await?;
+    sqlx::query(r#"DELETE FROM "following" WHERE "followeeHost" = $1"#)
+        .bind(host)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `delete-all-files.ts`: `driveFilesRepository.delete({ userHost: host })`.
+/// `userHost` is NULL for local owners, so local files never match.
+pub async fn delete_drive_files_by_host(pool: &PgPool, host: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "drive_file" WHERE "userHost" = $1"#)
+        .bind(host)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

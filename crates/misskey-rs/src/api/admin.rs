@@ -765,7 +765,7 @@ async fn get_index_stats(state: &AppState, token: Option<&str>) -> ApiResult {
     Ok((StatusCode::OK, Json(json!(stats))).into_response())
 }
 
-async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
+pub(crate) async fn admin_meta(state: &AppState, token: Option<&str>) -> ApiResult {
     let _ctx = gate(state, token, Gate::Admin).await?;
     let pool = state.pool.as_ref().expect("gated");
 
