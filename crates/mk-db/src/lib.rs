@@ -15,6 +15,10 @@ pub mod antennas;
 // live in the 0001 baseline; list/read/admin paths + the unread probe the
 // MeDetailed lane will wire)
 pub mod announcement;
+// avatar-decorations: get-avatar-decorations + admin/avatar-decorations/*
+// (the avatar_decoration table ships in the 0001 baseline; role-visibility
+// filtering reads the role table)
+pub mod avatar_decoration;
 // channels-agent: channels/* domain (channel/channel_following/channel_favorite
 // tables + the channels/timeline note db path)
 pub mod channel;

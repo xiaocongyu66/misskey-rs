@@ -19398,3 +19398,170 @@ async fn pages_arena_crud_like_list() {
     assert_eq!(s, StatusCode::OK, "body: {mine}");
     assert!(mine.as_array().unwrap().is_empty(), "my after delete: {mine}");
 }
+
+/// `get-avatar-decorations` + `admin/avatar-decorations/*`: admin CRUD
+/// roundtrip, the guest-ok public list (role-visibility filtering), and the
+/// non-admin 403 gate.
+#[tokio::test]
+async fn avatar_decorations_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_avatar_decorations").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // first signup = root (admin), second = plain user.
+    let admin = signup(&app, "root").await;
+    let token = admin["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, "bob").await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    // gate: non-admin → 403 ROLE_PERMISSION_DENIED; no credential → 401.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/list",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // create → entity shape.
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/create",
+        json!({
+            "name": "star",
+            "description": "a star",
+            "url": "https://example.com/star.png",
+            "roleIdsThatCanBeUsedThisDecoration": [],
+            "category": "cute",
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 10);
+    assert!(created["createdAt"].is_string());
+    assert_eq!(created["updatedAt"], Value::Null);
+    assert_eq!(created["name"], json!("star"));
+    assert_eq!(created["description"], json!("a star"));
+    assert_eq!(created["url"], json!("https://example.com/star.png"));
+    assert_eq!(created["category"], json!("cute"));
+
+    // admin list sees it.
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/list",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(row["name"], json!("star"));
+    assert!(row["createdAt"].is_string());
+    assert_eq!(row["updatedAt"], Value::Null);
+
+    // public list (guest-ok) returns the row; no admin-only timestamp keys.
+    let (s, public) = post_json(app.clone(), "/api/get-avatar-decorations", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {public}");
+    let prow = public
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(prow["name"], json!("star"));
+    assert_eq!(prow["description"], json!("a star"));
+    assert_eq!(prow["url"], json!("https://example.com/star.png"));
+    assert_eq!(prow["category"], json!("cute"));
+    assert!(prow.get("createdAt").is_none());
+    assert!(prow.get("updatedAt").is_none());
+
+    // update → 204; a role id that is not a real role is filtered from the
+    // guest list but stays in the admin list (upstream visibleRoles).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/update",
+        json!({
+            "id": id,
+            "name": "superstar",
+            "description": "d",
+            "url": "https://example.com/s.png",
+            "roleIdsThatCanBeUsedThisDecoration": ["nonexistentrole"],
+            "category": null,
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/list",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(row["name"], json!("superstar"));
+    assert_eq!(row["category"], Value::Null);
+    assert_eq!(
+        row["roleIdsThatCanBeUsedThisDecoration"],
+        json!(["nonexistentrole"])
+    );
+    assert!(row["updatedAt"].is_string());
+    let (_, public) = post_json(app.clone(), "/api/get-avatar-decorations", json!({})).await;
+    let prow = public
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(prow["roleIdsThatCanBeUsedThisDecoration"], json!([]));
+
+    // delete → 204; gone from both lists; a second delete → 500.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/delete",
+        json!({ "id": id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (_, list) = post_json(
+        app.clone(),
+        "/api/admin/avatar-decorations/list",
+        json!({ "i": token }),
+    )
+    .await;
+    assert!(list.as_array().unwrap().iter().all(|r| r["id"] != json!(id)));
+    let (_, public) = post_json(app.clone(), "/api/get-avatar-decorations", json!({})).await;
+    assert!(public.as_array().unwrap().iter().all(|r| r["id"] != json!(id)));
+    let (s, body) = post_json(
+        app,
+        "/api/admin/avatar-decorations/delete",
+        json!({ "id": id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+}

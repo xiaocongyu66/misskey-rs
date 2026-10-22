@@ -74,6 +74,10 @@ mod i_more;
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
 // No `i/read-all-unread-announcements` exists at the pinned upstream.
 mod announcement;
+// avatar-decorations: get-avatar-decorations (guest-ok) +
+// admin/avatar-decorations/{create,delete,list,update} — db paths in
+// mk-db/src/avatar_decoration.rs (the table ships in the 0001 baseline).
+mod avatar_decorations;
 // note-agent: notes.ts acceptance slice — notes (global list),
 // notes/polls/vote, notes/translate + the admin/update-meta
 // sensitiveWords/prohibitedWords patch (db paths in mk-db meta.rs).
@@ -775,6 +779,27 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return admin_emoji::handle(&state, name.as_str(), &body, token.as_deref()).await;
     }
     // ==== END admin-emoji DISPATCH ARM ====
+
+    // ==== avatar-decorations DISPATCH ARM ====
+    // Self-contained block on the admin-emoji pattern: method check, body
+    // parsing and token extraction live here; the guest-ok public list plus
+    // the shared requireAdmin gate and endpoint bodies in
+    // api::avatar_decorations (SQL in mk-db/src/avatar_decoration.rs). Noses
+    // in ahead of the admin/* catch-all so admin/avatar-decorations/* shadows
+    // it; every other admin/* name keeps falling through.
+    if avatar_decorations::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return avatar_decorations::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END avatar-decorations DISPATCH ARM ====
 
     // ==== admin-queue DISPATCH ARM (admin/queue/*) ====
     // Noses in ahead of the admin/* catch-all (announcements/admin-emoji
