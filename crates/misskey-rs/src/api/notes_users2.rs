@@ -41,6 +41,18 @@ pub(crate) const NOTES_USERS2_ENDPOINTS: &[&str] = &[
     "users/pages",
     "roles/list",
     "roles/show",
+    // slice 2
+    "roles/users",
+    "roles/notes",
+    "users/achievements",
+    "users/recommendation",
+    "users/featured-notes",
+    "following/requests/reject",
+    "following/requests/sent",
+    "following/update-all",
+    "hashtags/search",
+    "username/available",
+    "email-address/available",
 ];
 
 pub(crate) fn handles(name: &str) -> bool {
@@ -84,6 +96,35 @@ fn schema_invalid(param: &str, reason: &str) -> Response {
 
 fn ok_json(v: Value) -> Response {
     (StatusCode::OK, Json(v)).into_response()
+}
+
+fn ok_empty() -> Response {
+    // upstream `send(reply, undefined)` → 204
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn offset_param(body: &Value, dflt: i64) -> Result<i64, Response> {
+    match body.get("offset") {
+        None => Ok(dflt),
+        Some(Value::Number(n)) => {
+            let v = n
+                .as_i64()
+                .ok_or_else(|| schema_invalid("offset", "must be an integer"))?;
+            if v < 0 {
+                return Err(schema_invalid("offset", "must be >= 0"));
+            }
+            Ok(v)
+        }
+        Some(_) => Err(schema_invalid("offset", "must be an integer")),
+    }
+}
+
+fn until_id_param(body: &Value) -> Result<Option<String>, Response> {
+    match body.get("untilId") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(schema_invalid("untilId", "must be a misskey:id")),
+    }
 }
 
 fn created_at(id: &str) -> String {
@@ -197,9 +238,16 @@ pub(crate) async fn handle(
     let Some(pool) = &state.pool else {
         return internal();
     };
-    // All names in this slice are guest-ok; a present credential still
-    // resolves (and an invalid one still 401s).
-    let me_id = if token.is_some() || credential_declared {
+    // Slice-2 names behind requireCredential; every other name is guest-ok
+    // (a present credential still resolves, an invalid one still 401s).
+    const REQUIRES_CREDENTIAL: &[&str] = &[
+        "roles/notes",
+        "users/recommendation",
+        "following/requests/reject",
+        "following/requests/sent",
+        "following/update-all",
+    ];
+    let me_id = if REQUIRES_CREDENTIAL.contains(&name) || token.is_some() || credential_declared {
         match super::social::require_checked_user(pool, token.as_deref(), credential_declared).await
         {
             Ok(id) => Some(id),
@@ -217,6 +265,23 @@ pub(crate) async fn handle(
         "users/pages" => users_pages(state, pool, body).await,
         "roles/list" => roles_list(pool, body).await,
         "roles/show" => roles_show(pool, body).await,
+        "roles/users" => roles_users(state, pool, body, me_id.as_deref()).await,
+        "roles/notes" => roles_notes(state, pool, body, me_id.as_deref().unwrap()).await,
+        "users/achievements" => users_achievements(pool, body).await,
+        "users/recommendation" => {
+            users_recommendation(state, pool, body, me_id.as_deref().unwrap()).await
+        }
+        "users/featured-notes" => users_featured_notes(state, pool, body, me_id.as_deref()).await,
+        "following/requests/reject" => {
+            following_requests_reject(pool, body, me_id.as_deref().unwrap()).await
+        }
+        "following/requests/sent" => {
+            following_requests_sent(state, pool, body, me_id.as_deref().unwrap()).await
+        }
+        "following/update-all" => following_update_all(pool, body, me_id.as_deref().unwrap()).await,
+        "hashtags/search" => hashtags_search(pool, body).await,
+        "username/available" => username_available(pool, body).await,
+        "email-address/available" => email_address_available(pool, body).await,
         _ => Ok(api_err(ApiError::unknown_endpoint())),
     };
     match result {
@@ -391,4 +456,329 @@ async fn roles_show(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response>
             )
         })?;
     Ok(ok_json(pack_role(row)))
+}
+
+// ---------------------------------------------------------------------------
+// roles/users — live assignments of a public+explorable role, UserDetailed
+// ---------------------------------------------------------------------------
+
+async fn roles_users(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: Option<&str>,
+) -> Check<Response> {
+    let role_id = id_param(body, "roleId")?;
+    let role = mk_db::roles::find_role_pack(pool, role_id)
+        .await
+        .map_err(|e| db_err("roles_users find_role_pack", e))?
+        .filter(|r| r.is_public && r.is_explorable)
+        .ok_or_else(|| {
+            meta_err(
+                "NO_SUCH_ROLE",
+                "30aaaee3-4792-48dc-ab0d-cf501a575ac5",
+                "No such role.",
+            )
+        })?;
+    let limit = limit_param(body, 10)?;
+    let (since_id, until_id) = pager_ids(body)?;
+    let rows = mk_db::roles::role_assignments_page(
+        pool,
+        &role.id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|e| db_err("roles_users role_assignments_page", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for assign in rows {
+        if let Some(user) =
+            super::freq::pack_user_detailed(state, pool, &assign.user_id, me_id).await?
+        {
+            out.push(json!({ "id": assign.id, "user": user }));
+        }
+    }
+    Ok(ok_json(json!(out)))
+}
+
+// ---------------------------------------------------------------------------
+// roles/notes — public notes by holders of the role
+// ---------------------------------------------------------------------------
+
+async fn roles_notes(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Check<Response> {
+    let role_id = id_param(body, "roleId")?;
+    let role = mk_db::roles::find_role_pack(pool, role_id)
+        .await
+        .map_err(|e| db_err("roles_notes find_role_pack", e))?
+        .filter(|r| r.is_public)
+        .ok_or_else(|| {
+            meta_err(
+                "NO_SUCH_ROLE",
+                "eb70323a-df61-4dd4-ad90-89c83c7cf26e",
+                "No such role.",
+            )
+        })?;
+    if !role.is_explorable {
+        return Ok(ok_json(json!([])));
+    }
+    let limit = limit_param(body, 10)?;
+    let (since_id, until_id) = pager_ids(body)?;
+    let rows = mk_db::note::role_timeline_notes(
+        pool,
+        &role.id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|e| db_err("roles_notes role_timeline_notes", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match super::pack_note_for(state, pool, &row.id, Some(me_id)).await {
+            Ok(v) => out.push(v),
+            Err(r) => return Err(*r),
+        }
+    }
+    Ok(ok_json(json!(out)))
+}
+
+// ---------------------------------------------------------------------------
+// users/achievements — profile.achievements (findOneByOrFail → 500)
+// ---------------------------------------------------------------------------
+
+async fn users_achievements(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
+    let user_id = id_param(body, "userId")?;
+    match mk_db::user::find_profile(pool, user_id).await {
+        Ok(profile) => Ok(ok_json(profile.achievements)),
+        Err(_) => Err(internal()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// users/recommendation — local explorable unlocked users not yet followed
+// ---------------------------------------------------------------------------
+
+async fn users_recommendation(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Check<Response> {
+    let limit = limit_param(body, 10)?;
+    let offset = offset_param(body, 0)?;
+    let rows = mk_db::user::recommend_users(pool, me_id, limit, offset)
+        .await
+        .map_err(|e| db_err("users_recommendation", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(user) =
+            super::freq::pack_user_detailed(state, pool, &row.id, Some(me_id)).await?
+        {
+            out.push(user);
+        }
+    }
+    Ok(ok_json(json!(out)))
+}
+
+// ---------------------------------------------------------------------------
+// users/featured-notes — the user's public notes (no Redis ranking here)
+// ---------------------------------------------------------------------------
+
+async fn users_featured_notes(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: Option<&str>,
+) -> Check<Response> {
+    let user_id = id_param(body, "userId")?;
+    let limit = limit_param(body, 10)?;
+    let until_id = until_id_param(body)?;
+    let rows = mk_db::note::user_public_notes(pool, user_id, until_id.as_deref(), limit)
+        .await
+        .map_err(|e| db_err("users_featured_notes", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match super::pack_note_for(state, pool, &row.id, me_id).await {
+            Ok(v) => out.push(v),
+            Err(r) => return Err(*r),
+        }
+    }
+    Ok(ok_json(json!(out)))
+}
+
+// ---------------------------------------------------------------------------
+// following/requests/reject
+// ---------------------------------------------------------------------------
+
+async fn following_requests_reject(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Check<Response> {
+    let user_id = id_param(body, "userId")?;
+    if mk_db::user::find_user_by_id(pool, user_id)
+        .await
+        .map_err(|e| db_err("requests_reject find_user", e))?
+        .is_none()
+    {
+        return Err(meta_err(
+            "NO_SUCH_USER",
+            "abc2ffa6-25b2-4380-ba99-321ff3a94555",
+            "No such user.",
+        ));
+    }
+    let removed = mk_db::following::reject_follow_request(pool, user_id, me_id)
+        .await
+        .map_err(|e| db_err("requests_reject delete", e))?;
+    if removed {
+        // A pending request had already bumped the pair counters.
+        mk_db::social::bump_follow_counts(pool, user_id, me_id, -1)
+            .await
+            .map_err(|e| db_err("requests_reject counts", e))?;
+    }
+    Ok(ok_empty())
+}
+
+// ---------------------------------------------------------------------------
+// following/requests/sent
+// ---------------------------------------------------------------------------
+
+async fn following_requests_sent(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Check<Response> {
+    let limit = limit_param(body, 10)?;
+    let (since_id, until_id) = pager_ids(body)?;
+    let rows = mk_db::following::list_sent_follow_requests(
+        pool,
+        me_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|e| db_err("requests_sent list", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let follower = super::note_user_lite(state, pool, &row.follower_id).await?;
+        let followee = super::note_user_lite(state, pool, &row.followee_id).await?;
+        out.push(json!({ "id": row.id, "follower": follower, "followee": followee }));
+    }
+    Ok(ok_json(json!(out)))
+}
+
+// ---------------------------------------------------------------------------
+// following/update-all
+// ---------------------------------------------------------------------------
+
+async fn following_update_all(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Check<Response> {
+    let notify = match body.get("notify") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "none" => Some(None),
+        Some(Value::String(s)) if s == "normal" => Some(Some("normal")),
+        Some(_) => return Err(schema_invalid("notify", "must be normal or none")),
+    };
+    let with_replies = match body.get("withReplies") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(schema_invalid("withReplies", "must be a boolean")),
+    };
+    mk_db::following::update_all_followings(pool, me_id, notify, with_replies)
+        .await
+        .map_err(|e| db_err("following_update_all", e))?;
+    Ok(ok_empty())
+}
+
+// ---------------------------------------------------------------------------
+// hashtags/search
+// ---------------------------------------------------------------------------
+
+async fn hashtags_search(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
+    let query = match body.get("query") {
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err(schema_invalid("query", "required")),
+    };
+    let limit = limit_param(body, 10)?;
+    let offset = offset_param(body, 0)?;
+    let names = mk_db::hashtag::search(pool, &query.to_lowercase(), limit, offset)
+        .await
+        .map_err(|e| db_err("hashtags_search", e))?;
+    Ok(ok_json(json!(names)))
+}
+
+// ---------------------------------------------------------------------------
+// username/available
+// ---------------------------------------------------------------------------
+
+async fn username_available(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
+    let username = match body.get("username") {
+        Some(Value::String(s))
+            if !s.is_empty()
+                && s.chars().count() <= 20
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
+            s.clone()
+        }
+        _ => {
+            return Err(schema_invalid(
+                "username",
+                "must be 1..20 chars of [a-zA-Z0-9_]",
+            ));
+        }
+    };
+    let lower = username.to_lowercase();
+    let exists = mk_db::user::username_exists_local(pool, &lower)
+        .await
+        .map_err(|e| db_err("username_available exists", e))?
+        || mk_db::user::used_username_exists(pool, &lower)
+            .await
+            .map_err(|e| db_err("username_available used", e))?;
+    let preserved = mk_db::meta::preserved_usernames(pool)
+        .await
+        .map_err(|e| db_err("username_available preserved", e))?
+        .iter()
+        .any(|x| x.to_lowercase() == lower);
+    Ok(ok_json(json!({ "available": !exists && !preserved })))
+}
+
+// ---------------------------------------------------------------------------
+// email-address/available
+// ---------------------------------------------------------------------------
+
+async fn email_address_available(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
+    let email = match body.get("emailAddress") {
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err(schema_invalid("emailAddress", "required")),
+    };
+    let format_ok = {
+        let parts: Vec<&str> = email.split('@').collect();
+        parts.len() == 2
+            && !parts[0].is_empty()
+            && parts[1].contains('.')
+            && !parts[1].starts_with('.')
+            && !parts[1].ends_with('.')
+            && !email.chars().any(char::is_whitespace)
+    };
+    if !format_ok {
+        return Ok(ok_json(json!({ "available": false, "reason": "format" })));
+    }
+    let used = mk_db::user::verified_email_exists(pool, &email)
+        .await
+        .map_err(|e| db_err("email_address_available", e))?;
+    if used {
+        return Ok(ok_json(json!({ "available": false, "reason": "used" })));
+    }
+    Ok(ok_json(json!({ "available": true, "reason": Value::Null })))
 }

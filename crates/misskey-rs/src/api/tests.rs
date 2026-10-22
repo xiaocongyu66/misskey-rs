@@ -23345,3 +23345,430 @@ async fn i_export_antennas_and_webhooks_crud() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "webhooks/show deleted: {err}");
     assert_eq!(err["error"]["code"], json!("NO_SUCH_WEBHOOK"));
 }
+
+// ==== slice 2: roles/users, roles/notes, achievements, recommendation,
+// featured-notes, following requests, update-all, hashtags, availability ====
+
+async fn nu2_signup(
+    app: &axum::Router,
+    pool: &mk_db::sqlx::PgPool,
+    prefix: &str,
+) -> (String, String) {
+    let username = format!("{}{}", prefix, &mk_types::id::gen_aid_now()[..8]);
+    let (_, v) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+    let token = v["token"].as_str().unwrap().to_string();
+    let id = mk_db::user::find_local_user_id_by_token(pool, &token)
+        .await
+        .unwrap()
+        .unwrap();
+    (token, id)
+}
+
+#[tokio::test]
+async fn roles_users_lists_role_assignments() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_roles_users").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, user_id) = nu2_signup(&app, &pool, "ru").await;
+
+    let (s, rv) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({ "name": "Members", "isPublic": true, "isExplorable": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "role create: {rv}");
+    let role_id = rv["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "roleId": role_id, "userId": user_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/roles/users",
+        json!({ "roleId": role_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "roles/users: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "roles/users: {out}");
+    assert_eq!(arr[0]["user"]["id"], json!(user_id));
+
+    let (s, e) = post_json(app, "/api/roles/users", json!({ "roleId": "xxxxxx" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "missing role: {e}");
+    assert_eq!(e["error"]["code"], json!("NO_SUCH_ROLE"));
+}
+
+#[tokio::test]
+async fn roles_notes_lists_role_holder_notes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_roles_notes").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, user_id) = nu2_signup(&app, &pool, "rn").await;
+
+    let (s, nv) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "role note", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note: {nv}");
+    let note_id = nv["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, rv) = post_json(
+        app.clone(),
+        "/api/admin/roles/create",
+        json!({ "name": "Timeline", "isPublic": true, "isExplorable": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "role create: {rv}");
+    let role_id = rv["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/roles/assign",
+        json!({ "roleId": role_id, "userId": user_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (s, out) = post_json(
+        app,
+        "/api/roles/notes",
+        json!({ "roleId": role_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "roles/notes: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "roles/notes: {out}");
+    assert_eq!(arr[0]["id"], json!(note_id));
+}
+
+#[tokio::test]
+async fn users_achievements_returns_profile_array() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_ach").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (_token, user_id) = nu2_signup(&app, &pool, "ac").await;
+
+    let (s, out) = post_json(app, "/api/users/achievements", json!({ "userId": user_id })).await;
+    assert_eq!(s, StatusCode::OK, "achievements: {out}");
+    assert_eq!(out, json!([]), "achievements: {out}");
+}
+
+#[tokio::test]
+async fn users_recommendation_excludes_self_and_followees() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_rec").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, me_id) = nu2_signup(&app, &pool, "ra").await;
+    let (_btoken, bob_id) = nu2_signup(&app, &pool, "rb").await;
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/users/recommendation",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "recommendation: {out}");
+    let arr = out.as_array().unwrap();
+    let ids: Vec<&Value> = arr.iter().map(|u| &u["id"]).collect();
+    assert!(ids.contains(&&json!(bob_id)), "recommendation: {out}");
+    assert!(!ids.contains(&&json!(me_id)), "recommendation: {out}");
+
+    let (s, e) = post_json(app, "/api/users/recommendation", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "guest: {e}");
+}
+
+#[tokio::test]
+async fn users_featured_notes_returns_public_notes() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_feat").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, user_id) = nu2_signup(&app, &pool, "fe").await;
+
+    let (s, nv) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "text": "featured", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "note: {nv}");
+    let note_id = nv["createdNote"]["id"].as_str().unwrap().to_string();
+
+    let (s, out) = post_json(
+        app,
+        "/api/users/featured-notes",
+        json!({ "userId": user_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "featured: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "featured: {out}");
+    assert_eq!(arr[0]["id"], json!(note_id));
+}
+
+#[tokio::test]
+async fn following_requests_reject_removes_pending() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_reject").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, alice_id) = nu2_signup(&app, &pool, "rj").await;
+    let (_btoken, bob_id) = nu2_signup(&app, &pool, "rk").await;
+
+    mk_db::sqlx::query(
+        r#"INSERT INTO "follow_request" ("id","followeeId","followerId") VALUES ('fr1',$1,$2)"#,
+    )
+    .bind(&alice_id)
+    .bind(&bob_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/requests/reject",
+        json!({ "userId": bob_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "reject: {body}");
+    let left: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "follow_request""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+
+    let (s, e) = post_json(
+        app,
+        "/api/following/requests/reject",
+        json!({ "userId": "xxxxxx", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "missing user: {e}");
+    assert_eq!(e["error"]["code"], json!("NO_SUCH_USER"));
+}
+
+#[tokio::test]
+async fn following_requests_sent_lists_outgoing() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_sent").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (_atoken, alice_id) = nu2_signup(&app, &pool, "sa").await;
+    let (btoken, bob_id) = nu2_signup(&app, &pool, "sb").await;
+
+    mk_db::sqlx::query(
+        r#"INSERT INTO "follow_request" ("id","followeeId","followerId") VALUES ('fr2',$1,$2)"#,
+    )
+    .bind(&alice_id)
+    .bind(&bob_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, out) = post_json(app, "/api/following/requests/sent", json!({ "i": btoken })).await;
+    assert_eq!(s, StatusCode::OK, "sent: {out}");
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "sent: {out}");
+    assert_eq!(arr[0]["follower"]["id"], json!(bob_id));
+    assert_eq!(arr[0]["followee"]["id"], json!(alice_id));
+}
+
+#[tokio::test]
+async fn following_update_all_updates_rows() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_updall").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (token, alice_id) = nu2_signup(&app, &pool, "ua").await;
+    let (_btoken, bob_id) = nu2_signup(&app, &pool, "ub").await;
+
+    mk_db::sqlx::query(
+        r#"INSERT INTO "following" ("id","followerId","followeeId") VALUES ('fo1',$1,$2)"#,
+    )
+    .bind(&alice_id)
+    .bind(&bob_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(
+        app,
+        "/api/following/update-all",
+        json!({ "notify": "none", "withReplies": true, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "update-all: {body}");
+    let (notify, with_replies): (Option<String>, bool) =
+        mk_db::sqlx::query_as(r#"SELECT "notify","withReplies" FROM "following" WHERE "id"='fo1'"#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notify, None);
+    assert!(with_replies);
+}
+
+#[tokio::test]
+async fn hashtags_search_matches_prefix() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_tags").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+
+    for (id, name, count) in [("h1", "misskey", 5), ("h2", "mastodon", 10)] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "hashtag" ("id","name","mentionedLocalUsersCount") VALUES ($1,$2,$3)"#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(count)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/hashtags/search",
+        json!({ "query": "MIS" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "search: {out}");
+    assert_eq!(out, json!(["misskey"]), "search: {out}");
+
+    let (s, out) = post_json(app, "/api/hashtags/search", json!({ "query": "ma" })).await;
+    assert_eq!(s, StatusCode::OK, "search2: {out}");
+    assert_eq!(out, json!(["mastodon"]), "search2: {out}");
+}
+
+#[tokio::test]
+async fn username_available_detects_existing_and_reserved() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_uname").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("un{}", &mk_types::id::gen_aid_now()[..8]);
+    let (_, _) = post_json(
+        app.clone(),
+        "/api/signup",
+        json!({ "username": username, "password": "test" }),
+    )
+    .await;
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/username/available",
+        json!({ "username": username }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "existing: {out}");
+    assert_eq!(out, json!({ "available": false }));
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/username/available",
+        json!({ "username": "freshname" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "fresh: {out}");
+    assert_eq!(out, json!({ "available": true }));
+
+    let (s, out) = post_json(
+        app,
+        "/api/username/available",
+        json!({ "username": "admin" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "reserved: {out}");
+    assert_eq!(out, json!({ "available": false }));
+}
+
+#[tokio::test]
+async fn email_address_available_checks_format_and_use() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mknu2_email").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+    let (_token, user_id) = nu2_signup(&app, &pool, "em").await;
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/email-address/available",
+        json!({ "emailAddress": "not-an-email" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "format: {out}");
+    assert_eq!(out, json!({ "available": false, "reason": "format" }));
+
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/email-address/available",
+        json!({ "emailAddress": "fresh@example.com" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "fresh: {out}");
+    assert_eq!(out, json!({ "available": true, "reason": null }));
+
+    mk_db::sqlx::query(
+        r#"UPDATE "user_profile" SET "email"='used@example.com', "emailVerified"=TRUE WHERE "userId"=$1"#,
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (s, out) = post_json(
+        app,
+        "/api/email-address/available",
+        json!({ "emailAddress": "used@example.com" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "used: {out}");
+    assert_eq!(out, json!({ "available": false, "reason": "used" }));
+}

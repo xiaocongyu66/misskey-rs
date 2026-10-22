@@ -232,3 +232,13 @@ mod tests {
         assert!(d.is_none());
     }
 }
+
+/// `meta.preservedUsernames` (endpoints/username/available.ts).
+pub async fn preserved_usernames(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, Vec<String>>(
+        r#"SELECT "preservedUsernames" FROM "meta" ORDER BY "id" DESC LIMIT 1"#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map(|v| v.unwrap_or_default())
+}

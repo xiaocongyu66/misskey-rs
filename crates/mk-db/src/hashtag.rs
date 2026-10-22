@@ -185,3 +185,29 @@ pub async fn trend(pool: &PgPool, now_ms: i64) -> Result<Vec<TrendEntry>, sqlx::
     entries.truncate(10);
     Ok(entries)
 }
+
+/// `endpoints/hashtags/search.ts` — `name LIKE '<lowercased query>%'`
+/// ordered by mentionedLocalUsersCount DESC, returning the names only.
+pub async fn search(
+    pool: &PgPool,
+    query_lower: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let escaped = query_lower
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    sqlx::query_scalar::<_, String>(
+        r#"SELECT "name" FROM "hashtag"
+           WHERE "name" LIKE $1 ESCAPE '\'
+           ORDER BY "mentionedLocalUsersCount" DESC, "name" ASC
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(pattern)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}

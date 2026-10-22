@@ -1175,3 +1175,56 @@ pub async fn find_note_id_by_uri(pool: &PgPool, uri: &str) -> Result<Option<Stri
         .fetch_optional(pool)
         .await
 }
+
+/// `endpoints/roles/notes.ts` — the public notes of users currently holding
+/// the role, newest first (the Redis `roleTimeline:<roleId>` fanout has no
+/// equivalent here; this reads the same membership from `role_assignment`).
+pub async fn role_timeline_notes(
+    pool: &PgPool,
+    role_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {NOTE_COLS} FROM "note" n
+           WHERE n."visibility" = 'public'
+             AND EXISTS (
+                 SELECT 1 FROM "role_assignment" a
+                 WHERE a."roleId" = $1 AND a."userId" = n."userId"
+                   AND (a."expiresAt" IS NULL OR a."expiresAt" > now())
+             )
+             AND ($2::text IS NULL OR n."id" > $2)
+             AND ($3::text IS NULL OR n."id" < $3)
+           ORDER BY n."id" DESC LIMIT $4"#
+    );
+    sqlx::query_as::<_, NoteRow>(&sql)
+        .bind(role_id)
+        .bind(since_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// `endpoints/users/featured-notes.ts` fallback: the user's public notes,
+/// newest first (no Redis featured ranking in this workspace).
+pub async fn user_public_notes(
+    pool: &PgPool,
+    user_id: &str,
+    until_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {NOTE_COLS} FROM "note"
+           WHERE "userId" = $1 AND "visibility" = 'public'
+             AND ($2::text IS NULL OR "id" < $2)
+           ORDER BY "id" DESC LIMIT $3"#
+    );
+    sqlx::query_as::<_, NoteRow>(&sql)
+        .bind(user_id)
+        .bind(until_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}

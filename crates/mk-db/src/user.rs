@@ -1183,3 +1183,46 @@ pub async fn find_user_id_by_uri(pool: &PgPool, uri: &str) -> Result<Option<Stri
     .fetch_optional(pool)
     .await
 }
+
+/// `endpoints/users/recommendation.ts` — local explorable unlocked users
+/// updated in the last 7 days that the caller does not follow, ranked by
+/// followersCount (the muted/blocked subqueries ride in the caller lane).
+pub async fn recommend_users(
+    pool: &PgPool,
+    me_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LocalUserRow>, sqlx::Error> {
+    let sql = format!(
+        r#"SELECT {LOCAL_USER_COLS} FROM "user" u
+           WHERE u."isLocked" = FALSE
+             AND u."isExplorable" = TRUE
+             AND u."host" IS NULL
+             AND (u."updatedAt" IS NULL OR u."updatedAt" >= now() - interval '7 days')
+             AND u."id" != $1
+             AND NOT EXISTS (
+                 SELECT 1 FROM "following" f
+                 WHERE f."followerId" = $1 AND f."followeeId" = u."id"
+             )
+           ORDER BY u."followersCount" DESC, u."id" DESC
+           LIMIT $2 OFFSET $3"#
+    );
+    sqlx::query_as::<_, LocalUserRow>(&sql)
+        .bind(me_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+}
+
+/// `EmailService.validateEmailForAccount` used check: a verified profile
+/// already owns the address.
+pub async fn verified_email_exists(pool: &PgPool, email: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        r#"SELECT count(*) FROM "user_profile" WHERE "email" = $1 AND "emailVerified" = TRUE"#,
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .map(|n| n > 0)
+}
