@@ -20202,3 +20202,57 @@ async fn federation_instances_show_stats_and_host_lists() {
     assert_eq!(body.as_array().unwrap().len(), 2, "body: {body}");
     assert_eq!(body[0]["followeeId"], json!("u1"));
 }
+
+// renote-mute/list: create → list → delete over renote_muting (the
+// endpoints/renote-mute/list.ts partner pack).
+#[tokio::test]
+async fn renote_mute_list_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkrenotemute").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("rma")).await;
+    let bob = signup(&app, &uname("rmb")).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let b_id = bob["id"].as_str().unwrap().to_string();
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/renote-mute/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "renote-mute/create");
+
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/renote-mute/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "renote-mute/list: {list}");
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "list: {list}");
+    assert_eq!(rows[0]["muteeId"], json!(b_id));
+    assert_eq!(rows[0]["mutee"]["id"], json!(b_id));
+    assert!(rows[0]["id"].is_string());
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/renote-mute/delete",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "renote-mute/delete");
+    let (_, list) = post_json(
+        app.clone(),
+        "/api/renote-mute/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 0, "after delete: {list}");
+}

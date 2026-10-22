@@ -110,7 +110,7 @@ pub(crate) fn is_prohibit_moved(name: &str) -> bool {
 pub(crate) fn handles(name: &str) -> bool {
     matches!(
         name,
-        "i/move" | "mute/list" | "blocking/list" | "users/lists/list"
+        "i/move" | "mute/list" | "blocking/list" | "renote-mute/list" | "users/lists/list"
     )
 }
 
@@ -223,6 +223,20 @@ pub(crate) async fn handle(
     let resp = match name {
         "i/move" => move_route(state, pool, body, token).await,
         "mute/list" => mute_list(state, pool, body, token).await,
+        // upstream renote-mute/list: the same partner pack, no expiry column
+        "renote-mute/list" => {
+            partner_list(
+                state,
+                pool,
+                body,
+                token,
+                "renote_muting",
+                "muterId",
+                "muteeId",
+                false,
+            )
+            .await
+        }
         "blocking/list" => blocking_list(state, pool, body, token).await,
         "users/lists/list" => users_lists_list(state, pool, body, token).await,
         _ => return api_err(ApiError::unknown_endpoint()),
