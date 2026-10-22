@@ -20329,3 +20329,220 @@ async fn admin_accounts_roundtrip() {
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "delete: {body}");
 }
+
+/// `admin/drive/*` + `admin/delete-all-files-of-a-user`: list filters
+/// (userId wins; origin local/remote/combined + hostname), show-file
+/// (fileId + user), clean-remote-files (userHost IS NOT NULL only),
+/// cleanup (unreferenced rows only — note/avatar/banner refs protect) and
+/// the moderator/admin gates.
+#[tokio::test]
+async fn admin_drive_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_drive_rt").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, "root").await;
+    let root_id = root["id"].as_str().unwrap().to_string();
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let alice = signup(&app, "alice").await;
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let plain = signup(&app, "plain").await;
+    let plain_token = plain["token"].as_str().unwrap().to_string();
+
+    // alice local file, root avatar file, a userless orphan and a remote file.
+    let local_id = seed_drive_file(&pool, &alice_id, "image/jpeg").await;
+    let avatar_id = seed_drive_file(&pool, &root_id, "image/png").await;
+    mk_db::sqlx::query(r#"UPDATE "user" SET "avatarId" = $1 WHERE "id" = $2"#)
+        .bind(&avatar_id)
+        .bind(&root_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let orphan_id = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "drive_file"
+             ("id","md5","name","type","size","storedInternal","url")
+           VALUES ($1,$2,'orphan.bin','application/octet-stream',10,FALSE,$3)"#,
+    )
+    .bind(&orphan_id)
+    .bind(mk_types::id::gen_aid_now())
+    .bind(format!("http://127.0.0.1:3000/files/{orphan_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let remote_id = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "drive_file"
+             ("id","md5","name","type","size","storedInternal","url","userHost")
+           VALUES ($1,$2,'remote.jpg','image/jpeg',20,FALSE,$3,'remote.example')"#,
+    )
+    .bind(&remote_id)
+    .bind(mk_types::id::gen_aid_now())
+    .bind(format!("https://remote.example/files/{remote_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // non-admin → 403 moderator ROLE_PERMISSION_DENIED
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
+
+    // userId filter → only alice's file (origin/hostname suppressed).
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": root_token, "userId": alice_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {b}");
+    assert_eq!(arr[0]["id"], json!(local_id));
+    assert_eq!(arr[0]["userId"], json!(alice_id));
+    assert_eq!(arr[0]["userHost"], Value::Null);
+
+    // default origin=local → the three local rows, no remote.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3, "body: {b}");
+    assert!(ids.contains(&local_id.as_str()));
+    assert!(ids.contains(&avatar_id.as_str()));
+    assert!(ids.contains(&orphan_id.as_str()));
+    assert!(!ids.contains(&remote_id.as_str()));
+
+    // origin=remote / combined+hostname → the remote row only.
+    for body in [
+        json!({ "i": root_token, "origin": "remote" }),
+        json!({ "i": root_token, "origin": "combined", "hostname": "remote.example" }),
+    ] {
+        let (s, b) = post_json(app.clone(), "/api/admin/drive/files", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {b}");
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "body: {b}");
+        assert_eq!(arr[0]["id"], json!(remote_id));
+        assert_eq!(arr[0]["userHost"], json!("remote.example"));
+    }
+
+    // show-file: fileId → flat file + user; unknown id → NO_SUCH_FILE.
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/show-file",
+        json!({ "i": root_token, "fileId": local_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b["id"], json!(local_id));
+    assert_eq!(b["userId"], json!(alice_id));
+    assert_eq!(b["user"]["id"], json!(alice_id));
+    assert_eq!(b["type"], json!("image/jpeg"));
+
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/show-file",
+        json!({ "i": root_token, "fileId": "nosuchfile" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // clean-remote-files: only userHost IS NOT NULL rows die.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/drive/clean-remote-files",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": root_token, "origin": "remote" }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": root_token, "userId": alice_id }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1, "local survives: {b}");
+
+    // delete-all-files-of-a-user is requireAdmin (plain → admin-gate id).
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/delete-all-files-of-a-user",
+        json!({ "i": plain_token, "userId": alice_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("c3d38592-54c0-429d-be96-5636b0431a61")
+    );
+
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/delete-all-files-of-a-user",
+        json!({ "i": root_token, "userId": alice_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/drive/files",
+        json!({ "i": root_token, "userId": alice_id }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // cleanup: the userless orphan goes, the avatar-referenced file stays.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/admin/drive/cleanup",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let orphan_left: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "drive_file" WHERE "id" = $1"#)
+            .bind(&orphan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(orphan_left, 0, "orphan should be swept");
+    let avatar_left: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "drive_file" WHERE "id" = $1"#)
+            .bind(&avatar_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(avatar_left, 1, "avatar-referenced file must survive");
+}

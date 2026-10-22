@@ -887,6 +887,27 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END admin-accounts DISPATCH ARM ====
 
+    // ==== admin-drive DISPATCH ARM (admin/drive/* + delete-all-files) ====
+    // Noses in ahead of the admin/* catch-all (admin-accounts convention):
+    // api::admin_drive owns the four admin/drive/* names plus
+    // admin/delete-all-files-of-a-user; every other admin/* name keeps
+    // falling through. Method check, body parsing and token extraction live
+    // in the arm; the shared requireModerator/requireAdmin gates and the
+    // handlers live in api::admin_drive (SQL in mk-db/src/drive.rs).
+    if admin_drive::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_drive::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-drive DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -6639,6 +6660,14 @@ mod admin_accounts;
 /// mod.rs only registers the module and the dispatch arm above (ahead of the
 /// admin/* catch-all).
 mod admin_relays;
+
+/// `admin/drive/*` + `admin/delete-all-files-of-a-user` family (upstream
+/// `endpoints/admin/drive/*.ts` and `endpoints/admin/delete-all-files-of-a-
+/// user.ts`). Module file `api/admin_drive.rs` owns the endpoint table +
+/// handlers and the shared requireModerator/requireAdmin gates; SQL lives in
+/// `mk-db/src/drive.rs`. mod.rs only registers the module and the dispatch
+/// arm above (ahead of the admin/* catch-all).
+mod admin_drive;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file

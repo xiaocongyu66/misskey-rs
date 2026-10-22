@@ -410,3 +410,211 @@ pub async fn note_ids_attaching_file(
     let rows: Vec<(String,)> = q.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
+
+// ==== admin-drive: admin/drive/{files,show-file,cleanup,clean-remote-files}
+// + admin/delete-all-files-of-a-user (upstream endpoints/admin/drive/*.ts,
+// endpoints/admin/delete-all-files-of-a-user.ts). ==========================
+
+/// Full `drive_file` row for the admin drive surface. `DriveFileRow` (the
+/// upload path) omits the origin marker (`userHost`) and the request
+/// metadata the admin `show-file` response exposes; this shape carries the
+/// columns upstream's `DriveFile` entity returns.
+#[derive(Debug, Default, sqlx::FromRow)]
+pub struct AdminDriveFileRow {
+    pub id: String,
+    #[sqlx(rename = "userId")]
+    pub user_id: Option<String>,
+    /// Remote origin host; NULL = local. This is the "origin" column the
+    /// admin endpoints filter on (upstream `file.userHost IS [NOT] NULL`).
+    #[sqlx(rename = "userHost")]
+    pub user_host: Option<String>,
+    pub md5: String,
+    pub name: String,
+    #[sqlx(rename = "type")]
+    pub file_type: String,
+    pub size: i32,
+    pub comment: Option<String>,
+    pub properties: serde_json::Value,
+    #[sqlx(rename = "storedInternal")]
+    pub stored_internal: bool,
+    pub url: String,
+    #[sqlx(rename = "thumbnailUrl")]
+    pub thumbnail_url: Option<String>,
+    #[sqlx(rename = "webpublicUrl")]
+    pub webpublic_url: Option<String>,
+    #[sqlx(rename = "webpublicType")]
+    pub webpublic_type: Option<String>,
+    #[sqlx(rename = "accessKey")]
+    pub access_key: Option<String>,
+    pub uri: Option<String>,
+    pub src: Option<String>,
+    #[sqlx(rename = "folderId")]
+    pub folder_id: Option<String>,
+    #[sqlx(rename = "isSensitive")]
+    pub is_sensitive: bool,
+    #[sqlx(rename = "isLink")]
+    pub is_link: bool,
+    pub blurhash: Option<String>,
+    #[sqlx(rename = "maybeSensitive")]
+    pub maybe_sensitive: bool,
+    #[sqlx(rename = "maybePorn")]
+    pub maybe_porn: bool,
+    #[sqlx(rename = "requestIp")]
+    pub request_ip: Option<String>,
+    #[sqlx(rename = "requestHeaders")]
+    pub request_headers: Option<serde_json::Value>,
+}
+
+const ADMIN_FILE_COLS: &str = r#""id", "userId", "userHost", "md5", "name", ("type"::text) AS "type", "size", "comment", ("properties"::text)::jsonb AS "properties", "storedInternal", "url", "thumbnailUrl", "webpublicUrl", "webpublicType", "accessKey", "uri", "src", "folderId", "isSensitive", "isLink", "blurhash", "maybeSensitive", "maybePorn", "requestIp", ("requestHeaders"::text)::jsonb AS "requestHeaders""#;
+
+/// `admin/drive/files` (endpoints/admin/drive/files.ts): global file list.
+/// Filter precedence mirrors upstream: a `userId` wins and suppresses the
+/// origin/hostname arms; otherwise `origin` local → `userHost IS NULL`,
+/// remote → `IS NOT NULL`, combined → no filter, and `hostname` adds
+/// `userHost = host`. `type` is exact or the `x/*` LIKE-prefix arm.
+/// `makePaginationQuery` semantics are identical to `files_list` (both
+/// bounds exclusive, sinceId-only → ASC, else DESC).
+#[allow(clippy::too_many_arguments)]
+pub async fn admin_files_list(
+    pool: &PgPool,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    user_id: Option<&str>,
+    origin: &str,
+    hostname: Option<&str>,
+    type_exact: Option<&str>,
+    type_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AdminDriveFileRow>, sqlx::Error> {
+    let mut q = sqlx::QueryBuilder::new("SELECT ");
+    q.push(ADMIN_FILE_COLS)
+        .push(r#" FROM "drive_file" WHERE TRUE"#);
+    match user_id {
+        Some(uid) => {
+            q.push(r#" AND "userId" = "#).push_bind(uid);
+        }
+        None => {
+            match origin {
+                "local" => {
+                    q.push(r#" AND "userHost" IS NULL"#);
+                }
+                "remote" => {
+                    q.push(r#" AND "userHost" IS NOT NULL"#);
+                }
+                // combined (or anything else): no origin filter.
+                _ => {}
+            }
+            if let Some(h) = hostname {
+                q.push(r#" AND "userHost" = "#).push_bind(h);
+            }
+        }
+    }
+    if let Some(t) = type_exact {
+        q.push(r#" AND "type" = "#).push_bind(t);
+    }
+    if let Some(p) = type_prefix {
+        let pattern = format!("{p}%");
+        q.push(r#" AND "type" LIKE "#).push_bind(pattern);
+    }
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (Some(s), None) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+        }
+        (None, Some(u)) => {
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (None, None) => {}
+    }
+    if since_id.is_some() && until_id.is_none() {
+        q.push(r#" ORDER BY "id" ASC"#);
+    } else {
+        q.push(r#" ORDER BY "id" DESC"#);
+    }
+    q.push(" LIMIT ").push_bind(limit);
+    q.build_query_as::<AdminDriveFileRow>()
+        .fetch_all(pool)
+        .await
+}
+
+/// `admin/drive/show-file` fileId arm (`findOneBy({ id })`).
+pub async fn admin_find_file_by_id(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<AdminDriveFileRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminDriveFileRow>(&format!(
+        r#"SELECT {ADMIN_FILE_COLS} FROM "drive_file" WHERE "id" = $1"#
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `admin/drive/show-file` url arm: upstream
+/// `findOneBy([{ url }, { thumbnailUrl: url }, { webpublicUrl: url }])`
+/// (an OR across the three columns).
+pub async fn admin_find_file_by_url(
+    pool: &PgPool,
+    url: &str,
+) -> Result<Option<AdminDriveFileRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminDriveFileRow>(&format!(
+        r#"SELECT {ADMIN_FILE_COLS} FROM "drive_file"
+           WHERE "url" = $1 OR "thumbnailUrl" = $1 OR "webpublicUrl" = $1
+           LIMIT 1"#
+    ))
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `admin/drive/cleanup` local slice. DOCUMENTED QUERY (slice plan): delete
+/// rows with no `note.fileIds` reference and no `user.avatarId`/`bannerId`
+/// reference. Upstream `DriveService.cleanup` sweeps `userId IS NULL`; the
+/// reference checks here are stricter (never delete a file a note or a
+/// profile still points at). Other tables that may reference a drive file
+/// (channel `bannerId`, page `eyeCatchingImageId`, avatar-decoration
+/// `fileId`, …) are NOT consulted — those columns are ON DELETE SET NULL /
+/// CASCADE in the baseline, so the delete still succeeds, but their refs do
+/// not protect a row. Returns the number of deleted rows.
+pub async fn admin_cleanup_orphans(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM "drive_file" AS "file"
+        WHERE NOT EXISTS (
+            SELECT 1 FROM "note" AS "note"
+            WHERE "file"."id" = ANY("note"."fileIds")
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM "user" AS "u"
+            WHERE "u"."avatarId" = "file"."id" OR "u"."bannerId" = "file"."id"
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// `admin/drive/clean-remote-files` local slice. Upstream queues
+/// `createCleanRemoteFilesJob` (which deletes `userHost IS NOT NULL` rows in
+/// the background); with no job queue for this lane the delete runs inline.
+/// Returns the number of deleted rows.
+pub async fn admin_clean_remote_files(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(r#"DELETE FROM "drive_file" WHERE "userHost" IS NOT NULL"#)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// `admin/delete-all-files-of-a-user`: `findBy({ userId })` + deleteFile for
+/// each row → one scoped DELETE. Returns the number of deleted rows.
+pub async fn admin_delete_files_of_user(pool: &PgPool, user_id: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(r#"DELETE FROM "drive_file" WHERE "userId" = $1"#)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
