@@ -521,7 +521,7 @@ async fn fetch_external_resources(body: &Value) -> Response {
 
     // upstream HttpRequestService.getJson: GET, 5s, 256 KiB, JSON accept.
     let res = match http_client()
-        .get(&url)
+        .get(url.as_str())
         .header(reqwest::header::ACCEPT, "application/json, */*")
         .timeout(Duration::from_secs(5))
         .send()
