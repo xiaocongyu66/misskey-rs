@@ -36,7 +36,7 @@ const PAGE_COLS: &str = r#""id",
     "eyeCatchingImageId" AS "eye_catching_image_id", "font",
     "alignCenter" AS "align_center",
     "hideTitleWhenPinned" AS "hide_title_when_pinned",
-    "likedCount" AS "liked_count", "visibility""#;
+    "likedCount" AS "liked_count", "visibility"::text AS "visibility""#;
 
 /// Same projection with the `p.` join alias (`pages/liked`).
 const PAGE_COLS_P: &str = r#"p."id",
@@ -45,7 +45,7 @@ const PAGE_COLS_P: &str = r#"p."id",
     p."variables", p."eyeCatchingImageId" AS "eye_catching_image_id",
     p."font", p."alignCenter" AS "align_center",
     p."hideTitleWhenPinned" AS "hide_title_when_pinned",
-    p."likedCount" AS "liked_count", p."visibility""#;
+    p."likedCount" AS "liked_count", p."visibility"::text AS "visibility""#;
 
 pub async fn find_page(pool: &PgPool, id: &str) -> Result<Option<PageRow>, sqlx::Error> {
     sqlx::query_as::<_, PageRow>(&format!(
