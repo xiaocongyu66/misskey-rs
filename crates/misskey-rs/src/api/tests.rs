@@ -19565,3 +19565,200 @@ async fn avatar_decorations_roundtrip() {
     .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// gallery/* — create → show → like → list → update → delete (upstream
+// endpoints/gallery/* + GalleryPostEntityService packs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn gallery_arena_crud_like_list() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkgallery_arena").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let (a_token, a_id) = channels_signup(app.clone(), "galice").await;
+    let (b_token, _) = channels_signup(app.clone(), "gbobby").await;
+
+    // create — the fetch-resource fixture body (fileIds: []) stays accepted;
+    // upstream pack(post, me) carries isLiked.
+    let (s, post) = post_json(
+        app.clone(),
+        "/api/gallery/posts/create",
+        json!({
+            "title": "test post",
+            "description": null,
+            "fileIds": [],
+            "isSensitive": false,
+            "i": a_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {post}");
+    assert_eq!(post["title"], json!("test post"));
+    assert_eq!(post["description"], Value::Null);
+    assert_eq!(post["userId"], json!(a_id));
+    assert_eq!(post["fileIds"], json!([]));
+    assert_eq!(post["files"], json!([]));
+    assert_eq!(post["isSensitive"], json!(false));
+    assert_eq!(post["likedCount"], json!(0));
+    assert_eq!(post["isLiked"], json!(false));
+    assert!(post["createdAt"].is_string());
+    assert!(post["updatedAt"].is_string());
+    assert_eq!(post["user"]["id"], json!(a_id));
+    let post_id = post["id"].as_str().unwrap().to_string();
+
+    // guest create → CREDENTIAL_REQUIRED (auth before paramDef)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/gallery/posts/create",
+        json!({ "title": "x", "fileIds": [] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // show guest → no isLiked; show with bob → isLiked false
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/gallery/posts/show",
+        json!({ "postId": post_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["id"], json!(post_id));
+    assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/gallery/posts/show",
+        json!({ "postId": post_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["isLiked"], json!(false));
+
+    // owner cannot like their own post
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/gallery/posts/like",
+        json!({ "postId": post_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("YOUR_POST"));
+
+    // bob likes → 204; duplicate → ALREADY_LIKED; unlike → 204 then NOT_LIKED
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/gallery/posts/like",
+        json!({ "postId": post_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/gallery/posts/like",
+        json!({ "postId": post_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_LIKED"));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/gallery/posts/show",
+        json!({ "postId": post_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(1));
+    assert_eq!(shown["isLiked"], json!(true));
+
+    // global list: guest sees the post without isLiked; bob sees isLiked
+    let (s, list) = post_json(app.clone(), "/api/gallery/posts", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let arr = list.as_array().unwrap();
+    assert!(arr.iter().any(|p| p["id"] == json!(post_id)), "{list}");
+    let row = arr.iter().find(|p| p["id"] == json!(post_id)).unwrap();
+    assert!(row.get("isLiked").is_none(), "guest list: {row}");
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/gallery/posts",
+        json!({ "i": b_token, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "{list}");
+    assert_eq!(arr[0]["isLiked"], json!(true));
+
+    // featured/popular carry the liked post (guest packs)
+    let (s, feat) = post_json(app.clone(), "/api/gallery/featured", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {feat}");
+    assert!(feat.as_array().unwrap().iter().any(|p| p["id"] == json!(post_id)));
+    let (s, pop) = post_json(app.clone(), "/api/gallery/popular", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {pop}");
+    assert!(pop.as_array().unwrap().iter().any(|p| p["id"] == json!(post_id)));
+
+    // update by owner → 200 packed post
+    let (s, updated) = post_json(
+        app.clone(),
+        "/api/gallery/posts/update",
+        json!({
+            "postId": post_id,
+            "title": "updated post",
+            "description": "desc",
+            "isSensitive": true,
+            "i": a_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {updated}");
+    assert_eq!(updated["title"], json!("updated post"));
+    assert_eq!(updated["description"], json!("desc"));
+    assert_eq!(updated["isSensitive"], json!(true));
+
+    // non-owner update is an owner-scoped no-op (upstream update({id,userId}))
+    let (s, same) = post_json(
+        app.clone(),
+        "/api/gallery/posts/update",
+        json!({ "postId": post_id, "title": "hijack", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {same}");
+    assert_eq!(same["title"], json!("updated post"));
+
+    // non-owner delete → ACCESS_DENIED; owner delete → 204
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/gallery/posts/delete",
+        json!({ "postId": post_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/gallery/posts/delete",
+        json!({ "postId": post_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // gone → NO_SUCH_POST
+    let (s, body) = post_json(
+        app,
+        "/api/gallery/posts/show",
+        json!({ "postId": post_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_POST"));
+    assert_eq!(
+        body["error"]["id"],
+        json!("1137bf14-c5b0-4604-85bb-5b5371b1cd45")
+    );
+}

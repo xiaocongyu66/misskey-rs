@@ -32,6 +32,9 @@ pub mod clips;
 // flash-agent: flash/* domain (flash/flash_like tables ship in the 0001
 // baseline; CRUD + likes + featured/search/my-likes db paths)
 pub mod flash;
+// gallery-agent: gallery/* domain (gallery_post/gallery_like tables ship in
+// the 0001 baseline; CRUD + likes + featured/popular/list db paths)
+pub mod gallery;
 // delete-account: i/delete-account + admin/delete-account soft-delete flag
 pub mod delete_account;
 // two-factor arena: the TOTP lane (vendored std-only SHA-1/HMAC-SHA1/

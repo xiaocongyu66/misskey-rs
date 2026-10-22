@@ -62,6 +62,11 @@ mod clips;
 // show,my,my-likes,like,unlike,featured,search}) — db paths in
 // mk-db/src/flash.rs (flash/flash_like tables ship in the 0001 baseline).
 mod flash_more;
+// gallery-agent: the gallery family (gallery/posts + gallery/posts/{create,
+// show,delete,update,like,unlike} + gallery/{featured,popular}) — db paths in
+// mk-db/src/gallery.rs (gallery_post/gallery_like tables ship in the 0001
+// baseline).
+mod gallery_more;
 // pages-agent: the page family (pages/{create,update,delete,show,like,unlike,
 // featured,my,liked}) — db paths in mk-db/src/page.rs (page/page_like tables
 // ship in the 0001 baseline).
@@ -1255,6 +1260,43 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return pages_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END pages-agent DISPATCH ARM ====
+
+    // ==== gallery-agent DISPATCH ARM (gallery/*) ====
+    // Self-contained block on the flash-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential gates (all but gallery/posts, gallery/posts/show,
+    // gallery/featured, gallery/popular) + endpoint bodies in
+    // api::gallery_more (db paths in mk-db/src/gallery.rs). Sits ahead of the
+    // arena-fetchres arm, which also lists gallery/posts/create: the full
+    // upstream handler below shadows that beforeAll fixture (same contract,
+    // wider params).
+    if gallery_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return gallery_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END gallery-agent DISPATCH ARM ====
 
     // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
     // gallery/posts/create) ====
