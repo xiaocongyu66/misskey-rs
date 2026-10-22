@@ -20156,8 +20156,12 @@ async fn federation_instances_show_stats_and_host_lists() {
     let (s, body) = post_json(app.clone(), "/api/federation/stats", json!({})).await;
     assert_eq!(s, StatusCode::OK, "body: {body}");
     let subs = body["topSubInstances"].as_array().unwrap();
-    assert_eq!(subs.len(), 1, "body: {body}");
-    assert_eq!(subs[0]["host"], json!("remote.example"));
+    // same ranking source as topPubInstances: both instance rows, each count 1
+    assert_eq!(subs.len(), 2, "body: {body}");
+    assert!(
+        subs.iter().any(|p| p["host"] == json!("remote.example")),
+        "body: {body}"
+    );
     assert_eq!(body["otherFollowersCount"], json!(2)); // 3 remote edges - 1 top
     let pubs = body["topPubInstances"].as_array().unwrap();
     assert_eq!(pubs.len(), 1, "body: {body}");
