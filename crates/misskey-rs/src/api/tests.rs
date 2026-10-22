@@ -20546,3 +20546,190 @@ async fn admin_drive_roundtrip() {
             .unwrap();
     assert_eq!(avatar_left, 1, "avatar-referenced file must survive");
 }
+
+/// invite + promo: upstream invite/{create,list,limit} +
+/// admin/invite/{create,list} + promo/read + admin/promo/create, plus the
+/// repo promo/show picker (random unread note, marks promo_read).
+#[tokio::test]
+async fn invite_promo_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_invite_promo").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // first signup = root (moderator gate bypass), second = plain user.
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, "invbob").await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // gate: no credential → 401 CREDENTIAL_REQUIRED.
+    let (s, body) = post_json(app.clone(), "/api/invite/create", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // invite/create → InviteCode shape.
+    let (s, created) =
+        post_json(app.clone(), "/api/invite/create", json!({ "i": bob_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let ticket_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(ticket_id.len(), 10);
+    assert!(created["code"].as_str().unwrap().len() >= 9);
+    assert_eq!(created["expiresAt"], Value::Null);
+    assert_eq!(created["used"], json!(false));
+    assert_eq!(created["usedAt"], Value::Null);
+    assert_eq!(created["createdBy"]["id"], json!(bob_id));
+    assert!(created["createdAt"].is_string());
+
+    // invite/list → the caller's ticket.
+    let (s, list) = post_json(app.clone(), "/api/invite/list", json!({ "i": bob_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(ticket_id))
+        .unwrap();
+    assert_eq!(row["code"], created["code"]);
+
+    // invite/limit → default role inviteLimit 0 → remaining null.
+    let (s, limit) = post_json(app.clone(), "/api/invite/limit", json!({ "i": bob_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {limit}");
+    assert_eq!(limit["remaining"], Value::Null);
+
+    // non-admin → 403 ROLE_PERMISSION_DENIED on the admin arm.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/invite/list",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // admin/invite/create count=2 with an expiresAt string.
+    let (s, created2) = post_json(
+        app.clone(),
+        "/api/admin/invite/create",
+        json!({ "count": 2, "expiresAt": "2100-01-01T00:00:00.000Z", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created2}");
+    let arr = created2.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["expiresAt"], json!("2100-01-01T00:00:00.000Z"));
+    assert!(arr[0]["code"].as_str().unwrap().len() >= 9);
+
+    // invalid date → INVALID_DATE_TIME.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/invite/create",
+        json!({ "count": 1, "expiresAt": "not-a-date", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_DATE_TIME"));
+
+    // admin/invite/list sees all 3 tickets; the type filters agree.
+    let (s, all) = post_json(
+        app.clone(),
+        "/api/admin/invite/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {all}");
+    assert_eq!(all.as_array().unwrap().len(), 3);
+    let (s, unused) = post_json(
+        app.clone(),
+        "/api/admin/invite/list",
+        json!({ "type": "unused", "sort": "+usedAt", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {unused}");
+    assert_eq!(unused.as_array().unwrap().len(), 3);
+    let (s, used) = post_json(
+        app.clone(),
+        "/api/admin/invite/list",
+        json!({ "type": "used", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {used}");
+    assert_eq!(used.as_array().unwrap().len(), 0);
+
+    // promo: bob creates a note; root promotes it.
+    let (_, note) = post_json(
+        app.clone(),
+        "/api/notes/create",
+        json!({ "i": bob_token, "text": "promo me" }),
+    )
+    .await;
+    let note_id = note["createdNote"]["id"].as_str().unwrap().to_string();
+    let expires = 4_102_444_800_000i64; // 2100-01-01T00:00:00Z
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/promo/create",
+        json!({ "noteId": note_id, "expiresAt": expires, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    // duplicate promote → ALREADY_PROMOTED.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/promo/create",
+        json!({ "noteId": note_id, "expiresAt": expires, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_PROMOTED"));
+
+    // admin/promo/list returns the row.
+    let (s, promos) = post_json(
+        app.clone(),
+        "/api/admin/promo/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {promos}");
+    assert!(
+        promos
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["noteId"] == json!(note_id))
+    );
+
+    // promo/show → the note; the second call is null (now read).
+    let (s, shown) = post_json(app.clone(), "/api/promo/show", json!({ "i": bob_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["noteId"], json!(note_id));
+    assert_eq!(shown["userId"], json!(bob_id));
+    assert!(shown["expiresAt"].is_string());
+    let read: bool = mk_db::promo::is_read(&pool, &bob_id, &note_id)
+        .await
+        .unwrap();
+    assert!(read, "promo/show must mark promo_read");
+    let (s, again) = post_json(app.clone(), "/api/promo/show", json!({ "i": bob_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {again}");
+    assert_eq!(again, Value::Null);
+
+    // promo/read is idempotent → 204; unknown note → NO_SUCH_NOTE.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/promo/read",
+        json!({ "noteId": note_id, "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/promo/read",
+        json!({ "noteId": "nonexistentnote", "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_NOTE"));
+}

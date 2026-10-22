@@ -125,6 +125,11 @@ pub mod sw;
 // admin-relays: the `relay` table paths (admin/relays/{list,add,remove};
 // 0001 baseline — id/inbox/status, UNIQUE btree on inbox; no migration)
 pub mod relay;
+// invite-promo: registration_ticket paths (invite/* + admin/invite/*) and
+// promo_note/promo_read paths (promo/read + admin/promo/*); all three tables
+// ship in the 0001 baseline — no migration.
+pub mod invite;
+pub mod promo;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await

@@ -70,6 +70,11 @@ mod flash_more;
 // mk-db/src/gallery.rs (gallery_post/gallery_like tables ship in the 0001
 // baseline).
 mod gallery_more;
+// invite-promo: upstream invite/{create,list,limit} + admin/invite/{create,
+// list} + promo/read + admin/promo/create (plus the repo promo/show picker
+// and admin/promo/list) — db paths in mk-db/src/{invite,promo}.rs; all
+// three tables ship in the 0001 baseline.
+mod invite_promo;
 // pages-agent: the page family (pages/{create,update,delete,show,like,unlike,
 // featured,my,liked}) — db paths in mk-db/src/page.rs (page/page_like tables
 // ship in the 0001 baseline).
@@ -1424,6 +1429,42 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
             .await;
     }
     // ==== END gallery-agent DISPATCH ARM ====
+
+    // ==== invite-promo DISPATCH ARM (invite/* + admin/invite/* + promo/*) ====
+    // Self-contained block on the gallery-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential / requireModerator gates and endpoint bodies in
+    // api::invite_promo (db paths in mk-db/src/{invite,promo}.rs). Sits ahead
+    // of the M0_ENDPOINTS fallthrough (none of these names are M0) and
+    // shadows no earlier arm.
+    if invite_promo::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return invite_promo::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
+    }
+    // ==== END invite-promo DISPATCH ARM ====
 
     // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
     // gallery/posts/create) ====
