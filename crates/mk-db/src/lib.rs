@@ -101,6 +101,9 @@ pub mod social;
 // following-agent: following/invalidate + following/requests/list reads
 // (the create/delete/accept/cancel writes live in social.rs)
 pub mod following;
+// following-agent: following/invalidate + following/requests/list reads
+// (the create/delete/accept/cancel writes live in social.rs)
+pub mod following;
 // arena-api: MiAccessToken rows (api.ts miauth/gen-token mint + the app
 // token scope gate the admin/get-index-stats legs ride)
 pub mod access_token;
