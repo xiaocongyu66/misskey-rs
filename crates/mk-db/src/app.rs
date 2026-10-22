@@ -132,15 +132,13 @@ pub async fn insert_session(
     token: &str,
     app_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"INSERT INTO "auth_session" ("id", "token", "appId") VALUES ($1, $2, $3)"#,
-    )
-    .bind(id)
-    .bind(token)
-    .bind(app_id)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    sqlx::query(r#"INSERT INTO "auth_session" ("id", "token", "appId") VALUES ($1, $2, $3)"#)
+        .bind(id)
+        .bind(token)
+        .bind(app_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 pub async fn find_session_by_token(
@@ -312,11 +310,7 @@ pub async fn list_app_tokens_by_user(
 // i/regenerate-token
 // ---------------------------------------------------------------------------
 
-pub async fn set_user_token(
-    pool: &PgPool,
-    user_id: &str,
-    token: &str,
-) -> Result<(), sqlx::Error> {
+pub async fn set_user_token(pool: &PgPool, user_id: &str, token: &str) -> Result<(), sqlx::Error> {
     sqlx::query(r#"UPDATE "user" SET "token" = $2 WHERE "id" = $1"#)
         .bind(user_id)
         .bind(token)

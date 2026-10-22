@@ -239,21 +239,25 @@ async fn pack_app(
 fn normalize_permission(perms: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in perms {
-        let normalized = if let Some(prefix) = p
-            .strip_suffix("/read")
-            .or_else(|| p.strip_suffix("/write"))
+        let normalized = if let Some(prefix) =
+            p.strip_suffix("/read").or_else(|| p.strip_suffix("/write"))
         {
-            let verb = if p.ends_with("/read") { "read" } else { "write" };
+            let verb = if p.ends_with("/read") {
+                "read"
+            } else {
+                "write"
+            };
             if prefix.is_empty() {
                 p.clone()
             } else {
                 format!("{verb}:{prefix}")
             }
-        } else if let Some(prefix) = p
-            .strip_suffix("-read")
-            .or_else(|| p.strip_suffix("-write"))
-        {
-            let verb = if p.ends_with("-read") { "read" } else { "write" };
+        } else if let Some(prefix) = p.strip_suffix("-read").or_else(|| p.strip_suffix("-write")) {
+            let verb = if p.ends_with("-read") {
+                "read"
+            } else {
+                "write"
+            };
             if prefix.is_empty() {
                 p.clone()
             } else {
@@ -453,11 +457,7 @@ async fn session_generate(
         .await
         .map_err(db_err)?;
     // config.authUrl = `${scheme}://${host}/auth`
-    let url = format!(
-        "{}/auth/{}",
-        state.config.url.trim_end_matches('/'),
-        token
-    );
+    let url = format!("{}/auth/{}", state.config.url.trim_end_matches('/'), token);
     Ok((StatusCode::OK, Json(json!({ "token": token, "url": url }))).into_response())
 }
 
@@ -497,11 +497,14 @@ async fn session_userkey(
     let Some(user) = user else {
         return Err(internal());
     };
-    Ok((StatusCode::OK, Json(json!({
-        "accessToken": access_token,
-        "user": user,
-    })))
-    .into_response())
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "accessToken": access_token,
+            "user": user,
+        })),
+    )
+        .into_response())
 }
 
 async fn auth_accept(
@@ -558,9 +561,7 @@ async fn regenerate_token(
 ) -> Check<Response> {
     let me = super::social::require_checked_user(pool, token, credential_declared).await?;
     let password = req_str(body, "password")?;
-    let profile = mk_db::user::find_profile(pool, &me)
-        .await
-        .map_err(db_err)?;
+    let profile = mk_db::user::find_profile(pool, &me).await.map_err(db_err)?;
     // bcrypt.compare against a NULL hash throws upstream.
     let Some(hash) = profile.password.as_deref() else {
         return Err(internal());
@@ -587,13 +588,14 @@ async fn change_password(
     let current = req_str(body, "currentPassword")?;
     let new_password = req_str(body, "newPassword")?;
     if new_password.is_empty() {
-        return Err(invalid_param("newPassword", "must NOT have fewer than 1 characters"));
+        return Err(invalid_param(
+            "newPassword",
+            "must NOT have fewer than 1 characters",
+        ));
     }
     let two_factor_token = opt_str(body, "token")?;
 
-    let profile = mk_db::user::find_profile(pool, &me)
-        .await
-        .map_err(db_err)?;
+    let profile = mk_db::user::find_profile(pool, &me).await.map_err(db_err)?;
     if profile.two_factor_enabled {
         let Some(t) = two_factor_token.as_deref() else {
             return Err(internal());
