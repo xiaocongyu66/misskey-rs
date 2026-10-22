@@ -22348,6 +22348,166 @@ async fn chat_react_search_roundtrip() {
     assert_eq!(a_id, alice["id"].as_str().unwrap());
 }
 
+// app/create → app/show → my/apps, then auth/session/generate → accept →
+// userkey (access-token mint), i/apps, and the password-gated
+// i/change-password / i/regenerate-token pair.
+#[tokio::test]
+async fn app_auth_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapp_auth").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let username = format!("appuser{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &username).await;
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let at = alice["token"].as_str().unwrap().to_string();
+
+    // app/create — guest-ok, permission aliases normalized + deduped.
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/app/create",
+        json!({
+            "name": "test app",
+            "description": "desc",
+            "permission": ["read:account", "account/write", "account/write"],
+            "callbackUrl": "https://example.com/cb",
+            "i": at,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {created}");
+    let app_id = created["id"].as_str().unwrap().to_string();
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert_eq!(created["name"], json!("test app"));
+    assert_eq!(
+        created["permission"],
+        json!(["read:account", "write:account"])
+    );
+    assert!(created.get("isAuthorized").is_none());
+
+    // app/show as owner exposes secret; guest does not.
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/app/show",
+        json!({ "appId": app_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["secret"], json!(secret));
+    assert_eq!(shown["isAuthorized"], json!(false));
+    let (s, guest) = post_json(
+        app.clone(),
+        "/api/app/show",
+        json!({ "appId": app_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(guest.get("secret").is_none());
+    assert!(guest.get("isAuthorized").is_none());
+    let (s, missing) = post_json(
+        app.clone(),
+        "/api/app/show",
+        json!({ "appId": "nosuchappid" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {missing}");
+    assert_eq!(missing["error"]["code"], json!("NO_SUCH_APP"));
+
+    // my/apps lists the app without the secret.
+    let (s, mine) = post_json(app.clone(), "/api/my/apps", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    let mine = mine.as_array().unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0]["id"], json!(app_id));
+    assert!(mine[0].get("secret").is_none());
+    assert_eq!(mine[0]["isAuthorized"], json!(false));
+
+    // auth/session/generate → accept (native token) → userkey.
+    let (s, generated) = post_json(
+        app.clone(),
+        "/api/auth/session/generate",
+        json!({ "appSecret": secret }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {generated}");
+    let session_token = generated["token"].as_str().unwrap().to_string();
+    assert!(generated["url"].as_str().unwrap().ends_with(&session_token));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/auth/accept",
+        json!({ "token": session_token, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "accept");
+    let (s, userkey) = post_json(
+        app.clone(),
+        "/api/auth/session/userkey",
+        json!({ "appSecret": secret, "token": session_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {userkey}");
+    assert!(userkey["accessToken"].as_str().is_some());
+    assert_eq!(userkey["user"]["id"], json!(alice_id));
+    // the handshake consumes the session
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/auth/session/userkey",
+        json!({ "appSecret": secret, "token": session_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // isAuthorized flips + i/apps lists the minted access token.
+    let (s, mine) = post_json(app.clone(), "/api/my/apps", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(mine.as_array().unwrap()[0]["isAuthorized"], json!(true));
+    let (s, iapps) = post_json(app.clone(), "/api/i/apps", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {iapps}");
+    let iapps = iapps.as_array().unwrap();
+    assert_eq!(iapps.len(), 1);
+    assert_eq!(
+        iapps[0]["permission"],
+        json!(["read:account", "write:account"])
+    );
+    assert_eq!(iapps[0]["name"], json!("test app"));
+
+    // change-password: wrong current → 500; correct → 204.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/change-password",
+        json!({ "currentPassword": "wrong", "newPassword": "test2", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "wrong password");
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/change-password",
+        json!({ "currentPassword": "test", "newPassword": "test2", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "change-password");
+
+    // regenerate-token verifies the new password, then rotates the token.
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/regenerate-token",
+        json!({ "password": "test", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "old password rejected");
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/regenerate-token",
+        json!({ "password": "test2", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "regenerate");
+    let (s, _) = post_json(app.clone(), "/api/my/apps", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "old token revoked");
+}
+
 /// `admin/captcha/*` + `admin/unset-user-{avatar,banner}` +
 /// `admin/update-user-note`: captcha save→current round-trip (none +
 /// testcaptcha), avatar/banner clearing (including the null-id early return),

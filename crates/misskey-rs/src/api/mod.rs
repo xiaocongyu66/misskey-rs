@@ -214,6 +214,10 @@ mod hashtags;
 // paths in mk-db/src/auth.rs — auth_session + app ship in the 0001 baseline).
 // session/userkey + accept stay out (app-secret / OAuth consent handshake).
 mod auth_more;
+// app-auth: app/* + my/apps + i/apps + auth/session/{generate,userkey} +
+// auth/accept + i/regenerate-token + i/change-password (SQL in
+// mk-db/src/app.rs; app/auth_session/access_token ship in the 0001 baseline).
+mod app_auth;
 
 /// Endpoints that accept GET (upstream `meta.allowGet`) with `cacheSec`.
 const GET_ALLOWED: &[(&str, u64)] = &[
@@ -1859,6 +1863,41 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return auth_more::handle(&state, name.as_str(), &body, token.as_deref()).await;
     }
     // ==== END auth DISPATCH ARM ====
+
+    // ==== app-auth DISPATCH ARM ====
+    // Names: app/create, app/show, my/apps, i/apps,
+    // auth/session/generate, auth/session/userkey, auth/accept,
+    // i/regenerate-token, i/change-password. Method check, body parsing and
+    // the credential-declared probe live here; the guest-ok / requireCredential
+    // / secure gates and endpoint bodies live in api::app_auth (SQL in
+    // mk-db/src/app.rs). Sits ahead of the M0_ENDPOINTS fallthrough and
+    // shadows no earlier arm (auth_more owns only auth/session/show).
+    if app_auth::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return app_auth::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END app-auth DISPATCH ARM ====
 
     // ==== retention-export DISPATCH ARM (export-custom-emojis) ====
     // retention itself rides the M0 read block below (guest-ok + allowGet);

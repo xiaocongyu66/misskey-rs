@@ -6,6 +6,11 @@ use sqlx::postgres::PgPoolOptions;
 
 pub use sqlx;
 
+// app-auth: `app` / `auth_session` / app-scoped `access_token` paths
+// (app/*, my/apps, i/apps, auth/session/*, auth/accept, i/regenerate-token,
+// i/change-password; all three tables ship in the 0001 baseline).
+pub mod app;
+
 pub mod admin;
 // admin-abuse: the admin/abuse-* family paths (report list filters + resolve
 // resolvedAs + forward, and the notification-recipient CRUD) over the 0001
