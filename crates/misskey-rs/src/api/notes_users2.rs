@@ -94,9 +94,7 @@ fn created_at(id: &str) -> String {
 
 fn id_param<'a>(body: &'a Value, key: &str) -> Result<&'a str, Response> {
     match body.get(key) {
-        Some(Value::String(s))
-            if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
+        Some(Value::String(s)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
             Ok(s.as_str())
         }
         _ => Err(schema_invalid(key, "must be a misskey:id (alnum)")),
@@ -259,10 +257,7 @@ async fn notes_clips(
 // notes/show-partial-bulk — minimal packs for up to 100 note ids
 // ---------------------------------------------------------------------------
 
-async fn notes_show_partial_bulk(
-    pool: &mk_db::sqlx::PgPool,
-    body: &Value,
-) -> Check<Response> {
+async fn notes_show_partial_bulk(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
     let note_ids = note_ids_param(body)?;
     let mut out = Vec::with_capacity(note_ids.len());
     for note_id in note_ids {

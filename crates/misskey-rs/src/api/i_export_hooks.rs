@@ -47,14 +47,7 @@ pub(crate) fn handles(name: &str) -> bool {
 
 /// upstream `models/Webhook.ts` `webhookEventTypes`.
 const WEBHOOK_EVENT_TYPES: &[&str] = &[
-    "mention",
-    "unfollow",
-    "follow",
-    "followed",
-    "note",
-    "reply",
-    "renote",
-    "reaction",
+    "mention", "unfollow", "follow", "followed", "note", "reply", "renote", "reaction",
 ];
 
 /// RoleService `getDefaultPolicies().webhookLimit`.
@@ -71,11 +64,16 @@ pub(crate) async fn handle(
     let Some(pool) = &state.pool else {
         return api_err(ApiError::internal_error());
     };
-    let me_id =
-        match super::social::require_checked_user(pool, token.as_deref(), credential_declared).await {
-            Ok(id) => id,
-            Err(resp) => return resp,
-        };
+    let me_id = match super::social::require_checked_user(
+        pool,
+        token.as_deref(),
+        credential_declared,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
     let result: Check<Response> = match name {
         "i/export-antennas" => export_antennas(pool, &me_id).await,
         "i/export-notes" => export_notes(pool, &me_id).await,
@@ -208,9 +206,7 @@ async fn find_webhook(
     webhook_id: &str,
     user_id: &str,
 ) -> Result<Option<WebhookRow>, mk_db::sqlx::Error> {
-    let sql = format!(
-        r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "id" = $1 AND "userId" = $2"#
-    );
+    let sql = format!(r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "id" = $1 AND "userId" = $2"#);
     mk_db::sqlx::query_as::<_, WebhookRow>(&sql)
         .bind(webhook_id)
         .bind(user_id)
@@ -283,11 +279,7 @@ fn parse_on(body: &Value, required: bool) -> Result<Option<Vec<String>>, Respons
     }
 }
 
-async fn webhook_create(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn webhook_create(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let name = parse_name(body)?;
     let url = parse_url(body)?;
     let secret = parse_secret(body, true)?.unwrap_or_default();
@@ -330,11 +322,7 @@ async fn webhook_create(
     Ok(ok_json(pack_webhook(&row)))
 }
 
-async fn webhook_delete(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn webhook_delete(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let webhook_id = required_webhook_id(body)?;
     let Some(row) = find_webhook(pool, &webhook_id, me_id)
         .await
@@ -351,7 +339,8 @@ async fn webhook_delete(
 }
 
 async fn webhook_list(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response> {
-    let sql = format!(r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "userId" = $1 ORDER BY "id" ASC"#);
+    let sql =
+        format!(r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "userId" = $1 ORDER BY "id" ASC"#);
     let rows = mk_db::sqlx::query_as::<_, WebhookRow>(&sql)
         .bind(me_id)
         .fetch_all(pool)
@@ -361,11 +350,7 @@ async fn webhook_list(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response
     Ok(ok_json(json!(out)))
 }
 
-async fn webhook_show(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn webhook_show(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let webhook_id = required_webhook_id(body)?;
     let Some(row) = find_webhook(pool, &webhook_id, me_id)
         .await
@@ -376,11 +361,7 @@ async fn webhook_show(
     Ok(ok_json(pack_webhook(&row)))
 }
 
-async fn webhook_update(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn webhook_update(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let webhook_id = required_webhook_id(body)?;
     let Some(row) = find_webhook(pool, &webhook_id, me_id)
         .await
@@ -421,11 +402,7 @@ async fn webhook_update(
     Ok(ok_empty())
 }
 
-async fn webhook_test(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn webhook_test(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let webhook_id = required_webhook_id(body)?;
     let event_type = match body.get("type").and_then(|v| v.as_str()) {
         Some(t) if WEBHOOK_EVENT_TYPES.contains(&t) => t.to_string(),

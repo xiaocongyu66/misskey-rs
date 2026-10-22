@@ -22940,7 +22940,12 @@ async fn notes_clips_lists_public_clips_containing_note() {
     assert_eq!(s, StatusCode::NO_CONTENT);
 
     // guest-ok: returns the public clip, no me-gated keys
-    let (s, out) = post_json(app.clone(), "/api/notes/clips", json!({ "noteId": note_id })).await;
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/notes/clips",
+        json!({ "noteId": note_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "notes/clips: {out}");
     let arr = out.as_array().unwrap();
     assert_eq!(arr.len(), 1, "notes/clips: {out}");
@@ -22949,7 +22954,11 @@ async fn notes_clips_lists_public_clips_containing_note() {
 
     let (s, e) = post_json(app, "/api/notes/clips", json!({ "noteId": "xxxxxx" })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "missing note: {e}");
-    assert_eq!(e["error"]["code"], json!("NO_SUCH_NOTE"), "missing note: {e}");
+    assert_eq!(
+        e["error"]["code"],
+        json!("NO_SUCH_NOTE"),
+        "missing note: {e}"
+    );
 }
 
 #[tokio::test]
@@ -23069,7 +23078,12 @@ async fn users_gallery_posts_lists_posts_of_user() {
     assert_eq!(s, StatusCode::OK, "gallery create: {gv}");
     let post_id = gv["id"].as_str().unwrap().to_string();
 
-    let (s, out) = post_json(app, "/api/users/gallery/posts", json!({ "userId": user_id })).await;
+    let (s, out) = post_json(
+        app,
+        "/api/users/gallery/posts",
+        json!({ "userId": user_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "gallery posts: {out}");
     let arr = out.as_array().unwrap();
     assert_eq!(arr.len(), 1, "gallery posts: {out}");

@@ -1462,7 +1462,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
                 }
             }
         }
-        return notes_users2::handle(&state, name.as_str(), &body, token, credential_declared).await;
+        return notes_users2::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
     }
     // ==== END notes-users2 DISPATCH ARM ====
 
@@ -1855,14 +1856,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
                 .map(|h| h.starts_with("Bearer "))
                 .unwrap_or(false);
         let token = extract_token(&body, &headers);
-        return i_export_hooks::handle(
-            &state,
-            name.as_str(),
-            &body,
-            token,
-            credential_declared,
-        )
-        .await;
+        return i_export_hooks::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
     }
     // ==== END i-export-hooks DISPATCH ARM ====
 

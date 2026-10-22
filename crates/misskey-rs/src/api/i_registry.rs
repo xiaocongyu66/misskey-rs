@@ -353,10 +353,7 @@ async fn registry_keys_with_type(
     Ok(ok_json(Value::Object(out)))
 }
 
-async fn registry_scopes_with_domain(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-) -> Check<Response> {
+async fn registry_scopes_with_domain(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response> {
     let rows = mk_db::registry::scopes_with_domain(pool, me_id)
         .await
         .map_err(|e| db_err("i/registry/scopes-with-domain", e))?;
