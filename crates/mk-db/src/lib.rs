@@ -7,6 +7,11 @@ use sqlx::postgres::PgPoolOptions;
 pub use sqlx;
 
 pub mod admin;
+// admin-abuse: the admin/abuse-* family paths (report list filters + resolve
+// resolvedAs + forward, and the notification-recipient CRUD) over the 0001
+// baseline tables; the synalio webhook plane keeps its minimal queries in
+// webhook.rs.
+pub mod abuse;
 // antennas-v2: antennas/* domain (antenna CRUD plane from the 0001 baseline +
 // the 0004 antenna_note fanout projection; checkHitAntenna ladder + the
 // antennas/notes feed page over the shared lists.rs fragment set)
@@ -67,6 +72,10 @@ pub mod move_account;
 // ff-visibility arena: users/followers + users/following list edges + the
 // meta."federation" patch/read the AP collections gate consumes
 pub mod ff_visibility;
+// federation/* domain: instance list/show/stats + host-filtered
+// followers/following/users reads (upstream endpoints/federation/*.ts; the
+// AP-fetch `update-remote-user` lane is out of scope)
+pub mod federation;
 // ul-tl-agent: users/lists/* + notes/user-list-timeline domain (user_list /
 // user_list_membership tables ship in the 0001 baseline)
 pub mod lists;
@@ -89,6 +98,9 @@ pub mod roles_lite;
 pub mod roles;
 // social-agent: social-graph writes (follow/mute/block/renote)
 pub mod social;
+// following-agent: following/invalidate + following/requests/list reads
+// (the create/delete/accept/cancel writes live in social.rs)
+pub mod following;
 // arena-api: MiAccessToken rows (api.ts miauth/gen-token mint + the app
 // token scope gate the admin/get-index-stats legs ride)
 pub mod access_token;

@@ -180,7 +180,8 @@ fn handler_internal_error() -> Response {
 // ff-arena: pub(crate) so api/ff_vis.rs can run the shared requireAdmin gate
 // for its admin/update-meta federation persistence arm.
 pub(crate) struct AdminCtx {
-    me: mk_db::user::LocalUserRow,
+    // admin-abuse: pub(crate) so the abuse endpoints can stamp assigneeId.
+    pub(crate) me: mk_db::user::LocalUserRow,
     /// RoleService.isAdministrator(me) — used by show-user's admin-view gate.
     is_admin: bool,
     /// arena-api: the access_token scope list when the credential was an

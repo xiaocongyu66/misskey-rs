@@ -24,7 +24,9 @@ use crate::error::{ApiError, api_err};
 /// degrades to the base policy and reports isSilenced: false for silenced
 /// users, failing the get-frequently-replied-users サイレンス case), then the
 /// users/show memo pass and the me-view role-compat post-passes.
-async fn pack_user_detailed(
+// admin-abuse: pub(crate) so api/admin_abuse.rs packs the report
+// reporter/targetUser/assignee as UserDetailedNotMe (upstream admin schema).
+pub(crate) async fn pack_user_detailed(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     user_id: &str,
