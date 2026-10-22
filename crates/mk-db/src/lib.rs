@@ -130,6 +130,12 @@ pub mod relay;
 // ship in the 0001 baseline — no migration.
 pub mod invite;
 pub mod promo;
+// i-registry arena: registry_item paths behind i/registry/* (key stored
+// `/`-joined, scope varchar[]; 0001 baseline — no migration)
+pub mod registry;
+// i-registry arena: signin rows behind i/signin-history (0001 baseline —
+// no migration; createdAt derived from the AID id)
+pub mod signin;
 // hashtags arena: hashtag counter reads + `__chart__hashtag` trend fallback
 // (both tables ship in the 0001 baseline — no migration)
 pub mod hashtag;

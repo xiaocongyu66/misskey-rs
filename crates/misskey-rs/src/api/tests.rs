@@ -21157,3 +21157,97 @@ async fn admin_stats_reads_roundtrip() {
         "non-admin: {denied}"
     );
 }
+
+// i/registry/*: set → get → get-detail → get-all/keys → remove subtree →
+// get 204 (upstream endpoints/i/registry/*.ts over registry_item) plus
+// i/signin-history listing a seeded signin row (id DESC; createdAt from the
+// AID id).
+#[tokio::test]
+async fn i_registry_and_signin_history_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_registry").await;
+    let username = format!("ireg{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+    let signed = signup(&app, &username).await;
+    let token = signed["token"].as_str().unwrap().to_string();
+    let me_id = resolve_me(&pool, Some(&token)).await.unwrap();
+
+    // set → 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/registry/set",
+        json!({ "key": ["a", "b"], "value": { "x": 1 }, "scope": "client", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "set: {body}");
+
+    // get → the nested registry value.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/registry/get",
+        json!({ "key": ["a", "b"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get: {body}");
+    assert_eq!(body, json!({ "x": 1 }));
+
+    // get-detail → the item + its scopes.
+    let (s, detail) = post_json(
+        app.clone(),
+        "/api/i/registry/get-detail",
+        json!({ "key": ["a", "b"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get-detail: {detail}");
+    assert_eq!(
+        detail["item"]["value"],
+        json!({ "x": 1 }),
+        "detail: {detail}"
+    );
+    assert_eq!(detail["scopes"], json!([["client"]]), "detail: {detail}");
+
+    // get-all folds the `/`-joined keys; keys returns the split arrays.
+    let (s, all) = post_json(
+        app.clone(),
+        "/api/i/registry/get-all",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get-all: {all}");
+    assert_eq!(all, json!({ "a": { "b": { "x": 1 } } }));
+    let (s, keys) = post_json(app.clone(), "/api/i/registry/keys", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "keys: {keys}");
+    assert_eq!(keys, json!([["a", "b"]]));
+
+    // remove the ["a"] subtree → get returns 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/registry/remove",
+        json!({ "key": ["a"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "remove: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/registry/get",
+        json!({ "key": ["a", "b"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "get after remove: {body}");
+
+    // signin-history lists the seeded row.
+    let signin_id = mk_types::id::gen_aid_now();
+    mk_db::user::insert_signin(&pool, &signin_id, &me_id, "203.0.113.7", true)
+        .await
+        .unwrap();
+    let (s, history) = post_json(app.clone(), "/api/i/signin-history", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "signin-history: {history}");
+    let rows = history.as_array().expect("signin array");
+    assert_eq!(rows.len(), 1, "signin-history: {history}");
+    assert_eq!(rows[0]["id"], json!(signin_id));
+    assert_eq!(rows[0]["ip"], json!("203.0.113.7"));
+    assert!(rows[0]["createdAt"].is_string(), "createdAt: {history}");
+}
