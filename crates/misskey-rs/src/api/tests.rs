@@ -21407,6 +21407,97 @@ async fn i_registry_and_signin_history_roundtrip() {
     assert!(rows[0]["createdAt"].is_string(), "createdAt: {history}");
 }
 
+// i/registry/keys-with-type + scopes-with-domain: seeded rows across every
+// JSON value type and across domains (upstream endpoints/i/registry/
+// {keys-with-type,scopes-with-domain}.ts over registry_item).
+#[tokio::test]
+async fn i_registry_keys_with_type_and_scopes_with_domain() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_registry2").await;
+    let username = format!("ireg2{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+    let signed = signup(&app, &username).await;
+    let token = signed["token"].as_str().unwrap().to_string();
+    let me_id = resolve_me(&pool, Some(&token)).await.unwrap();
+
+    // One row per JSON value type in scope ['client'] (domain NULL), plus a
+    // number row scoped to a domain.
+    let rows: [(&str, &str, Option<&str>); 7] = [
+        ("n", "1", None),
+        ("s", "\"x\"", None),
+        ("b", "true", None),
+        ("arr", "[1]", None),
+        ("obj", "{}", None),
+        ("nil", "null", None),
+        ("d", "2", Some("example.com")),
+    ];
+    for (key, value, domain) in rows {
+        let id = mk_types::id::gen_aid_now();
+        mk_db::sqlx::query(
+            r#"INSERT INTO "registry_item"
+               ("id","updatedAt","userId","key","scope","domain","value")
+               VALUES ($1, now(), $2, $3, ARRAY['client']::varchar[], $4, $5::jsonb)"#,
+        )
+        .bind(&id)
+        .bind(&me_id)
+        .bind(key)
+        .bind(domain)
+        .bind(value)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // keys-with-type → typeof labels, domain NULL only.
+    let (s, types) = post_json(
+        app.clone(),
+        "/api/i/registry/keys-with-type",
+        json!({ "scope": ["client"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "keys-with-type: {types}");
+    assert_eq!(
+        types,
+        json!({
+            "n": "number",
+            "s": "string",
+            "b": "boolean",
+            "arr": "array",
+            "obj": "object",
+            "nil": "null",
+        })
+    );
+
+    // keys-with-type + domain filter.
+    let (s, typed) = post_json(
+        app.clone(),
+        "/api/i/registry/keys-with-type",
+        json!({ "scope": ["client"], "domain": "example.com", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "keys-with-type domain: {typed}");
+    assert_eq!(typed, json!({ "d": "number" }));
+
+    // scopes-with-domain → one group per domain (NULL first).
+    let (s, scopes) = post_json(
+        app.clone(),
+        "/api/i/registry/scopes-with-domain",
+        json!({ "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scopes-with-domain: {scopes}");
+    assert_eq!(
+        scopes,
+        json!([
+            { "domain": null, "scopes": [["client"]] },
+            { "domain": "example.com", "scopes": [["client"]] },
+        ])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // fetch/proxy endpoints (fetch-rss / fetch-external-resources / page-push)
 // ---------------------------------------------------------------------------

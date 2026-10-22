@@ -1,5 +1,6 @@
 //! `i/registry/*` + `i/signin-history` — ports of
-//! `endpoints/i/registry/{get,set,remove,get-all,get-detail,keys}.ts` and
+//! `endpoints/i/registry/{get,set,remove,get-all,get-detail,keys,
+//! keys-with-type,scopes-with-domain}.ts` and
 //! `endpoints/i/signin-history.ts` (via `core/RegistryApiService.ts`).
 //!
 //! All names are `requireCredential: true` (`kind: read:account` /
@@ -17,7 +18,10 @@
 //! RESPONSES: `get` → the stored JSON value, or 204 when absent;
 //! `get-all` → the nested object rebuilt from the `/`-joined keys;
 //! `get-detail` → `{ item: <row>, scopes: string[][] }` (all scopes that hold
-//! the key); `keys` → `string[][]`; `set`/`remove` → 204. `signin-history`
+//! the key); `keys` → `string[][]`; `set`/`remove` → 204.
+//! `keys-with-type` → `{ <key>: type }` for the requested scope + domain
+//! (upstream `typeof` labels); `scopes-with-domain` → `[{ domain, scopes }]`
+//! grouped over every row the caller owns. `signin-history`
 //! pages the caller's `signin` rows id DESC with the standard
 //! `limit`/`sinceId`/`untilId` shape; the row's createdAt is derived from the
 //! AID id (the 0001 table has no createdAt column).
@@ -37,6 +41,8 @@ pub(crate) const ENDPOINTS: &[&str] = &[
     "i/registry/get-all",
     "i/registry/get-detail",
     "i/registry/keys",
+    "i/registry/keys-with-type",
+    "i/registry/scopes-with-domain",
     "i/signin-history",
 ];
 
@@ -64,6 +70,8 @@ pub(crate) async fn handle(
             "i/registry/get-all" => registry_get_all(pool, &me_id, body).await,
             "i/registry/get-detail" => registry_get_detail(pool, &me_id, body).await,
             "i/registry/keys" => registry_keys(pool, &me_id, body).await,
+            "i/registry/keys-with-type" => registry_keys_with_type(pool, &me_id, body).await,
+            "i/registry/scopes-with-domain" => registry_scopes_with_domain(pool, &me_id).await,
             "i/signin-history" => signin_history(pool, &me_id, body).await,
             _ => Ok(api_err(ApiError::unknown_endpoint())),
         }
@@ -285,6 +293,90 @@ async fn registry_keys(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) ->
     let out: Vec<Value> = keys
         .iter()
         .map(|k| json!(k.split('/').collect::<Vec<_>>()))
+        .collect();
+    Ok(ok_json(json!(out)))
+}
+
+/// `keys-with-type` scope: upstream pattern `^[a-zA-Z0-9_]+$`, default `[]`
+/// (unlike the other registry reads, it does not default to `['client']`).
+fn scope_any_param(body: &Value) -> Result<Vec<String>, Response> {
+    match body.get("scope") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => scope_any_one(s).map(|s| vec![s]),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(scope_any_one(s)?),
+                    None => return Err(invalid_param("scope", "expected a string array")),
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(invalid_param("scope", "expected a string or string array")),
+    }
+}
+
+fn scope_any_one(s: &str) -> Result<String, Response> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(invalid_param("scope", "must match ^[a-zA-Z0-9_]+$"));
+    }
+    Ok(s.to_string())
+}
+
+/// JSON value → the upstream `typeof`-style type label.
+fn value_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Array(_) => "array",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Bool(_) => "boolean",
+        Value::Object(_) => "object",
+    }
+}
+
+async fn registry_keys_with_type(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+    body: &Value,
+) -> Check<Response> {
+    let scope = scope_any_param(body)?;
+    let domain = opt_id_param(body, "domain")?;
+    let rows = mk_db::registry::keys_with_type(pool, me_id, domain.as_deref(), &scope)
+        .await
+        .map_err(|e| db_err("i/registry/keys-with-type", e))?;
+    let mut out = serde_json::Map::with_capacity(rows.len());
+    for (key, value) in rows {
+        out.insert(key, json!(value_type(&value)));
+    }
+    Ok(ok_json(Value::Object(out)))
+}
+
+async fn registry_scopes_with_domain(
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+) -> Check<Response> {
+    let rows = mk_db::registry::scopes_with_domain(pool, me_id)
+        .await
+        .map_err(|e| db_err("i/registry/scopes-with-domain", e))?;
+    let mut grouped: Vec<(Option<String>, Vec<Vec<String>>)> = Vec::new();
+    for (scope, domain) in rows {
+        match grouped
+            .iter_mut()
+            .find(|(d, _)| d.as_deref() == domain.as_deref())
+        {
+            Some((_, scopes)) => {
+                if !scopes.iter().any(|s| s.join(".") == scope.join(".")) {
+                    scopes.push(scope);
+                }
+            }
+            None => grouped.push((domain, vec![scope])),
+        }
+    }
+    let out: Vec<Value> = grouped
+        .into_iter()
+        .map(|(domain, scopes)| json!({ "domain": domain, "scopes": scopes }))
         .collect();
     Ok(ok_json(json!(out)))
 }

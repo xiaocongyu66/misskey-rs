@@ -139,6 +139,43 @@ pub async fn keys(
     .await
 }
 
+/// `i/registry/keys-with-type` — (key, value) rows in the scope, filtered by
+/// domain (`NULL` matches the rows with no domain, per upstream
+/// `getAllItemsOfScope`).
+pub async fn keys_with_type(
+    pool: &PgPool,
+    user_id: &str,
+    domain: Option<&str>,
+    scope: &[String],
+) -> Result<Vec<(String, Value)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Value)>(
+        r#"SELECT "key", "value" FROM "registry_item"
+           WHERE "userId" = $1 AND "domain" IS NOT DISTINCT FROM $2::varchar
+             AND "scope" = $3::varchar[] ORDER BY "key" ASC"#,
+    )
+    .bind(user_id)
+    .bind(domain)
+    .bind(scope)
+    .fetch_all(pool)
+    .await
+}
+
+/// `i/registry/scopes-with-domain` — every (scope, domain) pair the caller
+/// owns; the handler folds them into `{ domain, scopes }` groups (upstream
+/// `getAllScopeAndDomains`).
+pub async fn scopes_with_domain(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<(Vec<String>, Option<String>)>, sqlx::Error> {
+    sqlx::query_as::<_, (Vec<String>, Option<String>)>(
+        r#"SELECT "scope", "domain" FROM "registry_item"
+           WHERE "userId" = $1 ORDER BY "domain" ASC NULLS FIRST, "scope" ASC"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// `i/registry/get-detail` — every scope row for the key (upstream filters by
 /// userId + key only, so the response can report all scopes). `to_jsonb`
 /// yields the entity columns under their schema (camelCase) names.
