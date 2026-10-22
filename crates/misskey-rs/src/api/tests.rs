@@ -21591,3 +21591,147 @@ async fn export_custom_emojis_zip_meta_and_gates() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "bad format: {body}");
     assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
 }
+
+// arena-games tail (upstream endpoints/reversi/{create,join,show,games,match,
+// cancel}.ts + bubble-game/register.ts at the in-process api::games lane) ====
+
+/// create → show → join → cancel over the process-wide game map, plus the
+/// `{ gameId }` pairing shape of reversi/match and the open-games listing.
+#[tokio::test]
+async fn arena_games_reversi_in_process_lane() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkgames_a").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("gma")).await;
+    let bob = signup(&app, &uname("gmb")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bt = bob["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // create (settings? → the packed game; user1 = creator, open seat)
+    let (s, g) = post_json(
+        app.clone(),
+        "/api/reversi/create",
+        json!({ "i": at, "settings": { "bw": "1", "noIrregularRules": true } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {g}");
+    assert_eq!(g["user1Id"], alice_id);
+    assert_eq!(g["user2Id"], Value::Null);
+    assert_eq!(g["isStarted"], json!(false));
+    assert_eq!(g["bw"], json!("1"));
+    assert_eq!(g["noIrregularRules"], json!(true));
+    assert_eq!(g["map"].as_array().unwrap().len(), 8);
+    let game_id = g["id"].as_str().unwrap().to_string();
+
+    // games (my) lists the still-open game
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/reversi/games",
+        json!({ "i": at, "my": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"].as_str() == Some(game_id.as_str())),
+        "open game listed: {list}"
+    );
+
+    // show is open (no credential) and returns the pack
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/reversi/show",
+        json!({ "gameId": game_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["id"], game_id);
+    assert_eq!(shown["user1Id"], alice_id);
+
+    // join seats bob as user2 and starts the game
+    let (s, joined) = post_json(
+        app.clone(),
+        "/api/reversi/join",
+        json!({ "i": bt, "gameId": game_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {joined}");
+    assert_eq!(joined["user2Id"], bob_id);
+    assert_eq!(joined["isStarted"], json!(true));
+
+    // match { gameId } returns the pairing info
+    let (s, pairing) = post_json(
+        app.clone(),
+        "/api/reversi/match",
+        json!({ "i": at, "gameId": game_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {pairing}");
+    assert_eq!(pairing["user1Id"], alice_id);
+    assert_eq!(pairing["user2Id"], bob_id);
+    assert_eq!(pairing["game"]["id"], game_id);
+
+    // cancel drops the game → show rides NO_SUCH_GAME
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/reversi/cancel",
+        json!({ "i": at, "gameId": game_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/reversi/show",
+        json!({ "gameId": game_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_GAME"));
+    assert_eq!(
+        body["error"]["id"],
+        json!("f13a03db-fae1-46c9-87f3-43c8165419e1")
+    );
+}
+
+/// bubble-game/register stores the simple score record and echoes { score }.
+#[tokio::test]
+async fn arena_games_bubble_register_lane() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkgames_b").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &format!("gba{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let seed = crate::api::now_ms().to_string();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/bubble-game/register",
+        json!({ "i": at, "score": 42, "seed": seed, "logs": [[0, 1, 2]] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["score"], json!(42));
+
+    // missing credential rides the shared CREDENTIAL_REQUIRED envelope
+    let (s, body) = post_json(
+        app,
+        "/api/bubble-game/register",
+        json!({ "score": 1, "seed": seed, "logs": [] }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}

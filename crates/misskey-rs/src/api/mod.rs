@@ -134,6 +134,13 @@ mod antennas;
 // reversi-game.ts census) — db paths in mk-db/src/reversi.rs (reversi_game +
 // reversi_matching ship in the 0001 baseline, no 0007).
 mod reversi;
+// game-arena: the in-process reversi + bubble-game plane (upstream
+// endpoints/reversi/{games,create,join,show,match,cancel}.ts +
+// bubble-game/register.ts). Games/scores live in process-wide maps
+// (single-instance, lost on restart — see the module header); no SSE push.
+// The arm sits ahead of the arena-reversi arm and delegates legacy
+// `reversi/match {userId}` bodies back to api::reversi.
+mod games;
 // ftt2: the FTT Redis push pipeline (NoteCreateService.pushToTl +
 // FanoutTimelineService.push; the timelines.ts `FTT:` probes read
 // `list:homeTimeline:*` Redis lists literally).
@@ -746,6 +753,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return two_factor::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END two-factor DISPATCH ARM ====
+
+    // ==== game-arena DISPATCH ARM (in-process reversi + bubble-game) ====
+    // Method check, body parsing and token extraction live in the arm; the
+    // credential gates + endpoint bodies in api::games (process-wide game
+    // store, single-instance only). Sits AHEAD of the arena-reversi arm so
+    // reversi/games + the `{ gameId }` shape of reversi/match resolve here;
+    // legacy `{ userId }` match bodies delegate back to api::reversi.
+    if games::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return games::handle(&state, name.as_str(), &body, token).await;
+    }
+    // ==== END game-arena DISPATCH ARM ====
 
     // ==== arena-reversi DISPATCH ARM (reversi/*) ====
     // Self-contained block on the two-factor-arm pattern (census rn39315268103:
