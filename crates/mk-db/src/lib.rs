@@ -69,6 +69,8 @@ pub mod memo;
 pub mod meta;
 pub mod note;
 pub mod notification;
+// pages-agent: page + page_like (endpoints/pages/*; 0001 baseline)
+pub mod page;
 // note-agent: poll + poll_vote (notes/create poll param + notes/polls/vote)
 pub mod pin;
 pub mod poll;

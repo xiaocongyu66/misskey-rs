@@ -62,6 +62,10 @@ mod clips;
 // show,my,my-likes,like,unlike,featured,search}) — db paths in
 // mk-db/src/flash.rs (flash/flash_like tables ship in the 0001 baseline).
 mod flash_more;
+// pages-agent: the page family (pages/{create,update,delete,show,like,unlike,
+// featured,my,liked}) — db paths in mk-db/src/page.rs (page/page_like tables
+// ship in the 0001 baseline).
+mod pages_more;
 // i-more-agent: i/* remainder slice 1 (i/favorites, i/gallery/likes,
 // i/pages/likes) — db paths inline in api/i_more.rs (tables ship in 0001).
 mod i_more;
@@ -1190,6 +1194,42 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return flash_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END flash-agent DISPATCH ARM ====
+
+    // ==== pages-agent DISPATCH ARM (pages/*) ====
+    // Self-contained block on the flash-arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential gates (all but pages/show + pages/featured) +
+    // endpoint bodies in api::pages_more (db paths in mk-db/src/page.rs).
+    // Sits ahead of the arena-fetchres arm, which also lists pages/create:
+    // the full upstream handler below shadows that beforeAll fixture (same
+    // contract, wider params).
+    if pages_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return pages_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END pages-agent DISPATCH ARM ====
 
     // ==== arena-fetchres DISPATCH ARM (pages/create + flash/create +
     // gallery/posts/create) ====

@@ -19173,3 +19173,228 @@ async fn i_authorized_apps_lists_only_callers_apps() {
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {b}");
     assert_eq!(b["error"]["code"], json!("CREDENTIAL_REQUIRED"));
 }
+
+// ==== pages-agent slice: pages/{create,show,like,my,liked,featured,
+// update,unlike,delete} (upstream endpoints/pages/*; page/page_like) ====
+#[tokio::test]
+async fn pages_arena_crud_like_list() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mkpages_arena").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool));
+
+    let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
+    let (b_token, _) = channels_signup(app.clone(), "bobby").await;
+
+    // requireCredential gate (auth before paramDef)
+    let (s, body) = post_json(app.clone(), "/api/pages/create", json!({ "name": "x" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // create with the full upstream param set (name required, rest defaulted)
+    let content = json!([{
+        "id": "2be9a64b-5ada-43a3-85f3-ec3429551ded",
+        "text": "Hello World!",
+        "type": "text"
+    }]);
+    let variables = json!([{ "name": "x", "type": "string", "value": "y" }]);
+    let (s, page) = post_json(
+        app.clone(),
+        "/api/pages/create",
+        json!({
+            "name": "my-page",
+            "title": "My Page",
+            "summary": "sum",
+            "content": content,
+            "variables": variables,
+            "script": "return 1;",
+            "eyeCatchingImageId": null,
+            "font": "serif",
+            "alignCenter": true,
+            "hideTitleWhenPinned": true,
+            "i": a_token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    assert_eq!(page["name"], json!("my-page"));
+    assert_eq!(page["title"], json!("My Page"));
+    assert_eq!(page["summary"], json!("sum"));
+    assert_eq!(page["content"], content);
+    assert_eq!(page["variables"], variables);
+    assert_eq!(page["font"], json!("serif"));
+    assert_eq!(page["alignCenter"], json!(true));
+    assert_eq!(page["hideTitleWhenPinned"], json!(true));
+    assert_eq!(page["eyeCatchingImage"], Value::Null);
+    assert_eq!(page["userId"], json!(a_id));
+    assert_eq!(page["likedCount"], json!(0));
+    assert!(page["createdAt"].is_string());
+    assert!(page["updatedAt"].is_string());
+    assert_eq!(page["user"]["username"], json!("alice"));
+    // create packs without me → no isLiked key
+    assert!(page.get("isLiked").is_none(), "create pack: {page}");
+    let page_id = page["id"].as_str().unwrap().to_string();
+
+    // show guest → no isLiked; show with bob → isLiked false
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["name"], json!("my-page"));
+    assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["isLiked"], json!(false));
+
+    // owner cannot like their own page
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("YOUR_PAGE"));
+
+    // bob likes → 204; duplicate → ALREADY_LIKED
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/like",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ALREADY_LIKED"));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(1));
+    assert_eq!(shown["isLiked"], json!(true));
+
+    // pages/my (me pack → isLiked false for alice) + pages/liked (bob)
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    let mine = mine.as_array().unwrap();
+    assert_eq!(mine.len(), 1, "my: {mine:?}");
+    assert_eq!(mine[0]["id"], json!(page_id));
+    assert_eq!(mine[0]["isLiked"], json!(false));
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    assert!(mine.as_array().unwrap().is_empty(), "bob my: {mine}");
+    let (s, liked) = post_json(app.clone(), "/api/pages/liked", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {liked}");
+    let liked = liked.as_array().unwrap();
+    assert_eq!(liked.len(), 1, "liked: {liked:?}");
+    assert_eq!(liked[0]["id"], json!(page_id));
+    assert_eq!(liked[0]["isLiked"], json!(true));
+
+    // featured surfaces liked pages (guest-ok)
+    let (s, featured) = post_json(app.clone(), "/api/pages/featured", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "body: {featured}");
+    let featured = featured.as_array().unwrap();
+    assert_eq!(featured.len(), 1, "featured: {featured:?}");
+    assert_eq!(featured[0]["id"], json!(page_id));
+
+    // update is owner-only and returns 204
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/update",
+        json!({ "pageId": page_id, "title": "nope", "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/update",
+        json!({ "pageId": page_id, "title": "Renamed", "font": "sans-serif", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["title"], json!("Renamed"));
+    assert_eq!(shown["font"], json!("sans-serif"));
+    assert_eq!(shown["content"], content, "content survives a partial update");
+
+    // unlike → 204; a second unlike → NOT_LIKED; count back to 0
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/unlike",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/unlike",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NOT_LIKED"));
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {shown}");
+    assert_eq!(shown["likedCount"], json!(0));
+
+    // delete is owner/moderator-only; afterwards show → NO_SUCH_PAGE
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/delete",
+        json!({ "pageId": page_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("ACCESS_DENIED"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/pages/delete",
+        json!({ "pageId": page_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_PAGE"));
+    let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {mine}");
+    assert!(mine.as_array().unwrap().is_empty(), "my after delete: {mine}");
+}
