@@ -20868,12 +20868,11 @@ async fn admin_federation_ops_and_reset_password() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "remove-all-following: {body}");
-    let left: Vec<String> = mk_db::sqlx::query_scalar(
-        r#"SELECT "id" FROM "following" ORDER BY "id""#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let left: Vec<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "following" ORDER BY "id""#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(left, vec!["afe3".to_string()], "only remote-b edge stays");
 
     // drive files: one remote-a, one remote-b, one local (NULL userHost).
@@ -20902,12 +20901,11 @@ async fn admin_federation_ops_and_reset_password() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "delete-all-files: {body}");
-    let left: Vec<String> = mk_db::sqlx::query_scalar(
-        r#"SELECT "id" FROM "drive_file" ORDER BY "id""#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let left: Vec<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "drive_file" ORDER BY "id""#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         left,
         vec!["afd2".to_string(), "afd3".to_string()],
@@ -20938,13 +20936,12 @@ async fn admin_federation_ops_and_reset_password() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "reset-password: {body}");
-    let hash: String = mk_db::sqlx::query_scalar(
-        r#"SELECT "password" FROM "user_profile" WHERE "userId" = $1"#,
-    )
-    .bind(&target_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let hash: String =
+        mk_db::sqlx::query_scalar(r#"SELECT "password" FROM "user_profile" WHERE "userId" = $1"#)
+            .bind(&target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(mk_core::services::verify_password("newpass", &hash).unwrap());
     assert!(!mk_core::services::verify_password("test", &hash).unwrap());
 
@@ -20956,13 +20953,12 @@ async fn admin_federation_ops_and_reset_password() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "delete-account: {body}");
-    let is_deleted: bool = mk_db::sqlx::query_scalar(
-        r#"SELECT "isDeleted" FROM "user" WHERE "id" = $1"#,
-    )
-    .bind(&target_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let is_deleted: bool =
+        mk_db::sqlx::query_scalar(r#"SELECT "isDeleted" FROM "user" WHERE "id" = $1"#)
+            .bind(&target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(is_deleted, "target row flagged deleted");
 }
 
