@@ -575,3 +575,16 @@ pub async fn delete_ad(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
         .await?;
     Ok(())
 }
+
+/// `admin/accounts/find-by-email.ts`: `userProfilesRepository.findOneBy({
+/// email })` — the email lives on user_profile, so the lookup returns the
+/// owning user id (the endpoint then loads the user row).
+pub async fn find_user_id_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "userId" FROM "user_profile" WHERE "email" = $1 LIMIT 1"#)
+        .bind(email)
+        .fetch_optional(pool)
+        .await
+}

@@ -867,6 +867,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END admin-relays DISPATCH ARM ====
 
+    // ==== admin-accounts DISPATCH ARM (admin/accounts/*) ====
+    // Noses in ahead of the admin/* catch-all (admin-relays convention):
+    // api::admin_accounts owns find-by-email/create/delete; every other
+    // admin/* name keeps falling through. Method check, body parsing, token
+    // extraction and the shared requireModerator gate live in the module
+    // (SQL in mk-db/src/admin.rs).
+    if admin_accounts::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_accounts::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-accounts DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -6603,6 +6623,14 @@ mod admin_emoji;
 /// SQL lives in `mk-db/src/abuse.rs`. mod.rs only registers the module and the
 /// dispatch arm above (ahead of the admin/* catch-all).
 mod admin_abuse;
+
+/// `admin/accounts/*` family (upstream `endpoints/admin/accounts/*.ts`).
+/// Module file `api/admin_accounts.rs` owns the endpoint table + handlers and
+/// the shared requireModerator gate; the email lookup lives in
+/// `mk-db/src/admin.rs`, the delete path reuses `mk-db/src/delete_account.rs`.
+/// mod.rs only registers the module and the dispatch arm above (ahead of the
+/// admin/* catch-all).
+mod admin_accounts;
 
 /// `admin/relays/*` family (upstream `endpoints/admin/relays/*.ts` over
 /// `core/RelayService.ts`). Module file `api/admin_relays.rs` owns the

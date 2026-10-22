@@ -20256,3 +20256,76 @@ async fn renote_mute_list_roundtrip() {
     .await;
     assert_eq!(list.as_array().unwrap().len(), 0, "after delete: {list}");
 }
+
+// admin/accounts/*: find-by-email hit/miss + create→find-by-email→delete +
+// non-admin 403 (upstream endpoints/admin/accounts/*.ts, requireModerator).
+#[tokio::test]
+async fn admin_accounts_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadminaccounts").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // First signup stamps meta.rootUserId → moderator gate bypass.
+    let root = signup(&app, &uname("adma")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("admb")).await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    // find-by-email miss → 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/accounts/find-by-email",
+        json!({ "email": "nobody@example.com", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "miss: {body}");
+
+    // Plain user → ROLE_PERMISSION_DENIED 403.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/accounts/find-by-email",
+        json!({ "email": "nobody@example.com", "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "non-admin: {body}");
+
+    // create → packed UserDetailedNotMe.
+    let new_username = uname("admc");
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/admin/accounts/create",
+        json!({ "username": new_username, "password": "test", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "create: {created}");
+    let created_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["username"], json!(new_username));
+
+    // The create path leaves the email unset; attach one for the lookup.
+    mk_db::user::set_email_verify_code(&pool, &created_id, "target@example.com", "123456")
+        .await
+        .unwrap();
+
+    // find-by-email hit.
+    let (s, found) = post_json(
+        app.clone(),
+        "/api/admin/accounts/find-by-email",
+        json!({ "email": "target@example.com", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "hit: {found}");
+    assert_eq!(found["id"], json!(created_id));
+
+    // delete → 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/accounts/delete",
+        json!({ "userId": created_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "delete: {body}");
+}
