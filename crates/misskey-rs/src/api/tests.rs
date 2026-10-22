@@ -22670,7 +22670,32 @@ async fn admin_misc2_roundtrip() {
     .await;
     assert_eq!(cur["provider"], json!("testcaptcha"));
 
-    // Seed avatar + banner directly, then unset each.
+    // Seed avatar + banner directly (the user avatarId/bannerId columns are
+    // FK-constrained to drive_file, so create the rows first).
+    for (fid, fname) in [("av1", "av.png"), ("bn1", "bn.png")] {
+        mk_db::drive::insert_drive_file(
+            &pool,
+            &mk_db::drive::DriveFileRow {
+                id: fid.to_string(),
+                user_id: Some(bob_id.clone()),
+                md5: "00000000000000000000000000000000".to_string(),
+                name: fname.to_string(),
+                file_type: "image/png".to_string(),
+                size: 1,
+                blurhash: Some("bh".to_string()),
+                url: format!("http://example.test/{fname}"),
+                webpublic_url: None,
+                webpublic_type: None,
+                properties: serde_json::json!({}),
+                comment: None,
+                is_sensitive: false,
+                folder_id: None,
+            },
+            &format!("ak-{fid}"),
+        )
+        .await
+        .unwrap();
+    }
     mk_db::user::update_avatar_banner(
         &pool,
         &bob_id,
