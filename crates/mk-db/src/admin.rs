@@ -628,7 +628,7 @@ pub async fn list_moderation_logs(
     ));
     let mut query = sqlx::query_as::<_, ModerationLogRow>(&sql);
     for b in &binds {
-        query = query.bind(b);
+        query = query.bind(b.as_str());
     }
     query.bind(q.limit).fetch_all(pool).await
 }
