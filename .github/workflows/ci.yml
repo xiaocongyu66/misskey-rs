@@ -45,6 +45,18 @@ jobs:
       # with no failing assertion. Split into two halves; each half skips the
       # other's names (libtest --skip is a substring match, and these are the
       # exact test fn names).
+      - name: Clean leftover test databases
+        # Each test creates its own mk* database and never drops it; 97 of
+        # them left behind by batch 1 wedge the next batch's migrations.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT datname FROM pg_database WHERE datname LIKE 'mk%'" | \
+          while read -r db; do
+            PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+              "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db'" >/dev/null
+            PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+              "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null || true
+          done
       - name: Test (batch 1/2)
         run: |
           cargo test --workspace -- --test-threads=1 \
@@ -147,6 +159,18 @@ jobs:
             --skip well_known_webfinger_jrd \
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
+      - name: Clean leftover test databases
+        # Each test creates its own mk* database and never drops it; 97 of
+        # them left behind by batch 2/2 (i.e. batch 1) wedge the next batch's migrations.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT datname FROM pg_database WHERE datname LIKE 'mk%'" | \
+          while read -r db; do
+            PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+              "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db'" >/dev/null
+            PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
+              "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null || true
+          done
       - name: Test (batch 2/2)
         run: |
           cargo test --workspace -- --test-threads=1 \
