@@ -1105,6 +1105,10 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // endpoints/drive/folders/{create,update}.ts)
         || name == "drive/folders/create"
         || name == "drive/folders/update"
+        || name == "drive/folders/show"
+        || name == "drive/folders/delete"
+        || name == "drive/folders/find"
+        || name == "drive/files/move-bulk"
     {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();

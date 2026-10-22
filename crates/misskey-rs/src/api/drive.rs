@@ -274,6 +274,10 @@ pub(crate) async fn handle_json(
         "drive/files/check-existence" => files_check_existence(state, body, token).await,
         "drive/folders/create" => folders_create(state, body, token).await,
         "drive/folders/update" => folders_update(state, body, token).await,
+        "drive/folders/show" => folders_show(state, body, token).await,
+        "drive/folders/delete" => folders_delete(state, body, token).await,
+        "drive/folders/find" => folders_find(state, body, token).await,
+        "drive/files/move-bulk" => files_move_bulk(state, body, token).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
 }
@@ -1907,5 +1911,211 @@ mod tests {
         assert!(packed.get("parent").is_none());
         assert!(packed.get("foldersCount").is_none());
         assert!(packed.get("filesCount").is_none());
+    }
+}
+
+// ==== drive/folders/{show,delete,find} + drive/files/move-bulk ====
+
+fn no_such_folder() -> Response {
+    folder_meta_err(
+        "NO_SUCH_FOLDER",
+        "d74ab9eb-bb09-4bba-bf24-fb58f761e1e9",
+        "No such folder.",
+    )
+}
+
+fn folder_id_param(body: &Value) -> Result<String, Response> {
+    match body.get("folderId").and_then(Value::as_str) {
+        Some(s) if is_alnum_folder_id(s) => Ok(s.to_string()),
+        _ => Err(api_err(ApiError::invalid_param(json!({
+            "param": "folderId",
+            "reason": "must be a valid id",
+        })))),
+    }
+}
+
+/// `POST /api/drive/folders/show` — owner-scoped lookup, detail pack.
+pub(crate) async fn folders_show(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let folder_id = match folder_id_param(body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let row = match mk_db::drive::find_folder_owned(pool, &folder_id, &me_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return no_such_folder(),
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "folders_show");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let folders_count = mk_db::drive::count_child_folders(pool, &folder_id)
+        .await
+        .unwrap_or(0);
+    let files_count = mk_db::drive::count_child_files(pool, &folder_id)
+        .await
+        .unwrap_or(0);
+    let mut packed = pack_folder(&row, &folder_id);
+    packed["foldersCount"] = json!(folders_count);
+    packed["filesCount"] = json!(files_count);
+    axum::Json(packed).into_response()
+}
+
+/// `POST /api/drive/folders/delete` — refuse when children exist.
+pub(crate) async fn folders_delete(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let folder_id = match folder_id_param(body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match mk_db::drive::find_folder_owned(pool, &folder_id, &me_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return no_such_folder(),
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "folders_delete lookup");
+            return api_err(ApiError::internal_error());
+        }
+    }
+    let folders = mk_db::drive::count_child_folders(pool, &folder_id)
+        .await
+        .unwrap_or(0);
+    let files = mk_db::drive::count_child_files(pool, &folder_id)
+        .await
+        .unwrap_or(0);
+    if folders != 0 || files != 0 {
+        return folder_meta_err(
+            "HAS_CHILD_FILES_OR_FOLDERS",
+            "b0fc8a17-963c-405d-bfbc-859a487295e1",
+            "This folder has child files or folders.",
+        );
+    }
+    match mk_db::drive::delete_folder_owned(pool, &folder_id, &me_id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "folders_delete");
+            api_err(ApiError::internal_error())
+        }
+    }
+}
+
+/// `POST /api/drive/folders/find` — exact name under an optional parent.
+pub(crate) async fn folders_find(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let name = match body.get("name").and_then(Value::as_str) {
+        Some(s) => s,
+        None => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "name",
+                "reason": "required",
+            })));
+        }
+    };
+    let parent_id = match body.get("parentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "parentId",
+                "reason": "must be a string or null",
+            })));
+        }
+    };
+    let rows = match mk_db::drive::list_folders_named(pool, &me_id, name, parent_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "folders_find");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let out: Vec<Value> = rows.iter().map(|r| pack_folder(r, &r.id)).collect();
+    axum::Json(Value::Array(out)).into_response()
+}
+
+/// `POST /api/drive/files/move-bulk` — move the caller's files to a folder.
+pub(crate) async fn files_move_bulk(
+    state: &AppState,
+    body: &Value,
+    token: Option<String>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let file_ids: Vec<String> = match body.get("fileIds").and_then(Value::as_array) {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "fileIds",
+                "reason": "required",
+            })));
+        }
+    };
+    let folder_id = match body.get("folderId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if !is_alnum_folder_id(s) {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "folderId",
+                    "reason": "must be a valid id",
+                })));
+            }
+            match mk_db::drive::find_folder_owned(pool, s, &me_id).await {
+                Ok(Some(_)) => Some(s.clone()),
+                Ok(None) => return no_such_folder(),
+                Err(e) => {
+                    tracing::error!(target: "dbg_drive", error = %e, "move_bulk folder");
+                    return api_err(ApiError::internal_error());
+                }
+            }
+        }
+        Some(_) => {
+            return api_err(ApiError::invalid_param(json!({
+                "param": "folderId",
+                "reason": "must be a string or null",
+            })));
+        }
+    };
+    match mk_db::drive::move_files_to_folder(pool, &file_ids, folder_id.as_deref(), &me_id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "move_bulk");
+            api_err(ApiError::internal_error())
+        }
     }
 }

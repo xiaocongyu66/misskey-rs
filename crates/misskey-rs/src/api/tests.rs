@@ -22004,3 +22004,117 @@ async fn arena_games_bubble_register_lane() {
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
     assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
 }
+
+// drive/folders/{show,find,delete} + drive/files/move-bulk — the arena
+// folder island roundtrip (upstream endpoints/drive/folders/*.ts).
+#[tokio::test]
+async fn drive_folders_show_find_delete_and_move_bulk() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkdrivefolders").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &uname("dfa")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
+
+    let (s, a) = post_json(
+        app.clone(),
+        "/api/drive/folders/create",
+        json!({ "name": "arena", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {a}");
+    let a_folder = a["id"].as_str().unwrap().to_string();
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/drive/folders/create",
+        json!({ "name": "child", "parentId": a_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let b_folder = b["id"].as_str().unwrap().to_string();
+
+    // show packs the detail counts
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/folders/show",
+        json!({ "folderId": a_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["name"], json!("arena"));
+    assert_eq!(body["foldersCount"], json!(1));
+    assert_eq!(body["filesCount"], json!(0));
+
+    // find is exact-name + parent-scoped
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/folders/find",
+        json!({ "name": "arena", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    // delete refuses a folder with children
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/folders/delete",
+        json!({ "folderId": a_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("HAS_CHILD_FILES_OR_FOLDERS"));
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/folders/delete",
+        json!({ "folderId": b_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/folders/delete",
+        json!({ "folderId": a_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // move-bulk: two root files into a fresh folder
+    let (f1, _) = arena_files_seed(&pool, &a_id, "image/jpeg", "m1.jpg", None).await;
+    let (f2, _) = arena_files_seed(&pool, &a_id, "image/jpeg", "m2.jpg", None).await;
+    let (s, mv) = post_json(
+        app.clone(),
+        "/api/drive/folders/create",
+        json!({ "name": "bulk", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {mv}");
+    let mv_folder = mv["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/drive/files/move-bulk",
+        json!({ "fileIds": [f1, f2], "folderId": mv_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "folderId": mv_folder, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files",
+        json!({ "folderId": null, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 0);
+}

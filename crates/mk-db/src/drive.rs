@@ -618,3 +618,72 @@ pub async fn admin_delete_files_of_user(pool: &PgPool, user_id: &str) -> Result<
         .await?;
     Ok(result.rows_affected())
 }
+
+// ==== folders/{show,delete,find} + files/move-bulk ====
+
+pub async fn list_folders_named(
+    pool: &PgPool,
+    user_id: &str,
+    name: &str,
+    parent_id: Option<&str>,
+) -> Result<Vec<DriveFolderRow>, sqlx::Error> {
+    sqlx::query_as::<_, DriveFolderRow>(
+        r#"SELECT "id", "userId", "name", "parentId" FROM "drive_folder"
+           WHERE "userId" = $1 AND "name" = $2
+             AND (("parentId" = $3) OR ($3::varchar IS NULL AND "parentId" IS NULL))"#,
+    )
+    .bind(user_id)
+    .bind(name)
+    .bind(parent_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_child_folders(pool: &PgPool, parent_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "drive_folder" WHERE "parentId" = $1"#)
+        .bind(parent_id)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn count_child_files(pool: &PgPool, folder_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "drive_file" WHERE "folderId" = $1"#)
+        .bind(folder_id)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn delete_folder_owned(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(r#"DELETE FROM "drive_folder" WHERE "id" = $1 AND "userId" = $2"#)
+        .bind(id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// drive/files/move-bulk: only the caller's files move (owner-scoped UPDATE).
+pub async fn move_files_to_folder(
+    pool: &PgPool,
+    file_ids: &[String],
+    folder_id: Option<&str>,
+    user_id: &str,
+) -> Result<u64, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+    let r = sqlx::query(
+        r#"UPDATE "drive_file" SET "folderId" = $1
+           WHERE "id" = ANY($2) AND "userId" = $3"#,
+    )
+    .bind(folder_id)
+    .bind(file_ids)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
