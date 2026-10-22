@@ -167,6 +167,11 @@ mod miauth;
 // drive/files {list,show,delete} (the exports.ts beforeEach / poll loop).
 // pub(crate): main.rs mounts the /files route + spawns the queue worker.
 pub(crate) mod exports;
+// retention + export-custom-emojis: endpoints/retention.ts (newest 30
+// retention_aggregation rows, guest-ok + allowGet) + endpoints/
+// export-custom-emojis.ts (the synchronous stored-zip export variant; the
+// pinned queue processor cannot be wired here — see the module docs).
+mod retention_export;
 // arena-move: account migration (upstream endpoints/i/move.ts +
 // AccountMoveService.ts local slice) + the PROHIBIT_MOVED dispatch gate
 // (ApiCallService.ts L421-430) + the mute/list + blocking/list read lanes
@@ -202,6 +207,8 @@ const GET_ALLOWED: &[(&str, u64)] = &[
     ("server-info", 60),
     ("emojis", 0),
     ("get-online-users-count", 60),
+    // retention.ts: allowGet + cacheSec 60 * 60
+    ("retention", 60 * 60),
 ];
 
 const M0_ENDPOINTS: &[&str] = &[
@@ -213,6 +220,8 @@ const M0_ENDPOINTS: &[&str] = &[
     "get-online-users-count",
     "emojis",
     "drive",
+    // retention.ts (guest-ok read; handler in api::retention_export)
+    "retention",
 ];
 
 pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Response {
@@ -1715,6 +1724,26 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END auth DISPATCH ARM ====
 
+    // ==== retention-export DISPATCH ARM (export-custom-emojis) ====
+    // retention itself rides the M0 read block below (guest-ok + allowGet);
+    // export-custom-emojis is POST-only, requireModerator, and answers the
+    // stored-zip / meta.json body directly (module docs in api::
+    // retention_export spell out the divergence from the pinned queue
+    // processor, whose boot wiring lives outside this slice's files).
+    if retention_export::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return retention_export::export_custom_emojis(&state, &body, token.as_deref()).await;
+    }
+    // ==== END retention-export DISPATCH ARM ====
+
     if !M0_ENDPOINTS.contains(&name.as_str()) {
         return api_err(ApiError::unknown_endpoint());
     }
@@ -1731,6 +1760,12 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
 
     // Read endpoints in M0 are unauthenticated; the auth chain drops in at M1
     // here, in ApiCallService order.
+
+    // retention.ts: guest-ok read over retention_aggregation; the handler
+    // sets the cacheSec header itself (both POST and allowGet GET).
+    if name == "retention" {
+        return retention_export::retention(&state).await;
+    }
 
     let result: Value = match name.as_str() {
         "ping" => json!({ "pong": now_ms() }),

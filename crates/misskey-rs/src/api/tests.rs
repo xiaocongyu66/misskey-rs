@@ -21406,3 +21406,188 @@ async fn i_registry_and_signin_history_roundtrip() {
     assert_eq!(rows[0]["ip"], json!("203.0.113.7"));
     assert!(rows[0]["createdAt"].is_string(), "createdAt: {history}");
 }
+
+// ---------------------------------------------------------------------------
+// retention + export-custom-emojis (endpoints/retention.ts,
+// endpoints/export-custom-emojis.ts — api::retention_export)
+// ---------------------------------------------------------------------------
+
+/// POST with the raw response kept (the export answers binary zip bytes).
+async fn post_raw(
+    app: axum::Router,
+    path: &str,
+    body: Value,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+async fn seed_retention_row(pool: &mk_db::sqlx::PgPool, id: &str, users: i32, data: Value) {
+    mk_db::sqlx::query(
+        r#"INSERT INTO "retention_aggregation"
+             ("id", "createdAt", "userIds", "data", "updatedAt", "usersCount", "dateKey")
+           VALUES ($1, now(), '{}', $2::jsonb, now(), $3, $1)"#,
+    )
+    .bind(id)
+    .bind(data.to_string())
+    .bind(users)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retention_reads_recent_aggregations() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_retention").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // Guest-ok, empty table → [].
+    let (s, body) = get_json(app.clone(), "/api/retention").await;
+    assert_eq!(s, StatusCode::OK, "empty: {body}");
+    assert_eq!(body, json!([]));
+
+    seed_retention_row(&pool, "ret1", 3, json!({ "m": { "notes": 1 } })).await;
+    seed_retention_row(&pool, "ret2", 7, json!({ "m": { "notes": 3 } })).await;
+
+    // id DESC (ret2 first) + the packed shape: usersCount → users,
+    // createdAt ISO, data verbatim.
+    let (s, body) = get_json(app.clone(), "/api/retention").await;
+    assert_eq!(s, StatusCode::OK, "list: {body}");
+    let rows = body.as_array().expect("array");
+    assert_eq!(rows.len(), 2, "list: {body}");
+    assert_eq!(rows[0]["users"], json!(7), "list: {body}");
+    assert_eq!(rows[0]["data"], json!({ "m": { "notes": 3 } }));
+    assert!(rows[0]["createdAt"].is_string(), "list: {body}");
+    assert_eq!(rows[1]["users"], json!(3), "list: {body}");
+
+    // POST is accepted too (allowGet endpoints keep the POST path).
+    let (s, body) = post_json(app.clone(), "/api/retention", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "post: {body}");
+    assert_eq!(body.as_array().map(|r| r.len()), Some(2));
+
+    // meta.cacheSec = 3600 → Cache-Control on the GET response.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/retention")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=3600")
+    );
+}
+
+#[tokio::test]
+async fn export_custom_emojis_zip_meta_and_gates() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_export_emoji").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // `root` rides the admin gate's first-user shortcut (moderator).
+    let root = signup(&app, "root").await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let plain_name = format!("plain{}", mk_types::id::gen_aid_now());
+    let plain = signup(&app, &plain_name).await;
+    let plain_token = plain["token"].as_str().unwrap().to_string();
+
+    let mut emoji = mk_db::emoji::EmojiRow {
+        id: "emojiexport1".to_string(),
+        name: "blob".to_string(),
+        original_url: "http://127.0.0.1:1/blob.png".to_string(),
+        public_url: "http://127.0.0.1:1/blob.png".to_string(),
+        file_type: Some("image/png".to_string()),
+        aliases: vec!["blobby".to_string()],
+        ..Default::default()
+    };
+    mk_db::emoji::insert(&pool, &emoji).await.unwrap();
+    // Invalid name (`^[a-zA-Z0-9_]+$` fails) is skipped like the processor.
+    emoji.id = "emojiexport2".to_string();
+    emoji.name = "bad-name".to_string();
+    mk_db::emoji::insert(&pool, &emoji).await.unwrap();
+
+    // No credential → CREDENTIAL_REQUIRED (requireModerator meta).
+    let (s, body) = post_json(app.clone(), "/api/export-custom-emojis", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "anon: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // Plain user → ROLE_PERMISSION_DENIED.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/export-custom-emojis",
+        json!({ "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "plain: {body}");
+    assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+
+    // Moderator zip → 200, application/zip, stored-zip magic.
+    let (s, headers, bytes) = post_raw(
+        app.clone(),
+        "/api/export-custom-emojis",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/zip")
+    );
+    assert!(bytes.starts_with(b"PK\x03\x04"), "zip magic");
+
+    // `format: meta` → the same meta.json document as JSON.
+    let (s, meta) = post_json(
+        app.clone(),
+        "/api/export-custom-emojis",
+        json!({ "i": root_token, "format": "meta" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "meta: {meta}");
+    assert_eq!(meta["metaVersion"], json!(2));
+    let entries = meta["emojis"].as_array().expect("emojis array");
+    assert_eq!(entries.len(), 1, "invalid names skipped: {meta}");
+    assert_eq!(entries[0]["fileName"], json!("blob.png"));
+    assert_eq!(entries[0]["downloaded"], json!(false));
+    assert_eq!(entries[0]["emoji"]["name"], json!("blob"));
+    assert_eq!(entries[0]["emoji"]["aliases"], json!(["blobby"]));
+
+    // Unknown format → INVALID_PARAM.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/export-custom-emojis",
+        json!({ "i": root_token, "format": "tar" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "bad format: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
+}

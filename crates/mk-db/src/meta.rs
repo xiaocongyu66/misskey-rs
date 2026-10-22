@@ -179,6 +179,34 @@ pub async fn fetch_nodeinfo_meta(pool: &PgPool) -> Result<MetaNodeinfoRow, sqlx:
     .await
 }
 
+/// `endpoints/retention.ts`: the newest 30 `retention_aggregation` rows
+/// (`order: { id: 'DESC' }, take: 30`). `createdAt` bridges to epoch-ms like
+/// the rest of mk-db (the workspace sqlx has no chrono decoder); `data` is
+/// the raw jsonb counter map. The api pack renders `usersCount` as `users`
+/// and `createdAt` through `ms_to_iso`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct RetentionAggregationRow {
+    #[sqlx(rename = "createdAtMs")]
+    pub created_at_ms: i64,
+    #[sqlx(rename = "usersCount")]
+    pub users_count: i32,
+    pub data: serde_json::Value,
+}
+
+pub async fn retention_aggregations(
+    pool: &PgPool,
+) -> Result<Vec<RetentionAggregationRow>, sqlx::Error> {
+    sqlx::query_as::<_, RetentionAggregationRow>(
+        r#"SELECT (EXTRACT(EPOCH FROM "createdAt") * 1000)::bigint AS "createdAtMs",
+                  "usersCount", "data"
+           FROM "retention_aggregation"
+           ORDER BY "id" DESC
+           LIMIT 30"#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
