@@ -93,6 +93,10 @@ mod i_registry;
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
 // No `i/read-all-unread-announcements` exists at the pinned upstream.
 mod announcement;
+// announce-more: the announcements read side is already served by
+// api::announcement; this module carries the two remaining small i/* names
+// (i/update-email, i/revoke-token) — tables in the 0001 baseline, SQL inline.
+mod announce_more;
 // avatar-decorations: get-avatar-decorations (guest-ok) +
 // admin/avatar-decorations/{create,delete,list,update} — db paths in
 // mk-db/src/avatar_decoration.rs (the table ships in the 0001 baseline).
@@ -1598,6 +1602,40 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return i_more::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END i-more DISPATCH ARM ====
+
+    // ==== announce-more DISPATCH ARM (i/update-email + i/revoke-token) ====
+    // Self-contained block on the i-more pattern: method check, body parsing,
+    // token extraction and the credential-declared probe live here; the gates
+    // + bodies in api::announce_more. Neither name is claimed by an earlier
+    // arm; both sit ahead of the M0 fallthrough.
+    if announce_more::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return announce_more::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
+    }
+    // ==== END announce-more DISPATCH ARM ====
 
     // ==== i-registry DISPATCH ARM (i/registry/* + i/signin-history) ====
     // Self-contained block on the i-more pattern: method check, body parsing

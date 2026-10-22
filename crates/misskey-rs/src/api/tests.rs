@@ -21251,3 +21251,148 @@ async fn i_registry_and_signin_history_roundtrip() {
     assert_eq!(rows[0]["ip"], json!("203.0.113.7"));
     assert!(rows[0]["createdAt"].is_string(), "createdAt: {history}");
 }
+
+/// announce-more slice: `i/update-email` writes the profile email + a fresh
+/// verification code (consumed by the existing verify-email lane), and
+/// `i/revoke-token` deletes an owned access_token row (app tokens may only
+/// revoke themselves).
+#[tokio::test]
+async fn i_update_email_and_revoke_token() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = mk_db::test_support::fresh_db("mktest_i_small").await;
+    mk_db::run_migrations(&pool).await.unwrap();
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let user = signup(&app, &format!("iu{}", mk_types::id::gen_aid_now())).await;
+    let token = user["token"].as_str().unwrap().to_string();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // Wrong password → INCORRECT_PASSWORD (upstream meta error id).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/update-email",
+        json!({ "password": "wrong", "email": "a@example.test", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INCORRECT_PASSWORD"));
+
+    // Correct password → profile email updated, unverified, code stored.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/update-email",
+        json!({ "password": "test", "email": "new@example.test", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["email"], json!("new@example.test"));
+    let profile = mk_db::user::find_profile(&pool, &user_id).await.unwrap();
+    assert_eq!(profile.email.as_deref(), Some("new@example.test"));
+    assert!(!profile.email_verified);
+    let code: Option<String> = mk_db::sqlx::query_scalar(
+        r#"SELECT "emailVerifyCode" FROM "user_profile" WHERE "userId" = $1"#,
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let code = code.expect("verification code stored");
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/verify-email",
+        json!({ "code": code, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let profile = mk_db::user::find_profile(&pool, &user_id).await.unwrap();
+    assert!(profile.email_verified, "verify-email consumes the code");
+
+    // Mint two app tokens; the native token revokes one by tokenId.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s1", "permission": ["read:account"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let app_token = v["token"].as_str().unwrap().to_string();
+    let app_id: String =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "access_token" WHERE "token" = $1"#)
+            .bind(&app_token)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/revoke-token",
+        json!({ "tokenId": app_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let gone: Option<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "access_token" WHERE "id" = $1"#)
+            .bind(&app_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(gone.is_none(), "tokenId row deleted");
+
+    // App token may not revoke a sibling, but may revoke itself by `token`.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s2", "permission": ["read:account"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let a2 = v["token"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/miauth/gen-token",
+        json!({ "session": "s3", "permission": ["read:account"], "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let a3 = v["token"].as_str().unwrap().to_string();
+    let a3_id: String =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "access_token" WHERE "token" = $1"#)
+            .bind(&a3)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/revoke-token",
+        json!({ "tokenId": a3_id, "i": a2 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("PERMISSION_DENIED"));
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/revoke-token",
+        json!({ "token": a2, "i": a2 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    let gone: Option<String> =
+        mk_db::sqlx::query_scalar(r#"SELECT "id" FROM "access_token" WHERE "token" = $1"#)
+            .bind(&a2)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(gone.is_none(), "self-revoked row deleted");
+
+    // No credential → CREDENTIAL_REQUIRED (the endpoint's own 401 meta).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/revoke-token",
+        json!({ "tokenId": "none" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
