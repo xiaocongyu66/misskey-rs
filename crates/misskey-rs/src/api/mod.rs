@@ -1315,7 +1315,8 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
                 }
             }
         }
-        return gallery_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
+        return gallery_more::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
     }
     // ==== END gallery-agent DISPATCH ARM ====
 
