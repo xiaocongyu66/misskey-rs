@@ -19103,6 +19103,110 @@ async fn i_flash_likes_lists_only_callers_likes() {
     assert_eq!(b[0]["flash"]["id"], json!(p2));
 }
 
+/// blocking/* + mute/*: create → list → delete roundtrip; a self-target is
+/// rejected 400; another user's rows never leak into the list.
+#[tokio::test]
+async fn blocking_mute_list_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkblockmute").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let alice = signup(&app, &uname("bma")).await;
+    let bob = signup(&app, &uname("bmb")).await;
+    let carol = signup(&app, &uname("bmc")).await;
+    let a_id = alice["id"].as_str().unwrap();
+    let a_token = alice["token"].as_str().unwrap();
+    let b_id = bob["id"].as_str().unwrap();
+    let c_token = carol["token"].as_str().unwrap();
+
+    // self-block → 400 (blocking/create meta.errors.BLOCKEE_IS_YOURSELF)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({ "userId": a_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "self-block: {body}");
+    assert_eq!(body["error"]["code"], json!("BLOCKEE_IS_YOURSELF"));
+
+    // block → alice's list shows bob, carol's stays empty → unblock
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/blocking/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "blocking/create: {body}");
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/blocking/list",
+        json!({ "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "blocking/list: {list}");
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "blocking/list: {list}");
+    assert_eq!(rows[0]["blockeeId"], json!(b_id));
+    assert_eq!(rows[0]["blockee"]["id"], json!(b_id));
+    assert!(rows[0]["id"].is_string());
+    assert!(rows[0]["createdAt"].is_string());
+    let (s, other) = post_json(
+        app.clone(),
+        "/api/blocking/list",
+        json!({ "i": c_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        other.as_array().unwrap().is_empty(),
+        "carol's blocking list: {other}"
+    );
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/blocking/delete",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "blocking/delete: {body}");
+    let (_, list) = post_json(app.clone(), "/api/blocking/list", json!({ "i": a_token })).await;
+    assert!(list.as_array().unwrap().is_empty(), "after unblock: {list}");
+
+    // mute (with expiry) → list → unmute
+    let expires_at = 4_102_444_800_000i64; // 2100-01-01Z
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": b_id, "expiresAt": expires_at, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "mute/create: {body}");
+    let (s, list) = post_json(app.clone(), "/api/mute/list", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "mute/list: {list}");
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "mute/list: {list}");
+    assert_eq!(rows[0]["muteeId"], json!(b_id));
+    assert_eq!(rows[0]["mutee"]["id"], json!(b_id));
+    assert!(rows[0]["expiresAt"].is_string(), "expiresAt: {list}");
+    let (_, other) = post_json(app.clone(), "/api/mute/list", json!({ "i": c_token })).await;
+    assert!(
+        other.as_array().unwrap().is_empty(),
+        "carol's mute list: {other}"
+    );
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/mute/delete",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = post_json(app, "/api/mute/list", json!({ "i": a_token })).await;
+    assert!(list.as_array().unwrap().is_empty(), "after unmute: {list}");
+}
+
 /// `i/authorized-apps`: the caller's app rows (id DESC, secret included),
 /// other users' apps excluded.
 #[tokio::test]
