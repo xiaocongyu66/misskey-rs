@@ -19343,7 +19343,12 @@ async fn pages_arena_crud_like_list() {
     let page_id = page["id"].as_str().unwrap().to_string();
 
     // show guest → no isLiked; show with bob → isLiked false
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "body: {shown}");
     assert_eq!(shown["name"], json!("my-page"));
     assert!(shown.get("isLiked").is_none(), "guest show: {shown}");
@@ -19433,14 +19438,16 @@ async fn pages_arena_crud_like_list() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "body: {shown}");
     assert_eq!(shown["title"], json!("Renamed"));
     assert_eq!(shown["font"], json!("sans-serif"));
-    assert_eq!(
-        shown["content"], content,
-        "content survives a partial update"
-    );
+    assert_eq!(shown["content"], content, "content survives a partial update");
 
     // unlike → 204; a second unlike → NOT_LIKED; count back to 0
     let (s, _) = post_json(
@@ -19458,7 +19465,12 @@ async fn pages_arena_crud_like_list() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("NOT_LIKED"));
-    let (s, shown) = post_json(app.clone(), "/api/pages/show", json!({ "pageId": page_id })).await;
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/pages/show",
+        json!({ "pageId": page_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK, "body: {shown}");
     assert_eq!(shown["likedCount"], json!(0));
 
@@ -19488,10 +19500,7 @@ async fn pages_arena_crud_like_list() {
     assert_eq!(body["error"]["code"], json!("NO_SUCH_PAGE"));
     let (s, mine) = post_json(app.clone(), "/api/pages/my", json!({ "i": a_token })).await;
     assert_eq!(s, StatusCode::OK, "body: {mine}");
-    assert!(
-        mine.as_array().unwrap().is_empty(),
-        "my after delete: {mine}"
-    );
+    assert!(mine.as_array().unwrap().is_empty(), "my after delete: {mine}");
 }
 
 /// `get-avatar-decorations` + `admin/avatar-decorations/*`: admin CRUD
@@ -19522,12 +19531,7 @@ async fn avatar_decorations_roundtrip() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "body: {body}");
     assert_eq!(body["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
-    let (s, body) = post_json(
-        app.clone(),
-        "/api/admin/avatar-decorations/list",
-        json!({}),
-    )
-    .await;
+    let (s, body) = post_json(app.clone(), "/api/admin/avatar-decorations/list", json!({})).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
     assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
 
@@ -19804,20 +19808,10 @@ async fn gallery_arena_crud_like_list() {
     // featured/popular carry the liked post (guest packs)
     let (s, feat) = post_json(app.clone(), "/api/gallery/featured", json!({})).await;
     assert_eq!(s, StatusCode::OK, "body: {feat}");
-    assert!(
-        feat.as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["id"] == json!(post_id))
-    );
+    assert!(feat.as_array().unwrap().iter().any(|p| p["id"] == json!(post_id)));
     let (s, pop) = post_json(app.clone(), "/api/gallery/popular", json!({})).await;
     assert_eq!(s, StatusCode::OK, "body: {pop}");
-    assert!(
-        pop.as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["id"] == json!(post_id))
-    );
+    assert!(pop.as_array().unwrap().iter().any(|p| p["id"] == json!(post_id)));
 
     // update by owner → 200 packed post
     let (s, updated) = post_json(
@@ -19865,7 +19859,12 @@ async fn gallery_arena_crud_like_list() {
     assert_eq!(s, StatusCode::NO_CONTENT);
 
     // gone → NO_SUCH_POST
-    let (s, body) = post_json(app, "/api/gallery/posts/show", json!({ "postId": post_id })).await;
+    let (s, body) = post_json(
+        app,
+        "/api/gallery/posts/show",
+        json!({ "postId": post_id }),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("NO_SUCH_POST"));
     assert_eq!(
