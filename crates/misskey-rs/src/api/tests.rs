@@ -20845,7 +20845,7 @@ async fn admin_federation_ops_and_reset_password() {
     for (id, follower, followee, follower_host, followee_host) in [
         ("afe1", "u1", "u2", None, Some("remote-a.example")),
         ("afe2", "u2", "u1", Some("remote-a.example"), None),
-        ("afe3", "u1", "u2", None, Some("remote-b.example")),
+        ("afe3", "u3", "u4", None, Some("remote-b.example")),
     ] {
         mk_db::sqlx::query(
             r#"INSERT INTO "following" ("id", "followerId", "followeeId",
