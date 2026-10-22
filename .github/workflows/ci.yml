@@ -52,6 +52,15 @@ jobs:
             PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -tAc \
               "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null || true
           done
+      - name: Warmup migration
+        # The very first fresh-db migration in a cold runner can wedge (the
+        # single-process run sat on it for 30 minutes); running one db test
+        # first makes the later migrations take the warm path.
+        run: |
+          cargo test --workspace -- --test-threads=1 \
+            hashtags_users_tag_normalization_and_sort
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
       - name: Test
         # serial suite: concurrent fresh-db pools wedge the runner. A single
         # serial process handled 152 tests fine once the leftover mk* databases
