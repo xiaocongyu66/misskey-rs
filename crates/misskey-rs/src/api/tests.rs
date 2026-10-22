@@ -23772,3 +23772,99 @@ async fn email_address_available_checks_format_and_use() {
     assert_eq!(s, StatusCode::OK, "used: {out}");
     assert_eq!(out, json!({ "available": false, "reason": "used" }));
 }
+
+/// v2/admin/emoji/list: filtered + page-based listing with count/allCount/
+/// allPages, admin-only.
+#[tokio::test]
+async fn v2_admin_emoji_list_filters_pages_and_admin_gate() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkv2emoji").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let root = signup(&app, &uname("v2a")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("v2b")).await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+
+    for (id, name, host) in [
+        ("01v2local0000000000000000000000", "v2local", None::<&str>),
+        (
+            "01v2remote000000000000000000000",
+            "v2remote",
+            Some("remote.example"),
+        ),
+    ] {
+        mk_db::sqlx::query(
+            r#"INSERT INTO "emoji" ("id","name","host","originalUrl","uri","type","aliases",
+                 "category","publicUrl","license","localOnly","isSensitive",
+                 "roleIdsThatCanBeUsedThisEmojiAsReaction")
+               VALUES ($1,$2,$3,'https://x/orig.png',NULL,'image/png','{}','cat','',NULL,
+                 false,false,'{}')"#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // non-admin → 403
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v2/admin/emoji/list",
+        json!({ "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // all: count 2, allCount 2, allPages 1
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/v2/admin/emoji/list",
+        json!({ "i": root_token, "limit": 10 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["count"], 2);
+    assert_eq!(body["allCount"], 2);
+    assert_eq!(body["allPages"], 1);
+    assert_eq!(body["emojis"].as_array().unwrap().len(), 2);
+
+    // name filter → 1
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/v2/admin/emoji/list",
+        json!({ "i": root_token, "query": { "name": "v2loc" } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["allCount"], 1);
+    assert_eq!(body["emojis"][0]["name"], "v2local");
+
+    // hostType=remote → 1
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/v2/admin/emoji/list",
+        json!({ "i": root_token, "query": { "hostType": "remote" } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["allCount"], 1);
+    assert_eq!(body["emojis"][0]["name"], "v2remote");
+
+    // limit 1 → allPages 2; page 1 → second row
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/v2/admin/emoji/list",
+        json!({ "i": root_token, "limit": 1, "page": 0 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["allPages"], 2);
+}

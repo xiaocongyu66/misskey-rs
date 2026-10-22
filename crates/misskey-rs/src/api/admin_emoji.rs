@@ -52,6 +52,7 @@ pub(super) fn handles(name: &str) -> bool {
             | "admin/emoji/set-aliases-bulk"
             | "admin/emoji/delete-bulk"
             | "admin/emoji/list-remote"
+            | "v2/admin/emoji/list"
     )
 }
 
@@ -86,6 +87,7 @@ pub(super) async fn handle(
         "admin/emoji/set-aliases-bulk" => set_aliases_bulk(pool, body).await,
         "admin/emoji/delete-bulk" => delete_bulk(pool, body).await,
         "admin/emoji/list-remote" => list_remote(pool, body).await,
+        "v2/admin/emoji/list" => v2_list(pool, body).await,
         _ => unreachable!("checked by handles()"),
     };
     match result {
@@ -293,6 +295,107 @@ fn pack(e: &mk_db::emoji::EmojiRow) -> Value {
         "localOnly": e.local_only,
         "roleIdsThatCanBeUsedThisEmojiAsReaction": e.role_ids,
     })
+}
+
+/// `EmojiDetailedAdmin` pack used by the v2 list (superset of `pack`).
+fn v2_pack(e: &mk_db::emoji::EmojiRow) -> Value {
+    json!({
+        "id": e.id,
+        "aliases": e.aliases,
+        "name": e.name,
+        "category": e.category,
+        "host": e.host,
+        "url": if e.public_url.is_empty() { e.original_url.clone() } else { e.public_url.clone() },
+        "license": e.license,
+        "isSensitive": e.is_sensitive,
+        "localOnly": e.local_only,
+        "roleIdsThatCanBeUsedThisEmojiAsReaction": e.role_ids,
+        "originalUrl": e.original_url,
+        "publicUrl": e.public_url,
+        "uri": e.uri,
+        "type": e.file_type,
+    })
+}
+
+/// `v2/admin/emoji/list.ts`: filtered, page-based listing returning
+/// `{emojis, count, allCount, allPages}`. Divergences: `sinceId`/`untilId`
+/// id cursors are accepted but only `page` is used for paging; `roleIds`
+/// filtering is not applied; `updatedAtFrom/To` are not applied.
+async fn v2_list(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<Response> {
+    let q = match body.get("query") {
+        None | Some(Value::Null) => None,
+        Some(v @ Value::Object(_)) => Some(v),
+        Some(_) => return Err(super::invalid_param("query", "must be object")),
+    };
+    let qs = |k: &str| -> Option<String> {
+        q.and_then(|o| o.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let qb = |k: &str| -> Option<bool> { q.and_then(|o| o.get(k)).and_then(|v| v.as_bool()) };
+    let host_type = qs("hostType").unwrap_or_else(|| "all".to_string());
+    let (name, host, uri, type_, aliases, category, license) = (
+        qs("name"),
+        qs("host"),
+        qs("uri"),
+        qs("type"),
+        qs("aliases"),
+        qs("category"),
+        qs("license"),
+    );
+    let filter = mk_db::emoji::AdminEmojiFilter {
+        name: name.as_deref(),
+        host: host.as_deref(),
+        uri: uri.as_deref(),
+        type_: type_.as_deref(),
+        aliases: aliases.as_deref(),
+        category: category.as_deref(),
+        license: license.as_deref(),
+        is_sensitive: qb("isSensitive"),
+        local_only: qb("localOnly"),
+        host_type: Some(host_type.as_str()),
+    };
+    let limit = parse_limit(body)?;
+    let page = match body.get("page") {
+        None | Some(Value::Null) => 0i64,
+        Some(v) => v
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| super::invalid_param("page", "must be a non-negative integer"))?,
+    };
+    let sort = body
+        .get("sortKeys")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("-id");
+    let (col, asc) = match sort {
+        "-id" => ("id", false),
+        "+id" => ("id", true),
+        "-name" => ("name", false),
+        "+name" => ("name", true),
+        "-aliases" => ("aliases", false),
+        "+aliases" => ("aliases", true),
+        "-license" => ("license", false),
+        "+license" => ("license", true),
+        "-isSensitive" => ("isSensitive", false),
+        "+isSensitive" => ("isSensitive", true),
+        "-category" => ("category", false),
+        "+category" => ("category", true),
+        "-host" => ("host", false),
+        "+host" => ("host", true),
+        _ => return Err(super::invalid_param("sortKeys", "unsupported sort key")),
+    };
+    let (rows, total) = mk_db::emoji::list_admin(pool, &filter, limit, page * limit, col, asc)
+        .await
+        .map_err(|e| db_err("list_admin", e))?;
+    let all_pages = (total + limit - 1) / limit;
+    Ok(ok_json(json!({
+        "emojis": rows.iter().map(v2_pack).collect::<Vec<_>>(),
+        "count": rows.len(),
+        "allCount": total,
+        "allPages": all_pages,
+    })))
 }
 
 fn ok_json(v: Value) -> Response {

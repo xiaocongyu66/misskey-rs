@@ -392,3 +392,80 @@ fn sql_like_escape(q: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+
+// ==== v2/admin/emoji/list (upstream endpoints/v2/admin/emoji/list.ts) ====
+
+/// Query filter subset of CustomEmojiService.fetchEmojis (the fields the v2
+/// list endpoint forwards).
+#[derive(Debug, Default)]
+pub struct AdminEmojiFilter<'a> {
+    pub name: Option<&'a str>,
+    pub host: Option<&'a str>,
+    pub uri: Option<&'a str>,
+    pub type_: Option<&'a str>,
+    pub aliases: Option<&'a str>,
+    pub category: Option<&'a str>,
+    pub license: Option<&'a str>,
+    pub is_sensitive: Option<bool>,
+    pub local_only: Option<bool>,
+    pub host_type: Option<&'a str>,
+}
+
+/// One page plus the filtered total (upstream `{emojis, count, allCount}`).
+pub async fn list_admin(
+    pool: &PgPool,
+    f: &AdminEmojiFilter<'_>,
+    limit: i64,
+    offset: i64,
+    sort_col: &str,
+    asc: bool,
+) -> Result<(Vec<EmojiRow>, i64), sqlx::Error> {
+    // sort column comes from a closed whitelist in the api layer
+    let dir = if asc { "ASC" } else { "DESC" };
+    let where_clause = r#"
+        WHERE ($1::text IS NULL OR "name" ILIKE '%' || $1 || '%')
+          AND ($2::text IS NULL OR "host" = $2)
+          AND ($3::text IS NULL OR "uri" ILIKE '%' || $3 || '%')
+          AND ($4::text IS NULL OR "type" = $4)
+          AND ($5::text IS NULL OR array_to_string("aliases", ',') ILIKE '%' || $5 || '%')
+          AND ($6::text IS NULL OR "category" = $6)
+          AND ($7::text IS NULL OR "license" = $7)
+          AND ($8::bool IS NULL OR "isSensitive" = $8)
+          AND ($9::bool IS NULL OR "localOnly" = $9)
+          AND ($10::text IS NULL OR $10 = 'all'
+               OR ($10 = 'local' AND "host" IS NULL)
+               OR ($10 = 'remote' AND "host" IS NOT NULL))"#;
+    let sql = format!(
+        r#"SELECT {EMOJI_COLS} FROM "emoji"{where_clause}
+           ORDER BY "{sort_col}" {dir} LIMIT $11 OFFSET $12"#
+    );
+    let mut q = sqlx::query_as::<_, EmojiRow>(&sql)
+        .bind(f.name)
+        .bind(f.host)
+        .bind(f.uri)
+        .bind(f.type_)
+        .bind(f.aliases)
+        .bind(f.category)
+        .bind(f.license)
+        .bind(f.is_sensitive)
+        .bind(f.local_only)
+        .bind(f.host_type)
+        .bind(limit)
+        .bind(offset);
+    let rows = q.fetch_all(pool).await?;
+    let count_sql = format!(r#"SELECT count(*) FROM "emoji"{where_clause}"#);
+    let total: i64 = sqlx::query_scalar(&count_sql)
+        .bind(f.name)
+        .bind(f.host)
+        .bind(f.uri)
+        .bind(f.type_)
+        .bind(f.aliases)
+        .bind(f.category)
+        .bind(f.license)
+        .bind(f.is_sensitive)
+        .bind(f.local_only)
+        .bind(f.host_type)
+        .fetch_one(pool)
+        .await?;
+    Ok((rows, total))
+}

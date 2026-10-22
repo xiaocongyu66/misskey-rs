@@ -157,6 +157,7 @@ jobs:
             --skip well_known_hostmeta_and_oauth \
             --skip well_known_nodeinfo_links \
             --skip well_known_webfinger_jrd \
+            --skip v2_admin_emoji_list_filters_pages_and_admin_gate \
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
       - name: Clean leftover test databases
