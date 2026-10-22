@@ -827,25 +827,36 @@ async fn users_lists_list(
     body: &Value,
     token: Option<String>,
 ) -> Response {
-    // requireCredential: no credential at all -> CREDENTIAL_REQUIRED; then
-    // the endpoint's own `me === null` fallthrough is INVALID_PARAM (handled
-    // by require_credential_me_id's 401 first, mirroring social lanes).
-    let Some(tok) = token.as_deref().filter(|t| t.len() == 16) else {
-        return super::authentication_failed();
-    };
-    let me_id = match mk_db::user::find_local_user_id_by_token(pool, tok).await {
-        Ok(v) => v,
-        Err(e) => return db_err("users_lists_list find_token", e),
-    };
-    let Some(me_id) = me_id else {
-        return super::authentication_failed();
+    // paramDef `userId: { type: 'string', format: 'misskey:id' }` (optional).
+    let user_id_param = match body.get("userId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return schema_invalid_param("userId", "must be id"),
     };
 
-    let user_id_param = body.get("userId").and_then(|v| v.as_str());
-    let owner_id = match user_id_param {
+    // requireCredential: false — an absent token falls through to the guest
+    // path; a present-but-unresolvable one is still AUTHENTICATION_FAILED.
+    let me_id = match token.as_deref() {
+        None => None,
+        Some(t) => {
+            if t.len() != 16 {
+                return super::authentication_failed();
+            }
+            match super::resolve_me(pool, Some(t)).await {
+                Some(id) => Some(id),
+                None => return super::authentication_failed(),
+            }
+        }
+    };
+
+    // list.ts: an explicit userId reads that user's PUBLIC lists (even when
+    // it is the caller's own id); an absent userId reads every list the
+    // caller owns, and a guest with no userId is INVALID_PARAM (the
+    // endpoint's own id, not the paramDef one).
+    let (owner_id, public_only) = match user_id_param {
         Some(uid) => {
-            // meta.errors.noSuchUser (this endpoint's own id variant) +
-            // remoteUser: the local slice never has host'd rows
+            // meta.errors.noSuchUser + remoteUser: the local slice never has
+            // host'd rows.
             let user = match mk_db::user::find_user_by_id(pool, uid).await {
                 Ok(u) => u,
                 Err(e) => return db_err("users_lists_list find_user", e),
@@ -859,12 +870,23 @@ async fn users_lists_list(
                     "No such user.",
                 ));
             };
-            user.id
+            (user.id, true)
         }
-        None => me_id,
+        None => match me_id {
+            Some(me) => (me, false),
+            None => {
+                return api_err(ApiError::new(
+                    400,
+                    ApiErrorKind::Client,
+                    "INVALID_PARAM",
+                    "ab36de0e-29e9-48cb-9732-d82f1281620d",
+                    "Invalid param.",
+                ));
+            }
+        },
     };
 
-    let lists = match mk_db::move_account::lists_of_owner(pool, &owner_id).await {
+    let lists = match mk_db::move_account::lists_of_owner(pool, &owner_id, public_only).await {
         Ok(v) => v,
         Err(e) => return db_err("users_lists_list lists_of_owner", e),
     };

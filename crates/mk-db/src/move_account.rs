@@ -395,17 +395,22 @@ pub async fn insert_role_assignment(
 // users/lists/list support (endpoints/users/lists/list.ts)
 // ---------------------------------------------------------------------------
 
-/// `userListsRepository.find({ userId: me.id })` — the caller's lists in
-/// table order (no ORDER BY upstream either); only the pinned asserts read
-/// the packed userIds membership, not an ordering.
+/// `userListsRepository.findBy({ userId })` — the owner's lists in table
+/// order (no ORDER BY upstream either); only the pinned asserts read the
+/// packed userIds membership, not an ordering. users/lists/list passes the
+/// explicit-userId arm `{ userId, isPublic: true }` (`public_only`), while the
+/// no-param caller arm reads every list it owns.
 pub async fn lists_of_owner(
     pool: &PgPool,
     owner_id: &str,
+    public_only: bool,
 ) -> Result<Vec<(String, String, bool)>, sqlx::Error> {
     sqlx::query_as::<_, (String, String, bool)>(
-        r#"SELECT "id", "name", "isPublic" FROM "user_list" WHERE "userId" = $1"#,
+        r#"SELECT "id", "name", "isPublic" FROM "user_list"
+           WHERE "userId" = $1 AND (NOT $2 OR "isPublic" = TRUE)"#,
     )
     .bind(owner_id)
+    .bind(public_only)
     .fetch_all(pool)
     .await
 }

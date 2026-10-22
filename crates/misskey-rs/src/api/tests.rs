@@ -18858,3 +18858,112 @@ async fn chat_room_and_direct_messages() {
     assert_eq!(s, StatusCode::OK, "body: {h}");
     assert_eq!(h, json!([]));
 }
+
+// ---------------------------------------------------------------------------
+// users/lists/list — upstream list.ts is requireCredential: false and the
+// explicit-userId arm reads `{ userId, isPublic: true }` (even for the
+// caller's own id); the no-param arm reads every list the caller owns.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn users_lists_list_owner_public_and_guest_gates() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkusers_lists_list").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("lla")).await;
+    let bob = signup(&app, &uname("llb")).await;
+    let a = alice["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    let (s, private_list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "priv", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {private_list}");
+    let private_id = private_list["id"].as_str().unwrap().to_string();
+
+    let (s, public_list) = post_json(
+        app.clone(),
+        "/api/users/lists/create",
+        json!({ "name": "pub", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {public_list}");
+    let public_id = public_list["id"].as_str().unwrap().to_string();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/lists/update",
+        json!({ "listId": public_id, "isPublic": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+
+    // no userId + credential → every list the caller owns.
+    let (s, lists) = post_json(app.clone(), "/api/users/lists/list", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {lists}");
+    let arr = lists.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.iter().any(|l| l["id"] == json!(private_id)));
+    assert!(arr.iter().any(|l| l["id"] == json!(public_id)));
+
+    // explicit userId (even the caller's own) → public-only.
+    for body in [
+        json!({ "userId": a, "i": at }),
+        json!({ "userId": a, "i": bt }),
+        json!({ "userId": a }),
+    ] {
+        let (s, lists) = post_json(app.clone(), "/api/users/lists/list", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {lists}");
+        let arr = lists.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "body: {lists}");
+        assert_eq!(arr[0]["id"], json!(public_id));
+        assert_eq!(arr[0]["isPublic"], json!(true));
+    }
+
+    // guest with no userId → INVALID_PARAM (the endpoint's own error id).
+    let (s, err) = post_json(app.clone(), "/api/users/lists/list", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
+    assert_eq!(
+        err["error"]["id"],
+        json!("ab36de0e-29e9-48cb-9732-d82f1281620d")
+    );
+
+    // unknown explicit userId → NO_SUCH_USER.
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/lists/list",
+        json!({ "userId": "9zzzzzzzzz" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_USER"));
+
+    // a present-but-unresolvable token still 401s.
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/lists/list",
+        json!({ "i": "0000000000000000" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("AUTHENTICATION_FAILED"));
+
+    // non-string userId → paramDef INVALID_PARAM.
+    let (s, err) = post_json(
+        app,
+        "/api/users/lists/list",
+        json!({ "userId": 42, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
+}
