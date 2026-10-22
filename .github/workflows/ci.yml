@@ -55,10 +55,12 @@ jobs:
       - name: Warmup migration
         # The very first fresh-db migration in a cold runner can wedge (the
         # single-process run sat on it for 30 minutes); running one db test
-        # first makes the later migrations take the warm path.
+        # first makes the later migrations take the warm path. This is also
+        # the batch-2 test that wedged right after its migrations, so its
+        # isolated outcome tells test-bug from batch-context.
         run: |
           cargo test --workspace -- --test-threads=1 \
-            hashtags_users_tag_normalization_and_sort
+            i_authorized_apps_lists_only_callers_apps
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
       - name: Test
