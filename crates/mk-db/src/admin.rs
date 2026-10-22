@@ -599,9 +599,7 @@ pub async fn table_stats(pool: &PgPool) -> Result<Vec<(String, i64)>, sqlx::Erro
 
 /// `admin/get-index-stats.ts` — index sizes from `pg_stat_user_indexes`
 /// (relname/indexrelname/pg_size_pretty/index scan count, largest first).
-pub async fn index_stats(
-    pool: &PgPool,
-) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
+pub async fn index_stats(pool: &PgPool) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
     sqlx::query_as(
         r#"SELECT relname, indexrelname,
                   pg_size_pretty(pg_relation_size(indexrelid)),

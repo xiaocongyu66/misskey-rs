@@ -184,11 +184,7 @@ fn created_at(id: &str) -> Value {
     }
 }
 
-async fn registry_get(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn registry_get(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let key = key_param(body)?;
     let scope = scope_param(body, false)?;
     let value = mk_db::registry::get(pool, me_id, &scope, &key)
@@ -200,11 +196,7 @@ async fn registry_get(
     }
 }
 
-async fn registry_set(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn registry_set(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let key = key_param(body)?;
     let Some(value) = body.get("value") else {
         return Err(invalid_param("value", "required"));
@@ -217,11 +209,7 @@ async fn registry_set(
     Ok(ok_empty())
 }
 
-async fn registry_remove(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn registry_remove(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let key = key_param(body)?;
     let scope = scope_param(body, false)?;
     mk_db::registry::remove(pool, me_id, &scope, &key)
@@ -289,11 +277,7 @@ async fn registry_get_detail(
     Ok(ok_json(json!({ "item": item, "scopes": scopes })))
 }
 
-async fn registry_keys(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn registry_keys(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let scope = scope_param(body, false)?;
     let keys = mk_db::registry::keys(pool, me_id, &scope)
         .await
@@ -305,21 +289,12 @@ async fn registry_keys(
     Ok(ok_json(json!(out)))
 }
 
-async fn signin_history(
-    pool: &mk_db::sqlx::PgPool,
-    me_id: &str,
-    body: &Value,
-) -> Check<Response> {
+async fn signin_history(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> Check<Response> {
     let (limit, since_id, until_id) = paging(body)?;
-    let rows = mk_db::signin::signin_history(
-        pool,
-        me_id,
-        limit,
-        since_id.as_deref(),
-        until_id.as_deref(),
-    )
-    .await
-    .map_err(|e| db_err("i/signin-history", e))?;
+    let rows =
+        mk_db::signin::signin_history(pool, me_id, limit, since_id.as_deref(), until_id.as_deref())
+            .await
+            .map_err(|e| db_err("i/signin-history", e))?;
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
