@@ -146,7 +146,7 @@ async fn user_ips(state: &AppState, body: &Value, token: Option<&str>) -> ApiRes
             return Err(invalid_param(
                 "userId",
                 "must have required property 'userId'",
-            ))
+            ));
         }
         Some(_) => return Err(invalid_param("userId", "must be string")),
     };
