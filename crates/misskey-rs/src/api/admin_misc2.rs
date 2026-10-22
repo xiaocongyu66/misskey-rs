@@ -89,9 +89,7 @@ pub(super) async fn handle(
         "admin/unset-mfa" => unset_mfa(pool, body, &ctx.me.id).await,
         "admin/send-email" => send_email(pool, body).await,
         "admin/update-proxy-account" => update_proxy_account(state, pool, body, &ctx.me.id).await,
-        "admin/update-abuse-user-report" => {
-            update_abuse_user_report(pool, body, &ctx.me.id).await
-        }
+        "admin/update-abuse-user-report" => update_abuse_user_report(pool, body, &ctx.me.id).await,
         "admin/show-moderation-logs" => show_moderation_logs(state, pool, body).await,
         "admin/roles/update-default-policies" => {
             update_default_policies(pool, body, &ctx.me.id).await
@@ -231,9 +229,7 @@ async fn captcha_save(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check {
         "hcaptcha" | "recaptcha" | "turnstile" => {
             let (Some(secret), Some(result)) = (secret.as_ref().and_then(|v| v.as_deref()), result)
             else {
-                return Err(invalid_parameters(
-                    "secret and captureResult are required",
-                ));
+                return Err(invalid_parameters("secret and captureResult are required"));
             };
             let url = match provider {
                 "hcaptcha" => "https://hcaptcha.com/siteverify",
@@ -294,12 +290,7 @@ async fn verify_siteverify(url: &str, secret: &str, response: &str) -> Check {
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn verify_mcaptcha(
-    instance_url: &str,
-    sitekey: &str,
-    secret: &str,
-    token: &str,
-) -> Check {
+async fn verify_mcaptcha(instance_url: &str, sitekey: &str, secret: &str, token: &str) -> Check {
     let url = format!(
         "{}/api/v1/pow/siteverify",
         instance_url.trim_end_matches('/')
@@ -338,13 +329,12 @@ async fn find_target(
     body: &Value,
 ) -> Check<Option<mk_db::user::LocalUserRow>> {
     let user_id = req_str(body, "userId")?;
-    mk_db::user::find_user_by_id(pool, user_id).await.map_err(db_err)
+    mk_db::user::find_user_by_id(pool, user_id)
+        .await
+        .map_err(db_err)
 }
 
-async fn load_user(
-    pool: &mk_db::sqlx::PgPool,
-    body: &Value,
-) -> Check<mk_db::user::LocalUserRow> {
+async fn load_user(pool: &mk_db::sqlx::PgPool, body: &Value) -> Check<mk_db::user::LocalUserRow> {
     match find_target(pool, body).await? {
         Some(user) => Ok(user),
         None => Err(internal()), // upstream `throw new Error('user not found')`
@@ -497,7 +487,9 @@ async fn unset_mfa(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> Che
     if target_is_admin && me_id != user.id {
         return Err(access_denied());
     }
-    mk_db::admin::unset_mfa(pool, &user.id).await.map_err(db_err)?;
+    mk_db::admin::unset_mfa(pool, &user.id)
+        .await
+        .map_err(db_err)?;
     log(
         pool,
         me_id,
@@ -619,11 +611,7 @@ async fn update_proxy_account(
 
 /// `admin/update-abuse-user-report.ts` → `AbuseReportService.update`
 /// (moderationNote only; the log fires only for a non-null changed note).
-async fn update_abuse_user_report(
-    pool: &mk_db::sqlx::PgPool,
-    body: &Value,
-    me_id: &str,
-) -> Check {
+async fn update_abuse_user_report(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> Check {
     let report_id = req_str(body, "reportId")?;
     let note = super::opt_nullable_str(body, "moderationNote")?;
     let Some(report) = mk_db::abuse::find_report(pool, report_id)
@@ -654,11 +642,7 @@ async fn update_abuse_user_report(
 
 /// `admin/show-moderation-logs.ts` — pagination + type/userId/search filters,
 /// `ModerationLogEntityService.pack` (createdAt from the AID, packed user).
-async fn show_moderation_logs(
-    state: &AppState,
-    pool: &mk_db::sqlx::PgPool,
-    body: &Value,
-) -> Check {
+async fn show_moderation_logs(state: &AppState, pool: &mk_db::sqlx::PgPool, body: &Value) -> Check {
     let limit = body
         .get("limit")
         .and_then(|v| v.as_i64())
@@ -738,11 +722,7 @@ async fn show_moderation_logs(
 /// `admin/roles/update-default-policies.ts` → `metaService.update({policies})`
 /// + `updateServerSettings` moderation log (the internal-event publish has no
 /// local bus; documented skip).
-async fn update_default_policies(
-    pool: &mk_db::sqlx::PgPool,
-    body: &Value,
-    me_id: &str,
-) -> Check {
+async fn update_default_policies(pool: &mk_db::sqlx::PgPool, body: &Value, me_id: &str) -> Check {
     let Some(policies) = body.get("policies") else {
         return Err(super::invalid_param("policies", "required"));
     };

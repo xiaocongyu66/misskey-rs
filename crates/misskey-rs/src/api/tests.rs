@@ -22397,12 +22397,7 @@ async fn app_auth_roundtrip() {
     assert_eq!(s, StatusCode::OK, "body: {shown}");
     assert_eq!(shown["secret"], json!(secret));
     assert_eq!(shown["isAuthorized"], json!(false));
-    let (s, guest) = post_json(
-        app.clone(),
-        "/api/app/show",
-        json!({ "appId": app_id }),
-    )
-    .await;
+    let (s, guest) = post_json(app.clone(), "/api/app/show", json!({ "appId": app_id })).await;
     assert_eq!(s, StatusCode::OK);
     assert!(guest.get("secret").is_none());
     assert!(guest.get("isAuthorized").is_none());
@@ -22496,7 +22491,11 @@ async fn app_auth_roundtrip() {
         json!({ "password": "test", "i": at }),
     )
     .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "old password rejected");
+    assert_eq!(
+        s,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "old password rejected"
+    );
     let (s, _) = post_json(
         app.clone(),
         "/api/i/regenerate-token",
@@ -22720,14 +22719,16 @@ async fn admin_misc2_slice2_roundtrip() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let keys: i64 = mk_db::sqlx::query_scalar(
-        r#"SELECT count(*) FROM "user_security_key" WHERE "userId"=$1"#,
-    )
-    .bind(&bob_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(!enabled && keys == 0, "mfa state: enabled={enabled} keys={keys}");
+    let keys: i64 =
+        mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_security_key" WHERE "userId"=$1"#)
+            .bind(&bob_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !enabled && keys == 0,
+        "mfa state: enabled={enabled} keys={keys}"
+    );
 
     // send-email with no meta.smtpHost → EmailService no-op, 204.
     let (s, body) = post_json(

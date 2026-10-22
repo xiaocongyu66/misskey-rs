@@ -497,11 +497,12 @@ pub async fn update_report_note(
     report_id: &str,
     note: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(r#"UPDATE "abuse_user_report" SET "moderationNote" = $2 WHERE "id" = $1"#)
-        .bind(report_id)
-        .bind(note)
-        .execute(pool)
-        .await?;
+    let res =
+        sqlx::query(r#"UPDATE "abuse_user_report" SET "moderationNote" = $2 WHERE "id" = $1"#)
+            .bind(report_id)
+            .bind(note)
+            .execute(pool)
+            .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -596,9 +597,8 @@ pub async fn list_moderation_logs(
     pool: &PgPool,
     q: &ModerationLogQuery<'_>,
 ) -> Result<Vec<ModerationLogRow>, sqlx::Error> {
-    let mut sql = String::from(
-        r#"SELECT "id", "userId", "type", "info" FROM "moderation_log" WHERE TRUE"#,
-    );
+    let mut sql =
+        String::from(r#"SELECT "id", "userId", "type", "info" FROM "moderation_log" WHERE TRUE"#);
     let mut binds: Vec<String> = Vec::new();
     if let Some(v) = q.since_id {
         binds.push(v.to_string());

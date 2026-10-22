@@ -7070,6 +7070,10 @@ mod admin_fedops;
 /// arm above (ahead of the admin/* catch-all).
 mod admin_drive;
 
+/// Module file `api/admin_misc2.rs` owns the captcha + user avatar/banner/note
+/// admin names (`endpoints/admin/{captcha/*,unset-user-avatar,
+/// unset-user-banner,update-user-note}.ts`).
+mod admin_misc2;
 /// `admin/{meta,get-table-stats,get-index-stats,get-user-ips}` reads
 /// (upstream `endpoints/admin/*.ts`). Module file `api/admin_stats.rs` owns
 /// the endpoint table + handlers and delegates `admin/meta` to the detailed
@@ -7077,10 +7081,6 @@ mod admin_drive;
 /// only registers the module and the dispatch arm above (ahead of the
 /// admin/* catch-all).
 mod admin_stats;
-/// Module file `api/admin_misc2.rs` owns the captcha + user avatar/banner/note
-/// admin names (`endpoints/admin/{captcha/*,unset-user-avatar,
-/// unset-user-banner,update-user-note}.ts`).
-mod admin_misc2;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file
