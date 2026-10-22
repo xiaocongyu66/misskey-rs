@@ -29,6 +29,9 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{ApiError, api_err};
+// sqlx is a mk-db dependency, not a direct one here: import the re-export so
+// the `sqlx::FromRow` derive and its `#[sqlx(...)]` helper attributes resolve.
+use mk_db::sqlx;
 
 pub(crate) const ENDPOINTS: &[&str] = &[
     "i/export-antennas",
@@ -450,7 +453,13 @@ async fn webhook_test(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -> 
             .timeout(std::time::Duration::from_secs(10))
             .build();
         if let Ok(client) = client {
-            if let Err(e) = client.post(&to).json(&payload).send().await {
+            if let Err(e) = client
+                .post(&to)
+                .header("content-type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+            {
                 tracing::warn!(target: "dbg_i_export_hooks", error = %e, "webhook test delivery failed");
             }
         }
