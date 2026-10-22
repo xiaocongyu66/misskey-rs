@@ -21445,7 +21445,7 @@ async fn seed_retention_row(pool: &mk_db::sqlx::PgPool, id: &str, users: i32, da
            VALUES ($1, now(), '{}', $2::jsonb, now(), $3, $1)"#,
     )
     .bind(id)
-    .bind(data.to_string())
+    .bind(data)
     .bind(users)
     .execute(pool)
     .await
@@ -21462,7 +21462,7 @@ async fn retention_reads_recent_aggregations() {
     let app = crate::build_router(test_state(pool.clone()));
 
     // Guest-ok, empty table → [].
-    let (s, body) = get_json(app.clone(), "/api/retention").await;
+    let (s, body) = get_json(&app, "/api/retention").await;
     assert_eq!(s, StatusCode::OK, "empty: {body}");
     assert_eq!(body, json!([]));
 
@@ -21471,7 +21471,7 @@ async fn retention_reads_recent_aggregations() {
 
     // id DESC (ret2 first) + the packed shape: usersCount → users,
     // createdAt ISO, data verbatim.
-    let (s, body) = get_json(app.clone(), "/api/retention").await;
+    let (s, body) = get_json(&app, "/api/retention").await;
     assert_eq!(s, StatusCode::OK, "list: {body}");
     let rows = body.as_array().expect("array");
     assert_eq!(rows.len(), 2, "list: {body}");
