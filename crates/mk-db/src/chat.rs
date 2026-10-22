@@ -637,6 +637,9 @@ pub async fn search_messages(
                  OR m."toRoomId" IN (
                      SELECT "roomId" FROM "chat_room_membership" WHERE "userId" = $1
                  )
+                 OR m."toRoomId" IN (
+                     SELECT "id" FROM "chat_room" WHERE "ownerId" = $1
+                 )
                )
              AND m."text" IS NOT NULL
              AND lower(m."text") LIKE '%' || lower($2) || '%'
