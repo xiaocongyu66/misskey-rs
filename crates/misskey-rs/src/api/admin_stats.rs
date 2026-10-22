@@ -24,6 +24,10 @@ use crate::error::{ApiError, api_err};
 use super::admin::{self, Gate};
 use super::{invalid_param, opt_int_param};
 
+/// Shared handler error shape (`Result<Response, Response>`) — same alias the
+/// other admin modules declare locally.
+type ApiResult = Result<Response, Response>;
+
 /// Endpoint names owned by this module (all POST-only, requireAdmin).
 const ENDPOINTS: &[&str] = &[
     "admin/meta",
