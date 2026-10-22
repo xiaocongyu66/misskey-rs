@@ -29,9 +29,6 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{ApiError, api_err};
-// sqlx is a mk-db dependency, not a direct one here: import the re-export so
-// the `sqlx::FromRow` derive and its `#[sqlx(...)]` helper attributes resolve.
-use mk_db::sqlx;
 
 pub(crate) const ENDPOINTS: &[&str] = &[
     "i/export-antennas",
@@ -168,20 +165,45 @@ async fn export_notes(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response
 // Webhooks
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct WebhookRow {
     id: String,
-    #[sqlx(rename = "userId")]
     user_id: String,
     name: String,
-    #[sqlx(rename = "on")]
     on: Vec<String>,
     url: String,
     secret: String,
     active: bool,
     latest_sent_at_ms: Option<i64>,
-    #[sqlx(rename = "latestStatus")]
     latest_status: Option<i32>,
+}
+
+/// Column order of `WEBHOOK_COLS`. This crate has no direct sqlx dependency,
+/// so the `FromRow` derive is unavailable and rows decode as a tuple.
+type WebhookTuple = (
+    String,
+    String,
+    String,
+    Vec<String>,
+    String,
+    String,
+    bool,
+    Option<i64>,
+    Option<i32>,
+);
+
+fn webhook_row(t: WebhookTuple) -> WebhookRow {
+    WebhookRow {
+        id: t.0,
+        user_id: t.1,
+        name: t.2,
+        on: t.3,
+        url: t.4,
+        secret: t.5,
+        active: t.6,
+        latest_sent_at_ms: t.7,
+        latest_status: t.8,
+    }
 }
 
 const WEBHOOK_COLS: &str = r#""id", "userId", "name", "on", "url", "secret", "active",
@@ -210,11 +232,12 @@ async fn find_webhook(
     user_id: &str,
 ) -> Result<Option<WebhookRow>, mk_db::sqlx::Error> {
     let sql = format!(r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "id" = $1 AND "userId" = $2"#);
-    mk_db::sqlx::query_as::<_, WebhookRow>(&sql)
+    mk_db::sqlx::query_as::<_, WebhookTuple>(&sql)
         .bind(webhook_id)
         .bind(user_id)
         .fetch_optional(pool)
         .await
+        .map(|row| row.map(webhook_row))
 }
 
 fn required_webhook_id(body: &Value) -> Result<String, Response> {
@@ -344,12 +367,15 @@ async fn webhook_delete(pool: &mk_db::sqlx::PgPool, me_id: &str, body: &Value) -
 async fn webhook_list(pool: &mk_db::sqlx::PgPool, me_id: &str) -> Check<Response> {
     let sql =
         format!(r#"SELECT {WEBHOOK_COLS} FROM "webhook" WHERE "userId" = $1 ORDER BY "id" ASC"#);
-    let rows = mk_db::sqlx::query_as::<_, WebhookRow>(&sql)
+    let rows = mk_db::sqlx::query_as::<_, WebhookTuple>(&sql)
         .bind(me_id)
         .fetch_all(pool)
         .await
         .map_err(|e| db_err("i/webhooks/list", e))?;
-    let out: Vec<Value> = rows.iter().map(pack_webhook).collect();
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|t| pack_webhook(&webhook_row(t)))
+        .collect();
     Ok(ok_json(json!(out)))
 }
 
