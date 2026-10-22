@@ -135,3 +135,22 @@ pub async fn parse_timestamptz_ms(pool: &PgPool, s: &str) -> Result<Option<i64>,
         .fetch_one(pool)
         .await
 }
+
+/// `invite/delete`: `registrationTicketsRepository.findOneBy({ id })`.
+pub async fn find_by_id(pool: &PgPool, id: &str) -> Result<Option<TicketRow>, sqlx::Error> {
+    sqlx::query_as::<_, TicketRow>(&format!(
+        r#"SELECT {COLS} FROM "registration_ticket" WHERE "id" = $1"#
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `invite/delete`: `registrationTicketsRepository.delete(ticket.id)`.
+pub async fn delete_by_id(pool: &PgPool, id: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(r#"DELETE FROM "registration_ticket" WHERE "id" = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}

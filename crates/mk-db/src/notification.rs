@@ -294,7 +294,7 @@ pub async fn ensure_table(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         DO $do$ BEGIN
-            CREATE TYPE public.notification_type_enum AS ENUM ('follow', 'mention', 'reply', 'renote', 'quote', 'note', 'reaction', 'pollVote', 'pollEnded', 'receiveFollowRequest', 'followRequestAccepted', 'groupInvited', 'achievementEarned', 'app');
+            CREATE TYPE public.notification_type_enum AS ENUM ('follow', 'mention', 'reply', 'renote', 'quote', 'note', 'reaction', 'pollVote', 'pollEnded', 'receiveFollowRequest', 'followRequestAccepted', 'groupInvited', 'achievementEarned', 'app', 'test');
         -- note-notify: migration 0005 ALTERs 'note' between 'quote' and
         -- 'reaction' (the NoteCreateService L806 'note' fanout). This
         -- self-heal path (42P01 → replay, normally after the e2e fixture's
@@ -338,5 +338,119 @@ pub async fn ensure_table(pool: &PgPool) -> Result<(), sqlx::Error> {
     ] {
         sqlx::query(stmt).execute(pool).await?;
     }
+    // `notifications/test-notification`: the pinned 0001 enum predates the
+    // 'test' value (upstream keeps notifications in Redis, so its migration
+    // chain never needed it). ADD VALUE IF NOT EXISTS is idempotent.
+    ensure_test_type(pool).await?;
+    Ok(())
+}
+
+async fn ensure_test_type(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"ALTER TYPE public.notification_type_enum ADD VALUE IF NOT EXISTS 'test'"#)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `notifications/create` — `NotificationService.createNotification('app')`
+/// with the custom body/header/icon + appAccessTokenId columns (the 0002
+/// table carries the 1585385921215-custom-notification shape).
+pub async fn insert_app_notification(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    custom_body: &str,
+    custom_header: Option<&str>,
+    custom_icon: Option<&str>,
+    app_access_token_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    match insert_app_notification_once(
+        pool,
+        id,
+        user_id,
+        custom_body,
+        custom_header,
+        custom_icon,
+        app_access_token_id,
+    )
+    .await
+    {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            insert_app_notification_once(
+                pool,
+                id,
+                user_id,
+                custom_body,
+                custom_header,
+                custom_icon,
+                app_access_token_id,
+            )
+            .await
+        }
+        r => r,
+    }
+}
+
+async fn insert_app_notification_once(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    custom_body: &str,
+    custom_header: Option<&str>,
+    custom_icon: Option<&str>,
+    app_access_token_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO "notification"
+            ("id", "createdAt", "notifieeId", "type", "isRead",
+             "customBody", "customHeader", "customIcon", "appAccessTokenId")
+        VALUES ($1, now(), $2, 'app'::notification_type_enum, FALSE, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(custom_body)
+    .bind(custom_header)
+    .bind(custom_icon)
+    .bind(app_access_token_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `notifications/test-notification` — `createNotification('test')`: a
+/// notifier-less row (pack shape is `{id, createdAt, type}`).
+pub async fn insert_test_notification(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    match insert_test_notification_once(pool, id, user_id).await {
+        Err(e) if is_undefined_table(&e) => {
+            ensure_table(pool).await?;
+            insert_test_notification_once(pool, id, user_id).await
+        }
+        r => r,
+    }
+}
+
+async fn insert_test_notification_once(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    ensure_test_type(pool).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO "notification" ("id", "createdAt", "notifieeId", "type", "isRead")
+        VALUES ($1, now(), $2, 'test'::notification_type_enum, FALSE)
+        "#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }

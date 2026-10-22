@@ -48,6 +48,7 @@ pub(super) fn handles(name: &str) -> bool {
             | "reversi/match"
             | "reversi/cancel"
             | "bubble-game/register"
+            | "bubble-game/ranking"
     )
 }
 
@@ -73,6 +74,7 @@ pub(super) async fn handle(
             }
         }
         "reversi/cancel" => cancel(state, body, token.as_deref()).await,
+        "bubble-game/ranking" => ranking(state, body).await,
         _ => register(state, body, token.as_deref()).await,
     }
 }
@@ -174,6 +176,7 @@ fn store() -> &'static Mutex<HashMap<String, Game>> {
 #[derive(Clone)]
 #[allow(dead_code)]
 struct ScoreRecord {
+    id: String,
     user_id: String,
     score: i64,
     seed: String,
@@ -519,7 +522,9 @@ async fn register(state: &AppState, body: &Value, token: Option<&str>) -> Respon
         return invalid_param("seed");
     }
     let logs = body.get("logs").cloned().unwrap_or_else(|| json!([]));
+    let at_ms = crate::api::now_ms();
     let record = ScoreRecord {
+        id: mk_types::id::gen_aid(at_ms as i64),
         user_id: me,
         score,
         seed: seed.to_string(),
@@ -529,7 +534,7 @@ async fn register(state: &AppState, body: &Value, token: Option<&str>) -> Respon
             .and_then(Value::as_str)
             .map(str::to_string),
         game_version: body.get("gameVersion").and_then(Value::as_i64),
-        at_ms: crate::api::now_ms(),
+        at_ms,
     };
     {
         let mut guard = scores().lock().unwrap();
@@ -540,4 +545,40 @@ async fn register(state: &AppState, body: &Value, token: Option<&str>) -> Respon
         }
     }
     (StatusCode::OK, axum::Json(json!({ "score": score }))).into_response()
+}
+
+/// `bubble-game/ranking` — top 10 scores in the process-wide ring, newest
+/// 7 days only (upstream `seededAt > now - 7d`, `gameMode` filter, score
+/// DESC). DIVERGENCE: upstream reads the `bubble_game_record` table and
+/// packs `UserLite`; this port ranks the in-process `scores()` ring (see
+/// module header) and packs users through the same UserLite helper.
+async fn ranking(state: &AppState, body: &Value) -> Response {
+    let Some(pool) = &state.pool else {
+        return internal();
+    };
+    let game_mode = body.get("gameMode").and_then(Value::as_str);
+    let now = crate::api::now_ms();
+    let cutoff = now.saturating_sub(7 * 24 * 60 * 60 * 1000);
+
+    let mut rows: Vec<ScoreRecord> = {
+        let guard = scores().lock().unwrap();
+        guard
+            .iter()
+            .filter(|r| r.at_ms >= cutoff)
+            .filter(|r| game_mode.map_or(true, |m| r.game_mode.as_deref() == Some(m)))
+            .cloned()
+            .collect()
+    };
+    rows.sort_by(|a, b| b.score.cmp(&a.score).then(a.at_ms.cmp(&b.at_ms)));
+    rows.truncate(10);
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(json!({
+            "id": r.id,
+            "score": r.score,
+            "user": pack_user(state, pool, &r.user_id).await,
+        }));
+    }
+    (StatusCode::OK, axum::Json(json!(out))).into_response()
 }

@@ -1166,3 +1166,12 @@ pub async fn user_reaction_rows(
         .fetch_all(pool)
         .await
 }
+
+/// `ApDbResolverService.getNoteFromApId` remote branch:
+/// `findOneBy({ uri })` → the note id (ap/show local table lookup).
+pub async fn find_note_id_by_uri(pool: &PgPool, uri: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT "id" FROM "note" WHERE "uri" = $1 LIMIT 1"#)
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
+}

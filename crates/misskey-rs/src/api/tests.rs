@@ -22118,3 +22118,135 @@ async fn drive_folders_show_find_delete_and_move_bulk() {
     assert_eq!(s, StatusCode::OK, "body: {body}");
     assert_eq!(body.as_array().unwrap().len(), 0);
 }
+
+// notifications/{test-notification,flush} — the test row lands unread, flush
+// marks every row read (upstream deletes the Redis timeline; see
+// api::ap_sw_misc).
+#[tokio::test]
+async fn ap_sw_misc_notifications_test_and_flush() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapswnotif").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("apn{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/notifications/test-notification",
+        json!({ "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    let (s, list) = post_json(
+        app.clone(),
+        "/api/notifications",
+        json!({ "i": at, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"].as_str() == Some("test")),
+        "test notification listed: {list}"
+    );
+
+    let (s, body) = post_json(app.clone(), "/api/notifications/flush", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+
+    let (s, list) = post_json(
+        app,
+        "/api/notifications",
+        json!({ "i": at, "unreadOnly": true }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {list}");
+    assert!(list.as_array().unwrap().is_empty(), "flushed: {list}");
+}
+
+// invite/delete removes a registration_ticket owned by the caller.
+#[tokio::test]
+async fn ap_sw_misc_invite_delete_removes_ticket() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapswninvite").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("api{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+
+    let ticket_id = mk_types::id::gen_aid(crate::api::now_ms() as i64);
+    let code = format!("code{}", mk_types::id::gen_aid_now());
+    mk_db::invite::insert(&pool, &ticket_id, &code, None, &alice_id)
+        .await
+        .unwrap();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/invite/delete",
+        json!({ "i": at, "inviteId": ticket_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {body}");
+    assert!(
+        mk_db::invite::find_by_id(&pool, &ticket_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "ticket removed"
+    );
+
+    // unknown ticket → NO_SUCH_INVITE_CODE
+    let (s, body) = post_json(
+        app,
+        "/api/invite/delete",
+        json!({ "i": at, "inviteId": "0000000000" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_INVITE_CODE"));
+}
+
+// bubble-game/ranking ranks the in-process score ring (score DESC, top 10).
+#[tokio::test]
+async fn ap_sw_misc_bubble_game_ranking() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkapswnrank").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let alice = signup(&app, &format!("apr{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let alice_id = alice["id"].as_str().unwrap().to_string();
+    let mode = format!("m{}", mk_types::id::gen_aid_now());
+    let seed = crate::api::now_ms().to_string();
+
+    for score in [5, 123, 42] {
+        let (s, body) = post_json(
+            app.clone(),
+            "/api/bubble-game/register",
+            json!({ "i": at, "score": score, "seed": seed, "logs": [], "gameMode": mode }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {body}");
+    }
+
+    let (s, ranking) =
+        post_json(app, "/api/bubble-game/ranking", json!({ "gameMode": mode })).await;
+    assert_eq!(s, StatusCode::OK, "body: {ranking}");
+    let rows = ranking.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "ranking: {ranking}");
+    assert_eq!(rows[0]["score"], json!(123));
+    assert_eq!(rows[1]["score"], json!(42));
+    assert_eq!(rows[2]["score"], json!(5));
+    assert_eq!(rows[0]["user"]["id"], json!(alice_id));
+    assert!(rows[0]["id"].as_str().is_some());
+}

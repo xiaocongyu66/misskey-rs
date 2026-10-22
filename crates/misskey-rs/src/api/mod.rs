@@ -200,6 +200,12 @@ pub(crate) mod queue_processors;
 // followers/following/users reads (upstream endpoints/federation/*.ts @
 // ea2c3aed; `update-remote-user` needs the AP fetch lane and stays out).
 mod federation_more;
+// ap-sw-misc: ap/show (local-table half), sw/{show,update}-registration,
+// notifications/{create,flush,test-notification}, federation/update-remote-user
+// (documented no-op refresh) + invite/delete — api::ap_sw_misc; db helpers
+// appended to mk-db/src/{user,note,sw,notification,invite}.rs. ap/get is a
+// documented skip (no generic AP resolver in this workspace).
+mod ap_sw_misc;
 // hashtags-agent: hashtags/{trend,show,list} (upstream endpoints/hashtags/*;
 // db paths in mk-db/src/hashtag.rs — hashtag + __chart__hashtag ship in the
 // 0001 baseline). hashtags/users stays out (UserDetailed pack).
@@ -761,7 +767,9 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     // reversi/games + the `{ gameId }` shape of reversi/match resolve here;
     // legacy `{ userId }` match bodies delegate back to api::reversi.
     if games::handles(name.as_str()) {
-        if method != Method::POST {
+        // bubble-game/ranking is `allowGet: true` upstream (guest-ok).
+        let get_ok = name == "bubble-game/ranking" && method == Method::GET;
+        if method != Method::POST && !get_ok {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         let headers = req.headers().clone();
@@ -1773,6 +1781,28 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return federation_more::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END federation DISPATCH ARM ====
+
+    // ==== ap/sw/notifications-misc DISPATCH ARM ====
+    // Self-contained block: ap/show (local-table lookup), sw show/update
+    // registration, notifications create/flush/test, the update-remote-user
+    // no-op refresh and invite/delete — bodies in api::ap_sw_misc, SQL in
+    // mk-db/src/{user,note,sw,notification,invite}.rs. None of the names
+    // collide with an earlier arm (federation_more does not own
+    // update-remote-user).
+    if ap_sw_misc::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        let credential_declared = body.get("i").is_some();
+        return ap_sw_misc::handle(&state, name.as_str(), &body, token, credential_declared).await;
+    }
+    // ==== END ap/sw/notifications-misc DISPATCH ARM ====
 
     // ==== hashtags DISPATCH ARM (hashtags/*) ====
     // Self-contained block: method check, body parsing and token extraction

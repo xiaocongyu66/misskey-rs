@@ -1171,3 +1171,15 @@ pub async fn merge_user_tags(
     }
     Ok(())
 }
+
+/// `ApDbResolverService.getUserFromApId` remote branch:
+/// `findOneBy({ uri, isDeleted: false })` → the local user id (ap/show local
+/// table lookup).
+pub async fn find_user_id_by_uri(pool: &PgPool, uri: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT "id" FROM "user" WHERE "uri" = $1 AND "isDeleted" = FALSE LIMIT 1"#,
+    )
+    .bind(uri)
+    .fetch_optional(pool)
+    .await
+}

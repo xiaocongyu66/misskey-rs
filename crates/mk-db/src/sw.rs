@@ -109,3 +109,44 @@ pub async fn delete_subscription(
     .await?;
     Ok(res.rows_affected())
 }
+
+/// One registration as `sw/show-registration` + `sw/update-registration`
+/// read it (`findOneBy({ userId, endpoint })`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RegistrationRow {
+    pub id: String,
+    pub endpoint: String,
+    #[sqlx(rename = "sendReadMessage")]
+    pub send_read_message: bool,
+}
+
+/// `swSubscriptionsRepository.findOneBy({ userId, endpoint })`.
+pub async fn find_registration(
+    pool: &PgPool,
+    user_id: &str,
+    endpoint: &str,
+) -> Result<Option<RegistrationRow>, sqlx::Error> {
+    sqlx::query_as::<_, RegistrationRow>(
+        r#"SELECT "id", "endpoint", "sendReadMessage" FROM "sw_subscription"
+           WHERE "userId" = $1 AND "endpoint" = $2
+           ORDER BY "id" LIMIT 1"#,
+    )
+    .bind(user_id)
+    .bind(endpoint)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `sw/update-registration` write (`update(id, { sendReadMessage })`).
+pub async fn update_send_read_message(
+    pool: &PgPool,
+    id: &str,
+    send_read_message: bool,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(r#"UPDATE "sw_subscription" SET "sendReadMessage" = $2 WHERE "id" = $1"#)
+        .bind(id)
+        .bind(send_read_message)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
