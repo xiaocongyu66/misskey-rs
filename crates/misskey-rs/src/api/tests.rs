@@ -23170,3 +23170,139 @@ async fn roles_list_and_show_public_explorable() {
         json!("de5502bf-009a-4639-86c1-fec349e46dcb")
     );
 }
+
+// i/export-antennas + i/export-notes + the i/webhooks/* CRUD family.
+// Export divergence: upstream queues a zip export job; this rewrite returns
+// the caller's rows as JSON (see api/i_export_hooks.rs).
+#[tokio::test]
+async fn i_export_antennas_and_webhooks_crud() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_exporthooks").await;
+    let username = format!("ieh{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+    let signed = signup(&app, &username).await;
+    let token = signed["token"].as_str().unwrap().to_string();
+    let me_id = resolve_me(&pool, Some(&token)).await.unwrap();
+
+    // Seed one owned antenna.
+    let antenna_id = mk_types::id::gen_aid_now();
+    mk_db::sqlx::query(
+        r#"INSERT INTO "antenna" ("id","userId","name","src","withFile","lastUsedAt")
+           VALUES ($1,$2,'mine','home',false,now())"#,
+    )
+    .bind(&antenna_id)
+    .bind(&me_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // export-antennas → the caller's antenna, packed like antennas/list.
+    let (s, exported) =
+        post_json(app.clone(), "/api/i/export-antennas", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "export-antennas: {exported}");
+    let arr = exported.as_array().expect("antenna array");
+    assert_eq!(arr.len(), 1, "export-antennas: {exported}");
+    assert_eq!(arr[0]["id"], json!(antenna_id));
+    assert_eq!(arr[0]["name"], json!("mine"));
+    assert_eq!(arr[0]["src"], json!("home"));
+    assert_eq!(arr[0]["userId"], json!(me_id));
+
+    // export-notes → JSON array (empty here).
+    let (s, notes) = post_json(app.clone(), "/api/i/export-notes", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "export-notes: {notes}");
+    assert_eq!(notes, json!([]));
+
+    // webhooks/create → packed row.
+    let (s, created) = post_json(
+        app.clone(),
+        "/api/i/webhooks/create",
+        json!({
+            "name": "hook",
+            "url": "http://127.0.0.1:1/hook",
+            "on": ["note", "follow"],
+            "i": token,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "webhooks/create: {created}");
+    let webhook_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["userId"], json!(me_id));
+    assert_eq!(created["name"], json!("hook"));
+    assert_eq!(created["on"], json!(["note", "follow"]));
+    assert_eq!(created["secret"], json!(""));
+    assert_eq!(created["active"], json!(true));
+    assert_eq!(created["latestSentAt"], json!(null));
+
+    // list + show.
+    let (s, list) = post_json(app.clone(), "/api/i/webhooks/list", json!({ "i": token })).await;
+    assert_eq!(s, StatusCode::OK, "webhooks/list: {list}");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], json!(webhook_id));
+
+    let (s, shown) = post_json(
+        app.clone(),
+        "/api/i/webhooks/show",
+        json!({ "webhookId": webhook_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "webhooks/show: {shown}");
+    assert_eq!(shown["id"], json!(webhook_id));
+
+    // update (partial: absent fields keep their value) → 204.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/webhooks/update",
+        json!({ "webhookId": webhook_id, "name": "renamed", "active": false, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "webhooks/update: {body}");
+    let (_, shown) = post_json(
+        app.clone(),
+        "/api/i/webhooks/show",
+        json!({ "webhookId": webhook_id, "i": token }),
+    )
+    .await;
+    assert_eq!(shown["name"], json!("renamed"));
+    assert_eq!(shown["active"], json!(false));
+    assert_eq!(shown["url"], json!("http://127.0.0.1:1/hook"));
+    assert_eq!(shown["on"], json!(["note", "follow"]));
+
+    // test → 204 (delivery is backgrounded, unreachable URL is fine).
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/webhooks/test",
+        json!({ "webhookId": webhook_id, "type": "note", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "webhooks/test: {body}");
+
+    // Unknown id resolves NO_SUCH_WEBHOOK, not 403.
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/i/webhooks/show",
+        json!({ "webhookId": "nonexistent", "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "webhooks/show unknown: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_WEBHOOK"));
+
+    // delete → 204, then show → NO_SUCH_WEBHOOK.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/i/webhooks/delete",
+        json!({ "webhookId": webhook_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "webhooks/delete: {body}");
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/i/webhooks/show",
+        json!({ "webhookId": webhook_id, "i": token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "webhooks/show deleted: {err}");
+    assert_eq!(err["error"]["code"], json!("NO_SUCH_WEBHOOK"));
+}

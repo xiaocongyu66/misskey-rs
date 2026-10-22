@@ -128,7 +128,7 @@ pub(crate) async fn handle(
 // AntennaEntityService.pack
 // ---------------------------------------------------------------------------
 
-fn pack_antenna(row: &mk_db::antennas::AntennaRow) -> Value {
+pub(crate) fn pack_antenna(row: &mk_db::antennas::AntennaRow) -> Value {
     let keywords: Value = serde_json::from_str(&row.keywords).unwrap_or_else(|_| json!([]));
     let exclude_keywords: Value =
         serde_json::from_str(&row.exclude_keywords).unwrap_or_else(|_| json!([]));

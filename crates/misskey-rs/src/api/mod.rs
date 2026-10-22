@@ -88,11 +88,6 @@ mod i_more;
 // handlers; SQL lives in mk-db/src/{registry,signin}.rs (both tables ship in
 // the 0001 baseline).
 mod i_registry;
-// i-export-hooks arena: i/export-{antennas,notes} (upstream enqueues a zip
-// export job; this rewrite answers the caller's rows as JSON — documented in
-// api/i_export_hooks.rs) + the i/webhooks/{create,delete,list,show,update,
-// test} family over the 0001 `webhook` table.
-mod i_export_hooks;
 // announcements-agent: the announcements family (announcements +
 // announcements/show + i/read-announcement + admin/announcements/*) — db
 // paths in mk-db/src/announcement.rs (tables ship in the 0001 baseline).
@@ -1831,40 +1826,6 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return i_registry::handle(&state, name.as_str(), &body, token).await;
     }
     // ==== END i-registry DISPATCH ARM ====
-
-    // ==== i-export-hooks DISPATCH ARM (i/export-{antennas,notes} +
-    // i/webhooks/*) ====
-    // Self-contained block on the i-registry pattern: method check, body
-    // parsing, token extraction and the credential-declared probe live here;
-    // the requireCredential gate + handlers in api::i_export_hooks (all SQL
-    // inline over the 0001 `webhook`/`antenna`/`note` tables). Sits ahead of
-    // the M0_ENDPOINTS fallthrough and shadows no earlier arm.
-    if i_export_hooks::handles(name.as_str()) {
-        if method != Method::POST {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        let headers = req.headers().clone();
-        let body = match parse_json_body(req).await {
-            Ok(b) => b,
-            Err(resp) => return resp,
-        };
-        let credential_declared = body.get("i").is_some()
-            || headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.starts_with("Bearer "))
-                .unwrap_or(false);
-        let token = extract_token(&body, &headers);
-        return i_export_hooks::handle(
-            &state,
-            name.as_str(),
-            &body,
-            token,
-            credential_declared,
-        )
-        .await;
-    }
-    // ==== END i-export-hooks DISPATCH ARM ====
 
     // ==== federation DISPATCH ARM (federation/*) ====
     // Self-contained block on the clips-arm pattern: method check, body parse
