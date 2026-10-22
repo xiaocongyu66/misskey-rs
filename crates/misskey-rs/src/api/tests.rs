@@ -20191,3 +20191,174 @@ async fn federation_instances_show_stats_and_host_lists() {
     assert_eq!(body.as_array().unwrap().len(), 2, "body: {body}");
     assert_eq!(body[0]["followeeId"], json!("u1"));
 }
+
+/// `following/invalidate` + `following/requests/list` (upstream
+/// endpoints/following/{invalidate,requests/list}.ts):
+/// follow → ALREADY_FOLLOWING → invalidate (edge + counters swept) →
+/// invalidate again (silent no-op); pending requests list packs the
+/// requester as UserDetailedNotMe and only for the followee.
+#[tokio::test]
+async fn social_follow_invalidate_and_requests_list() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mksocial_invalidate").await;
+    let uname_a = format!("socinv_a{}", mk_types::id::gen_aid_now());
+    let uname_b = format!("socinv_b{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let a = signup(&app, &uname_a).await;
+    let b = signup(&app, &uname_b).await;
+    let (a_id, a_token) = (a["id"].as_str().unwrap(), a["token"].as_str().unwrap());
+    let (b_id, b_token) = (b["id"].as_str().unwrap(), b["token"].as_str().unwrap());
+
+    // auth gate: no credential → CREDENTIAL_REQUIRED
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/following/invalidate",
+        json!({ "userId": b_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // follow → edge + counters
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["isFollowing"], json!(true));
+    let (follower, followee): (String, String) = mk_db::sqlx::query_as(
+        r#"SELECT "followerId", "followeeId" FROM "following" WHERE "followerId" = $1"#,
+    )
+    .bind(a_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(follower, a_id);
+    assert_eq!(followee, b_id);
+
+    // already following → 400 ALREADY_FOLLOWING
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("ALREADY_FOLLOWING"));
+
+    // invalidate → packed followee, edge + counters swept
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/invalidate",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["id"], json!(b_id));
+    assert_eq!(body["isFollowing"], json!(false));
+    assert_eq!(
+        count_rows(
+            &pool,
+            r#"SELECT count(*) FROM "following" WHERE "followerId" = $1 AND "followeeId" = $2"#,
+            a_id,
+            b_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            r#"SELECT "followingCount"::bigint FROM "user" WHERE "id" = $1"#,
+            a_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            r#"SELECT "followersCount"::bigint FROM "user" WHERE "id" = $1"#,
+            b_id
+        )
+        .await,
+        0
+    );
+
+    // invalidate again → silent no-op (unlike following/delete's 400)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/invalidate",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body["isFollowing"], json!(false));
+
+    // unknown target → findOneByOrFail → 500 INTERNAL_ERROR
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/following/invalidate",
+        json!({ "userId": "zzzzzzzzzzzz", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INTERNAL_ERROR"));
+
+    // lock b, then a follows → pending follow_request (no edge)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/i/update",
+        json!({ "isLocked": true, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/create",
+        json!({ "userId": b_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let (req_follower, req_followee): (String, String) = mk_db::sqlx::query_as(
+        r#"SELECT "followerId", "followeeId" FROM "follow_request" WHERE "followeeId" = $1"#,
+    )
+    .bind(b_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(req_follower, a_id);
+    assert_eq!(req_followee, b_id);
+
+    // followee sees the requester packed
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/requests/list",
+        json!({ "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {body}");
+    assert_eq!(arr[0]["id"], json!(a_id));
+    assert_eq!(arr[0]["username"], json!(uname_a));
+
+    // limit is honoured; the requester's own list is empty
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/following/requests/list",
+        json!({ "i": b_token, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    let (s, body) = post_json(app, "/api/following/requests/list", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!([]));
+}
