@@ -269,6 +269,172 @@ pub async fn moderation_note(pool: &PgPool, user_id: &str) -> Result<Option<Stri
     Ok(v.flatten())
 }
 
+/// `admin/update-user-note.ts` `userProfilesRepository.update({ userId },
+/// { moderationNote: ps.text })`.
+pub async fn set_moderation_note(
+    pool: &PgPool,
+    user_id: &str,
+    note: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "user_profile" SET "moderationNote" = $2 WHERE "userId" = $1"#)
+        .bind(user_id)
+        .bind(note)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `CaptchaService.get()` — the single `meta` row's captcha columns.
+#[derive(Debug, sqlx::FromRow)]
+pub struct CaptchaSettings {
+    pub provider: String,
+    #[sqlx(rename = "hcaptchaSiteKey")]
+    pub hcaptcha_site_key: Option<String>,
+    #[sqlx(rename = "hcaptchaSecretKey")]
+    pub hcaptcha_secret_key: Option<String>,
+    #[sqlx(rename = "mcaptchaSiteKey")]
+    pub mcaptcha_site_key: Option<String>,
+    #[sqlx(rename = "mcaptchaSecretKey")]
+    pub mcaptcha_secret_key: Option<String>,
+    #[sqlx(rename = "mcaptchaInstanceUrl")]
+    pub mcaptcha_instance_url: Option<String>,
+    #[sqlx(rename = "recaptchaSiteKey")]
+    pub recaptcha_site_key: Option<String>,
+    #[sqlx(rename = "recaptchaSecretKey")]
+    pub recaptcha_secret_key: Option<String>,
+    #[sqlx(rename = "turnstileSiteKey")]
+    pub turnstile_site_key: Option<String>,
+    #[sqlx(rename = "turnstileSecretKey")]
+    pub turnstile_secret_key: Option<String>,
+}
+
+impl Default for CaptchaSettings {
+    fn default() -> Self {
+        Self {
+            provider: "none".to_string(),
+            hcaptcha_site_key: None,
+            hcaptcha_secret_key: None,
+            mcaptcha_site_key: None,
+            mcaptcha_secret_key: None,
+            mcaptcha_instance_url: None,
+            recaptcha_site_key: None,
+            recaptcha_secret_key: None,
+            turnstile_site_key: None,
+            turnstile_secret_key: None,
+        }
+    }
+}
+
+/// `CaptchaService.get()` provider switch order (hcaptcha → mcaptcha →
+/// recaptcha → turnstile → testcaptcha → none) + the per-provider keys.
+pub async fn captcha_settings(pool: &PgPool) -> Result<CaptchaSettings, sqlx::Error> {
+    let row = sqlx::query_as::<_, CaptchaSettings>(
+        r#"
+        SELECT
+          CASE
+            WHEN "enableHcaptcha" THEN 'hcaptcha'
+            WHEN "enableMcaptcha" THEN 'mcaptcha'
+            WHEN "enableRecaptcha" THEN 'recaptcha'
+            WHEN "enableTurnstile" THEN 'turnstile'
+            WHEN "enableTestcaptcha" THEN 'testcaptcha'
+            ELSE 'none'
+          END AS "provider",
+          "hcaptchaSiteKey", "hcaptchaSecretKey",
+          "mcaptchaSitekey" AS "mcaptchaSiteKey", "mcaptchaSecretKey",
+          "mcaptchaInstanceUrl",
+          "recaptchaSiteKey", "recaptchaSecretKey",
+          "turnstileSiteKey", "turnstileSecretKey"
+        FROM "meta" LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or_default())
+}
+
+/// `CaptchaService.updateMeta` — one flag per provider plus the provider's
+/// keys. `None` = param absent (column untouched); `Some(None)` = explicit
+/// null. Upserts the single meta row (`id = 'x'`, matching the other
+/// meta writers).
+pub async fn update_captcha_meta(
+    pool: &PgPool,
+    provider: &str,
+    sitekey: Option<Option<&str>>,
+    secret: Option<Option<&str>>,
+    instance_url: Option<Option<&str>>,
+) -> Result<(), sqlx::Error> {
+    let flags: [(&str, bool); 5] = [
+        ("enableHcaptcha", provider == "hcaptcha"),
+        ("enableMcaptcha", provider == "mcaptcha"),
+        ("enableRecaptcha", provider == "recaptcha"),
+        ("enableTurnstile", provider == "turnstile"),
+        ("enableTestcaptcha", provider == "testcaptcha"),
+    ];
+    let mut extra: Vec<(&str, Option<&str>)> = Vec::new();
+    match provider {
+        "hcaptcha" => {
+            if let Some(v) = sitekey {
+                extra.push(("hcaptchaSiteKey", v));
+            }
+            if let Some(v) = secret {
+                extra.push(("hcaptchaSecretKey", v));
+            }
+        }
+        "mcaptcha" => {
+            if let Some(v) = sitekey {
+                extra.push(("mcaptchaSitekey", v));
+            }
+            if let Some(v) = secret {
+                extra.push(("mcaptchaSecretKey", v));
+            }
+            if let Some(v) = instance_url {
+                extra.push(("mcaptchaInstanceUrl", v));
+            }
+        }
+        "recaptcha" => {
+            if let Some(v) = sitekey {
+                extra.push(("recaptchaSiteKey", v));
+            }
+            if let Some(v) = secret {
+                extra.push(("recaptchaSecretKey", v));
+            }
+        }
+        "turnstile" => {
+            if let Some(v) = sitekey {
+                extra.push(("turnstileSiteKey", v));
+            }
+            if let Some(v) = secret {
+                extra.push(("turnstileSecretKey", v));
+            }
+        }
+        _ => {}
+    }
+
+    let mut names: Vec<String> = flags.iter().map(|(c, _)| format!("\"{c}\"")).collect();
+    names.extend(extra.iter().map(|(c, _)| format!("\"{c}\"")));
+    let params: Vec<String> = (1..=names.len()).map(|i| format!("${i}")).collect();
+    let sets = names
+        .iter()
+        .map(|c| format!("{c} = EXCLUDED.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"INSERT INTO "meta" ("id", {}) VALUES ('x', {}) ON CONFLICT ("id") DO UPDATE SET {}"#,
+        names.join(", "),
+        params.join(", "),
+        sets
+    );
+    let mut q = sqlx::query(&sql);
+    for (_, f) in &flags {
+        q = q.bind(*f);
+    }
+    for (_, v) in &extra {
+        q = q.bind(*v);
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
 /// ("user"."lastActiveDate" as epoch-ms, "isHibernated") for the
 /// admin/show-user response (the M1 LocalUserRow carries neither).
 pub async fn user_moderation_columns(

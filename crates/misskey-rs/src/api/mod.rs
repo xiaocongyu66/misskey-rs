@@ -1042,6 +1042,24 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END invite-promo DISPATCH ARM ====
 
+    // ==== admin-misc2 DISPATCH ARM (captcha + user avatar/banner/note) ====
+    // Self-contained on the admin-abuse pattern: method check, body parsing
+    // and token extraction live here; gates/bodies in api::admin_misc2 (SQL in
+    // mk-db/src/admin.rs). Sits ahead of the admin/* catch-all below.
+    if admin_misc2::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_misc2::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-misc2 DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -7020,6 +7038,10 @@ mod admin_drive;
 /// only registers the module and the dispatch arm above (ahead of the
 /// admin/* catch-all).
 mod admin_stats;
+/// Module file `api/admin_misc2.rs` owns the captcha + user avatar/banner/note
+/// admin names (`endpoints/admin/{captcha/*,unset-user-avatar,
+/// unset-user-banner,update-user-note}.ts`).
+mod admin_misc2;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file

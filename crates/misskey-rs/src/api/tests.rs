@@ -22347,3 +22347,146 @@ async fn chat_react_search_roundtrip() {
     assert_eq!(body.as_array().unwrap().len(), 1);
     assert_eq!(a_id, alice["id"].as_str().unwrap());
 }
+
+/// `admin/captcha/*` + `admin/unset-user-{avatar,banner}` +
+/// `admin/update-user-note`: captcha save→current round-trip (none +
+/// testcaptcha), avatar/banner clearing (including the null-id early return),
+/// moderation-note persistence and the non-moderator 403.
+#[tokio::test]
+async fn admin_misc2_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkmisc2").await;
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let app = crate::build_router(test_state(pool.clone()));
+
+    // First signup stamps meta.rootUserId → admin/moderator gate bypass.
+    let root = signup(&app, &uname("misca")).await;
+    let root_token = root["token"].as_str().unwrap().to_string();
+    let bob = signup(&app, &uname("miscb")).await;
+    let bob_token = bob["token"].as_str().unwrap().to_string();
+    let bob_id = bob["id"].as_str().unwrap().to_string();
+
+    // Plain user → ROLE_PERMISSION_DENIED 403.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/update-user-note",
+        json!({ "userId": bob_id, "text": "nope", "i": bob_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "non-admin: {body}");
+
+    // captcha save 'none' → current reflects it.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/captcha/save",
+        json!({ "provider": "none", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "save none: {body}");
+    let (s, cur) = post_json(
+        app.clone(),
+        "/api/admin/captcha/current",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "current: {cur}");
+    assert_eq!(cur["provider"], json!("none"));
+    assert_eq!(cur["hcaptcha"]["siteKey"], Value::Null);
+    assert_eq!(cur["mcaptcha"]["instanceUrl"], Value::Null);
+
+    // testcaptcha: bad result → 400, pass phrase → 204 + current.
+    let (s, _b) = post_json(
+        app.clone(),
+        "/api/admin/captcha/save",
+        json!({ "provider": "testcaptcha", "captchaResult": "nope", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/captcha/save",
+        json!({ "provider": "testcaptcha", "captchaResult": "testcaptcha-passed", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "save testcaptcha: {body}");
+    let (_, cur) = post_json(
+        app.clone(),
+        "/api/admin/captcha/current",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(cur["provider"], json!("testcaptcha"));
+
+    // Seed avatar + banner directly, then unset each.
+    mk_db::user::update_avatar_banner(
+        &pool,
+        &bob_id,
+        mk_db::user::AvatarBannerOp::Set {
+            id: "av1".to_string(),
+            url: "http://example.test/av.png".to_string(),
+            blurhash: Some("bh".to_string()),
+        },
+        mk_db::user::AvatarBannerOp::Set {
+            id: "bn1".to_string(),
+            url: "http://example.test/bn.png".to_string(),
+            blurhash: Some("bh".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/unset-user-avatar",
+        json!({ "userId": bob_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "unset avatar: {body}");
+    let u = mk_db::user::find_user_by_id(&pool, &bob_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(u.avatar_id.is_none() && u.avatar_url.is_none() && u.avatar_blurhash.is_none());
+    assert!(u.banner_id.is_some(), "banner untouched");
+
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/unset-user-banner",
+        json!({ "userId": bob_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "unset banner: {body}");
+    let u = mk_db::user::find_user_by_id(&pool, &bob_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(u.banner_id.is_none() && u.banner_url.is_none() && u.banner_blurhash.is_none());
+
+    // Idempotent early return when already unset.
+    let (s, _b) = post_json(
+        app.clone(),
+        "/api/admin/unset-user-avatar",
+        json!({ "userId": bob_id, "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // update-user-note persists to user_profile.moderationNote.
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/admin/update-user-note",
+        json!({ "userId": bob_id, "text": "watch this one", "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "note: {body}");
+    assert_eq!(
+        mk_db::admin::moderation_note(&pool, &bob_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("watch this one")
+    );
+}
