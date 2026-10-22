@@ -819,6 +819,27 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     }
     // ==== END admin-queue DISPATCH ARM ====
 
+    // ==== admin-relays DISPATCH ARM (admin/relays/{list,add,remove}) ====
+    // Noses in ahead of the admin/* catch-all (admin-queue convention):
+    // api::admin_relays owns only these three names; every other admin/*
+    // name keeps falling through. Method check, body parsing and token
+    // extraction live in the arm; the shared requireModerator gate and the
+    // relay handlers (DB-row-only, no outbound AP handshake) live in
+    // api::admin_relays (SQL in mk-db/src/relay.rs).
+    if admin_relays::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let token = extract_token(&body, &headers);
+        return admin_relays::handle(&state, name.as_str(), &body, token.as_deref()).await;
+    }
+    // ==== END admin-relays DISPATCH ARM ====
+
     // ==== ADMIN DISPATCH ARM (M2 admin slice) ====
     // Single arm routing every `admin/*` name into api::admin so the mod.rs
     // surface stays one hunk (rebase-trivial per the slice plan). Method
@@ -6490,6 +6511,14 @@ mod admin_queue;
 /// `mk-db/src/emoji.rs`. mod.rs only registers the module and the dispatch
 /// arm above (ahead of the admin/* catch-all).
 mod admin_emoji;
+
+/// `admin/relays/*` family (upstream `endpoints/admin/relays/*.ts` over
+/// `core/RelayService.ts`). Module file `api/admin_relays.rs` owns the
+/// endpoint table + handlers and the shared requireModerator gate; SQL lives
+/// in `mk-db/src/relay.rs`. DB-row-only (no outbound AP Follow/Undo lane).
+/// mod.rs only registers the module and the dispatch arm above (ahead of the
+/// admin/* catch-all).
+mod admin_relays;
 
 /// arena-streaming: `miauth/gen-token` + the /streaming ws-hub access-token
 /// authenticate (streaming.ts Authentication lane; module file

@@ -19762,3 +19762,137 @@ async fn gallery_arena_crud_like_list() {
         json!("1137bf14-c5b0-4604-85bb-5b5371b1cd45")
     );
 }
+
+/// `admin/relays/*`: add → list → remove roundtrip over the 0001 `relay`
+/// table, duplicate inbox → 500 (upstream uncaught UNIQUE violation),
+/// non-admin 403 (requireModerator gate), invalid URL 400.
+#[tokio::test]
+async fn admin_relays_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkadmin_relays_rt").await;
+    let app = crate::build_router(test_state(pool.clone()));
+    let root_token = signup(&app, "root").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_token =
+        signup(&app, &format!("plainrelay{}", mk_types::id::gen_aid_now())).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    // non-admin → 403 moderator ROLE_PERMISSION_DENIED
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": plain_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("ROLE_PERMISSION_DENIED"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("d33d5333-db36-423d-a8f9-1a2b9549da41")
+    );
+
+    // empty list
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    assert_eq!(b, json!([]));
+
+    // invalid url → INVALID_URL 400 (upstream https-only check)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": "http://relay.example/inbox" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INVALID_URL"));
+    assert_eq!(
+        b["error"]["id"],
+        json!("fb8c92d3-d4e5-44e7-b3d4-800d5cef8b2c")
+    );
+
+    // add → 200 relay entity, status requesting
+    let inbox = "https://relay.example/inbox";
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let relay_id = b["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("relay id: {b}"))
+        .to_string();
+    assert!(!relay_id.is_empty(), "body: {b}");
+    assert_eq!(b["inbox"], json!(inbox));
+    assert_eq!(b["status"], json!("requesting"));
+
+    // list → the single row
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {b}");
+    let arr = b.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {b}");
+    assert_eq!(arr[0]["id"], json!(relay_id));
+    assert_eq!(arr[0]["inbox"], json!(inbox));
+    assert_eq!(arr[0]["status"], json!("requesting"));
+
+    // duplicate inbox → 500 (UNIQUE btree, upstream uncaught insert error)
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/add",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(b.as_array().unwrap().len(), 1, "body: {b}");
+
+    // remove by inbox → 204, list empty
+    let (s, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/remove",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {b}");
+    let (_, b) = post_json(
+        app.clone(),
+        "/api/admin/relays/list",
+        json!({ "i": root_token }),
+    )
+    .await;
+    assert_eq!(b, json!([]));
+
+    // remove unknown inbox → 500 (upstream `throw new Error('relay not found')`)
+    let (s, b) = post_json(
+        app,
+        "/api/admin/relays/remove",
+        json!({ "i": root_token, "inbox": inbox }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {b}");
+    assert_eq!(b["error"]["code"], json!("INTERNAL_ERROR"));
+}

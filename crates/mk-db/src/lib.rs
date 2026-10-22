@@ -110,6 +110,9 @@ pub mod charts;
 // push lane: sw_subscription rows (sw/register + sw/unregister writes; the
 // VAPID assembly lives in mk-core::services::web_push)
 pub mod sw;
+// admin-relays: the `relay` table paths (admin/relays/{list,add,remove};
+// 0001 baseline — id/inbox/status, UNIQUE btree on inbox; no migration)
+pub mod relay;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(20).connect(url).await
