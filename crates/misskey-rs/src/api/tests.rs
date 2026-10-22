@@ -20000,22 +20000,25 @@ async fn federation_instances_show_stats_and_host_lists() {
     let pool = fresh_pool("mkfederation").await;
     let app = crate::build_router(test_state(pool.clone()));
 
-    // Two instances: one healthy, one manually suspended.
-    for (id, host, state) in [
-        ("i1", "remote.example", "none"),
-        ("i2", "suspended.example", "manuallySuspended"),
+    // Two instances: one healthy/federating, one manually suspended with no
+    // federation counts (so only the first lands in the stats top lists).
+    for (id, host, state, following, followers) in [
+        ("i1", "remote.example", "none", 1, 1),
+        ("i2", "suspended.example", "manuallySuspended", 0, 0),
     ] {
         mk_db::sqlx::query(
             r#"INSERT INTO "instance"
                  ("id", "firstRetrievedAt", "host", "usersCount", "notesCount",
                   "followingCount", "followersCount", "isNotResponding",
                   "softwareName", "softwareVersion", "suspensionState")
-               VALUES ($1, now(), $2, 3, 7, 1, 1, false,
+               VALUES ($1, now(), $2, 3, 7, $4, $5, false,
                        'misskey', '13.0.0', $3::public.instance_suspensionstate_enum)"#,
         )
         .bind(id)
         .bind(host)
         .bind(state)
+        .bind(following)
+        .bind(followers)
         .execute(&pool)
         .await
         .unwrap();
@@ -20151,13 +20154,8 @@ async fn federation_instances_show_stats_and_host_lists() {
     assert_eq!(subs[0]["host"], json!("remote.example"));
     assert_eq!(body["otherFollowersCount"], json!(2)); // 3 remote edges - 1 top
     let pubs = body["topPubInstances"].as_array().unwrap();
-    // both seeded instance rows carry followersCount 1 (the ranking reads the
-    // instance columns, not the edges) — upstream orders by followersCount
-    assert_eq!(pubs.len(), 2, "body: {body}");
-    assert!(
-        pubs.iter().any(|p| p["host"] == json!("remote.example")),
-        "body: {body}"
-    );
+    assert_eq!(pubs.len(), 1, "body: {body}");
+    assert_eq!(pubs[0]["host"], json!("remote.example"));
     assert_eq!(body["otherFollowingCount"], json!(1)); // 2 remote edges - 1 top
 
     // federation/users: only rows with the exact host.
