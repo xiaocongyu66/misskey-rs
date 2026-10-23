@@ -1496,16 +1496,20 @@ pub(crate) async fn notes_global_timeline(
     };
     // makePaginationQuery: id params win; the date params fold into generated
     // aid boundary ids (QueryService `idService.gen(sinceDate/untilDate)`).
-    let since_id = opt_id(body, "sinceId").or_else(|| {
-        body.get("sinceDate")
-            .and_then(|v| v.as_i64())
-            .map(mk_types::id::gen_aid)
-    });
-    let until_id = opt_id(body, "untilId").or_else(|| {
-        body.get("untilDate")
-            .and_then(|v| v.as_i64())
-            .map(mk_types::id::gen_aid)
-    });
+    let since_id: Option<String> = opt_id(body, "sinceId")
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("sinceDate")
+                .and_then(|v| v.as_i64())
+                .map(mk_types::id::gen_aid)
+        });
+    let until_id: Option<String> = opt_id(body, "untilId")
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("untilDate")
+                .and_then(|v| v.as_i64())
+                .map(mk_types::id::gen_aid)
+        });
     run_list(
         state,
         pool,
