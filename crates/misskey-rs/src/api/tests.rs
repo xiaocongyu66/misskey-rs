@@ -4261,6 +4261,120 @@ async fn drive_attached_chat_messages_roundtrip() {
     assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
 }
 
+// drive/stream — upstream endpoints/drive/stream.ts: the drive/files page
+// minus folderId/sort (pagination + the type filter only, owner-scoped).
+#[tokio::test]
+async fn drive_stream_lists_owner_files_paged() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_drive_stream").await;
+    let app = crate::build_router(test_state(pool));
+
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let b_token = bob["token"].as_str().unwrap().to_string();
+
+    let upload = |app: &axum::Router, token: &str, name: &str, bytes: &[u8]| {
+        let app = app.clone();
+        let token = token.to_string();
+        let mut body: Vec<u8> = format!(
+            "--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n--XX\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n");
+        body.extend_from_slice(token.as_bytes());
+        body.extend_from_slice(b"\r\n--XX--\r\n");
+        async move {
+            post_multipart(
+                app,
+                "/api/drive/files/create",
+                "multipart/form-data; boundary=XX",
+                body,
+            )
+            .await
+        }
+    };
+
+    // sequential uploads → increasing aid ids (the DESC page expects
+    // jpeg first, png last)
+    let (s, jpeg) = upload(&app, &a_token, "a.jpg", b"\xFF\xD8\xFF\xe0jpeg-bytes").await;
+    assert_eq!(s, StatusCode::OK, "body: {jpeg}");
+    assert_eq!(jpeg["type"], json!("image/jpeg"));
+    let (s, png) = upload(&app, &a_token, "b.png", b"\x89PNG\r\n\x1a\npng-bytes").await;
+    assert_eq!(s, StatusCode::OK, "body: {png}");
+    assert_eq!(png["type"], json!("image/png"));
+    let (s, bobs) = upload(&app, &b_token, "c.jpg", b"\xFF\xD8\xFF\xe0bob-bytes").await;
+    assert_eq!(s, StatusCode::OK, "body: {bobs}");
+    let png_id = png["id"].as_str().unwrap().to_string();
+    let jpeg_id = jpeg["id"].as_str().unwrap().to_string();
+
+    // default page: the caller's files, newest first (self pack: userId set)
+    let (s, page) = post_json(app.clone(), "/api/drive/stream", json!({ "i": a_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    let arr = page.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "body: {page}");
+    assert_eq!(arr[0]["id"], json!(png_id));
+    assert_eq!(arr[1]["id"], json!(jpeg_id));
+    assert_eq!(arr[0]["userId"], json!(alice["id"]));
+
+    // type filter: exact and the `x/*` wildcard arm
+    let (s, page) = post_json(
+        app.clone(),
+        "/api/drive/stream",
+        json!({ "type": "image/png", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["id"], json!(png_id));
+    let (s, page) = post_json(
+        app.clone(),
+        "/api/drive/stream",
+        json!({ "type": "image/*", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    assert_eq!(page.as_array().unwrap().len(), 2);
+
+    // untilId is exclusive (makePaginationQuery) → the older file only
+    let (s, page) = post_json(
+        app.clone(),
+        "/api/drive/stream",
+        json!({ "untilId": png_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    let arr = page.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], json!(jpeg_id));
+
+    // owner scoping: bob sees only his own row
+    let (s, page) = post_json(app.clone(), "/api/drive/stream", json!({ "i": b_token })).await;
+    assert_eq!(s, StatusCode::OK, "body: {page}");
+    let arr = page.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], bobs["id"]);
+
+    // type must match ^[a-zA-Z/\-*]+$ (paramDef pattern) → INVALID_PARAM
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/stream",
+        json!({ "type": "image/png;x", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
+
+    // no credential → 401 CREDENTIAL_REQUIRED
+    let (s, body) = post_json(app.clone(), "/api/drive/stream", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
 #[tokio::test]
 async fn announcements_auto_archive_cycle() {
     if std::env::var("DATABASE_URL").is_err() {
