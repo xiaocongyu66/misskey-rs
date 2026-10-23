@@ -245,7 +245,7 @@ pub(crate) async fn handle(
 // PageEntityService.pack
 // ---------------------------------------------------------------------------
 
-async fn pack_page(
+pub(crate) async fn pack_page(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     row: &mk_db::page::PageRow,

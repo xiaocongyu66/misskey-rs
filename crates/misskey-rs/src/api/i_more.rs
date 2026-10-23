@@ -2,7 +2,9 @@
 //! `i/pages/likes` (upstream `endpoints/i/{favorites,gallery/likes,pages/
 //! likes}.ts`), plus slice 2: `i/flashs`, `i/flash/likes` (upstream
 //! `endpoints/i/{flashs,flash/likes}.ts`) and `i/authorized-apps`
-//! (`endpoints/i/authorized-apps.ts`).
+//! (`endpoints/i/authorized-apps.ts`). `i/page-likes` (upstream
+//! `endpoints/i/page-likes.ts` — the actual upstream name) rides the same
+//! `page_like` table with the full PageLikeEntityService.pack shape.
 //!
 //! All are `requireCredential: true` reads over rows owned by the caller:
 //! - `i/favorites`       → `note_favorite` (id/userId/noteId; the 0001 baseline
@@ -57,6 +59,7 @@ pub(crate) const ENDPOINTS: &[&str] = &[
     "i/favorites",
     "i/gallery/likes",
     "i/pages/likes",
+    "i/page-likes",
     "i/flashs",
     "i/flash/likes",
     "i/authorized-apps",
@@ -108,6 +111,21 @@ pub(crate) async fn handle(
             }
             "i/pages/likes" => {
                 pages_likes(
+                    pool,
+                    &me_id,
+                    limit,
+                    since_id.as_deref(),
+                    until_id.as_deref(),
+                )
+                .await
+            }
+            // the upstream name (endpoints/i/page-likes.ts) — same table as
+            // the pre-existing `i/pages/likes` slice above, but the
+            // PageLikeEntityService.pack shape: `{ id, page: <full Page
+            // pack> }` with no createdAt on the like itself.
+            "i/page-likes" => {
+                page_likes(
+                    state,
                     pool,
                     &me_id,
                     limit,
@@ -360,6 +378,53 @@ async fn pages_likes(
             })
         })
         .collect();
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// `i/page-likes` (endpoints/i/page-likes.ts): `page_like` rows of the caller
+/// (makePaginationQuery, id DESC), each packed as
+/// `{ id, page: PageEntityService.pack(page, me) }` via
+/// `pages_more::pack_page` (full pack incl. user/eyeCatchingImage + isLiked).
+/// A like whose page row vanished answers INTERNAL_ERROR like upstream's
+/// `findOneByOrFail` inside the entity pack (unreachable under the FK).
+async fn page_likes(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    me_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Check<Response> {
+    let rows = mk_db::sqlx::query(
+        r#"SELECT "id", "pageId"
+           FROM "page_like"
+           WHERE "userId" = $1
+             AND ($2::text IS NULL OR "id" < $2)
+             AND ($3::text IS NULL OR "id" > $3)
+           ORDER BY "id" DESC
+           LIMIT $4"#,
+    )
+    .bind(me_id)
+    .bind(until_id)
+    .bind(since_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| db_err("i/page-likes", e))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        use mk_db::sqlx::Row;
+        let id: String = r.get("id");
+        let page_id: String = r.get("pageId");
+        let page = match mk_db::page::find_page(pool, &page_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(internal()),
+            Err(e) => return Err(db_err("i/page-likes find_page", e)),
+        };
+        let packed = super::pages_more::pack_page(state, pool, &page, Some(me_id)).await?;
+        out.push(json!({ "id": id, "page": packed }));
+    }
     Ok(ok_json(Value::Array(out)))
 }
 

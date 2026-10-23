@@ -17655,6 +17655,110 @@ async fn i_pages_likes_lists_only_callers_rows() {
     assert_eq!(b[0]["page"]["id"], json!(q2));
 }
 
+// i/page-likes — upstream endpoints/i/page-likes.ts (the upstream name): the
+// caller's page_like rows as PageLikeEntityService.pack rows — `{ id, page }`
+// with a full PageEntityService.pack nested (user pack, isLiked) and no
+// createdAt on the like itself.
+#[tokio::test]
+async fn i_page_likes_full_page_pack() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mki_page_likes").await;
+    let app = crate::build_router(test_state(pool));
+
+    let alice = signup(&app, &format!("pla{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("plb{}", mk_types::id::gen_aid_now())).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let bt = bob["token"].as_str().unwrap().to_string();
+
+    let mkpage = |app: &axum::Router, token: &str, name: String| {
+        let app = app.clone();
+        let token = token.to_string();
+        async move {
+            let (s, page) = post_json(
+                app,
+                "/api/pages/create",
+                json!({
+                    "alignCenter": false,
+                    "content": [{ "id": mk_types::id::gen_aid_now(), "text": "hi", "type": "text" }],
+                    "eyeCatchingImageId": null,
+                    "font": "sans-serif",
+                    "hideTitleWhenPinned": false,
+                    "name": name,
+                    "script": "",
+                    "summary": null,
+                    "title": "t",
+                    "variables": [],
+                    "i": token,
+                }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "pages/create: {page}");
+            page["id"].as_str().unwrap().to_string()
+        }
+    };
+    let page1 = mkpage(&app, &bt, format!("pl1{}", mk_types::id::gen_aid_now())).await;
+    let page2 = mkpage(&app, &bt, format!("pl2{}", mk_types::id::gen_aid_now())).await;
+
+    // alice likes both of bob's pages (pages/like writes the page_like rows)
+    for pid in [&page1, &page2] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/pages/like",
+            json!({ "pageId": pid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    }
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/pages/like",
+        json!({ "pageId": page1, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+
+    // alice's list: both likes, newest first, full page pack
+    let (s, likes) = post_json(app.clone(), "/api/i/page-likes", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {likes}");
+    let arr = likes.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "body: {likes}");
+    assert!(arr[0]["createdAt"].is_null(), "body: {likes}");
+    assert_eq!(arr[1]["page"]["id"], json!(page1));
+    assert_eq!(arr[0]["page"]["id"], json!(page2));
+    assert_eq!(arr[0]["page"]["title"], json!("t"));
+    assert!(arr[0]["page"]["user"]["id"].is_string(), "body: {likes}");
+    assert_eq!(arr[0]["page"]["isLiked"], json!(true));
+
+    // untilId is exclusive → only the older like remains
+    let until = arr[0]["id"].as_str().unwrap().to_string();
+    let (s, likes) = post_json(
+        app.clone(),
+        "/api/i/page-likes",
+        json!({ "untilId": until, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {likes}");
+    let arr = likes.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["page"]["id"], json!(page1));
+
+    // bob sees only his own like (isLiked computed for bob)
+    let (s, likes) = post_json(app.clone(), "/api/i/page-likes", json!({ "i": bt })).await;
+    assert_eq!(s, StatusCode::OK, "body: {likes}");
+    let arr = likes.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["page"]["id"], json!(page1));
+    assert_eq!(arr[0]["page"]["isLiked"], json!(true));
+
+    // no credential → 401 CREDENTIAL_REQUIRED
+    let (s, body) = post_json(app.clone(), "/api/i/page-likes", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
 // ---------------------------------------------------------------------------
 // admin-queue slice — admin/queue/* over mk-queue (appended at file end so
 // co-agent appends rebase trivially).
