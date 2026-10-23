@@ -21,6 +21,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --shm-size=1g
       redis:
         image: redis:7-alpine
         ports:
@@ -59,6 +60,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --shm-size=1g
       redis:
         image: redis:7-alpine
         ports:
