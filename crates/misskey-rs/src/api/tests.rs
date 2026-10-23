@@ -24644,3 +24644,272 @@ async fn users_get_following_users_by_birthday_range_and_auth() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
     assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
 }
+
+// notes/global-timeline — upstream endpoints/notes/global-timeline.ts: the
+// public non-channel plane across hosts (visibility='public' ONLY — home and
+// followers stay out), guest-ok, no reply gate, withFiles/withRenotes
+// toggles, aid paging with the makePaginationQuery date fold.
+#[tokio::test]
+async fn timelines_global_timeline() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkglobal_tl").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("gta")).await;
+    let bob = signup(&app, &uname("gtb")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    async fn note_post(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+    // E0434: fn items cannot capture the test's tokens — thread them through.
+    async fn fetch_gtl(app: &axum::Router, mut params: Value, token: &str) -> Value {
+        params["i"] = json!(token);
+        let (s, v) = post_json(app.clone(), "/api/notes/global-timeline", params).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        v
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    // public plane across authors (no follow plane here)
+    let n1 = note_post(&app, json!({ "text": "g1", "i": at })).await;
+    let n2 = note_post(&app, json!({ "text": "g2", "i": bt })).await;
+    // home / followers visibility stay out of the global plane
+    let n_home = note_post(&app, json!({ "text": "h", "visibility": "home", "i": bt })).await;
+    let n_fol = note_post(
+        &app,
+        json!({ "text": "f", "visibility": "followers", "i": bt }),
+    )
+    .await;
+
+    // guest call (no credential at all) — 200 with the public plane
+    let (s, res) = post_json(
+        app.clone(),
+        "/api/notes/global-timeline",
+        json!({ "limit": 100 }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(has(&res, &n1));
+    assert!(has(&res, &n2));
+    assert!(lacks(&res, &n_home));
+    assert!(lacks(&res, &n_fol));
+
+    // logged-in call — same plane, newest-first
+    let res = fetch_gtl(&app, json!({ "limit": 100 }), at).await;
+    let arr = res.as_array().unwrap();
+    let i1 = arr.iter().position(|n| n["id"] == json!(n1)).unwrap();
+    let i2 = arr.iter().position(|n| n["id"] == json!(n2)).unwrap();
+    assert!(i2 < i1, "newest-first ordering: {res}");
+
+    // untilId: EXCLUSIVE upper bound (makePaginationQuery)
+    let res = fetch_gtl(&app, json!({ "untilId": n2, "limit": 100 }), at).await;
+    assert!(has(&res, &n1));
+    assert!(lacks(&res, &n2));
+    // sinceId-only: EXCLUSIVE lower bound + oldest-first ASC
+    let res = fetch_gtl(&app, json!({ "sinceId": n1, "limit": 100 }), at).await;
+    assert!(has(&res, &n2));
+    assert!(lacks(&res, &n1));
+
+    // withRenotes=false drops the pure renote, keeps the quote; default keeps
+    let n_renote = note_post(&app, json!({ "renoteId": n1, "i": bt })).await;
+    let n_quote = note_post(&app, json!({ "text": "q", "renoteId": n1, "i": bt })).await;
+    let res = fetch_gtl(&app, json!({ "withRenotes": false, "limit": 100 }), at).await;
+    assert!(lacks(&res, &n_renote));
+    assert!(has(&res, &n_quote));
+    let res = fetch_gtl(&app, json!({ "limit": 100 }), at).await;
+    assert!(has(&res, &n_renote));
+
+    // withFiles=true: only rows carrying drive files
+    let file_id = seed_drive_file(&pool, b, "image/jpeg").await;
+    let n_text = note_post(&app, json!({ "text": "t", "i": bt })).await;
+    let n_file = note_post(&app, json!({ "fileIds": [file_id], "i": bt })).await;
+    let res = fetch_gtl(&app, json!({ "withFiles": true, "limit": 100 }), at).await;
+    assert!(lacks(&res, &n_text));
+    assert!(has(&res, &n_file));
+
+    // sinceDate/untilDate fold into generated aid bounds
+    // (QueryService idService.gen(date); id params would win — none here)
+    let n1_ms = mk_types::id::parse_aid_date(&n1).unwrap();
+    let res = fetch_gtl(&app, json!({ "untilDate": n1_ms + 1, "limit": 100 }), at).await;
+    assert!(has(&res, &n1));
+    assert!(lacks(&res, &n2));
+    let res = fetch_gtl(&app, json!({ "sinceDate": n1_ms + 1, "limit": 100 }), at).await;
+    assert!(has(&res, &n2));
+    assert!(lacks(&res, &n1));
+}
+
+// notes/polls/recommendation — upstream endpoints/notes/polls/recommendation.ts
+// (requireCredential read:account): the pure SQL poll scan — local authors,
+// not mine, noteVisibility='public', unexpired, not yet voted by me, unmuted
+// author, noteId DESC with limit/offset; packs ride detail (poll body).
+#[tokio::test]
+async fn polls_recommendation_scan() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkpoll_rec").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("pra")).await;
+    let bob = signup(&app, &uname("prb")).await;
+    let carol = signup(&app, &uname("prc")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+    let ct = carol["token"].as_str().unwrap();
+
+    async fn poll_note(app: &axum::Router, body: Value) -> String {
+        let (s, v) = post_json(app.clone(), "/api/notes/create", body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+        let id = v["createdNote"]["id"].as_str().unwrap().to_string();
+        assert_eq!(v["createdNote"]["hasPoll"], json!(true), "body: {v}");
+        id
+    }
+    async fn fetch_rec(app: &axum::Router, mut params: Value, token: &str) -> (StatusCode, Value) {
+        params["i"] = json!(token);
+        let (s, v) = post_json(app.clone(), "/api/notes/polls/recommendation", params).await;
+        (s, v)
+    }
+    fn has(res: &Value, id: &str) -> bool {
+        res.as_array().unwrap().iter().any(|n| n["id"] == json!(id))
+    }
+    fn lacks(res: &Value, id: &str) -> bool {
+        !has(res, id)
+    }
+
+    // auth ladder: no credential → 401 CREDENTIAL_REQUIRED; a declared but
+    // unresolvable token → 401 AUTHENTICATION_FAILED
+    let (s, err) = post_json(app.clone(), "/api/notes/polls/recommendation", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/notes/polls/recommendation",
+        json!({ "i": "0123456789abcdef" }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("AUTHENTICATION_FAILED"));
+
+    // happy path: bob's + carol's public local polls, noteId DESC
+    let bp = poll_note(
+        &app,
+        json!({ "text": "bob poll", "poll": { "choices": ["a", "b"] }, "i": bt }),
+    )
+    .await;
+    let cp = poll_note(
+        &app,
+        json!({ "text": "carol poll", "poll": { "choices": ["c", "d"] }, "i": ct }),
+    )
+    .await;
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(has(&res, &bp));
+    assert!(has(&res, &cp));
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr[0]["id"], json!(cp), "newest first: {res}");
+    // detail pack: the poll body rides (upstream packMany detail: true)
+    assert_eq!(
+        arr[0]["poll"]["choices"][0]["text"],
+        json!("c"),
+        "body: {res}"
+    );
+
+    // own polls never recommend back (poll.userId != meId)
+    let ap = poll_note(
+        &app,
+        json!({ "text": "mine", "poll": { "choices": ["x", "y"] }, "i": at }),
+    )
+    .await;
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &ap));
+
+    // already-voted polls drop out (pollId NOT IN my poll_vote)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/notes/polls/vote",
+        json!({ "noteId": bp, "choice": 0, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &bp));
+
+    // expired polls drop out (expiresAt > now() bracket)
+    let ep = poll_note(
+        &app,
+        json!({
+            "text": "expired",
+            "poll": { "choices": ["e1", "e2"], "expiredAfter": 1 },
+            "i": bt
+        }),
+    )
+    .await;
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &ep));
+
+    // non-public poll notes drop out (poll.noteVisibility = 'public' only)
+    let fp = poll_note(
+        &app,
+        json!({
+            "text": "followers poll",
+            "visibility": "followers",
+            "poll": { "choices": ["f1", "f2"] },
+            "i": bt
+        }),
+    )
+    .await;
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &fp));
+
+    // limit/offset window over the noteId DESC scan
+    let bp2 = poll_note(
+        &app,
+        json!({ "text": "bob poll 2", "poll": { "choices": ["g", "h"] }, "i": bt }),
+    )
+    .await;
+    let (s, res) = fetch_rec(&app, json!({ "limit": 1 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert_eq!(res.as_array().unwrap().len(), 1);
+    assert_eq!(res[0]["id"], json!(bp2), "limit 1 takes the newest: {res}");
+    let (s, res) = fetch_rec(&app, json!({ "limit": 1, "offset": 1 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert_eq!(res[0]["id"], json!(cp), "offset 1 skips the newest: {res}");
+
+    // muted authors drop out (muting ladder, per-viewer): carol mutes bob →
+    // bob's polls leave HER recommendation (alice's view is untouched; carol's
+    // own poll never appears — the userId != meId arm above)
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/mute/create",
+        json!({ "userId": b, "i": ct }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), ct).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(lacks(&res, &bp2));
+    let (s, res) = fetch_rec(&app, json!({ "limit": 100 }), at).await;
+    assert_eq!(s, StatusCode::OK, "body: {res}");
+    assert!(has(&res, &bp2));
+}
