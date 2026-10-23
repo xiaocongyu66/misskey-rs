@@ -1,5 +1,5 @@
-//! Timeline trio db-path queries (notes/timeline, notes/local-timeline,
-//! notes/hybrid-timeline).
+//! Timeline quad db-path queries (notes/timeline, notes/local-timeline,
+//! notes/hybrid-timeline, notes/global-timeline).
 //!
 //! Mirrors the pinned upstream db fallback queries
 //! (`notes/{timeline,local-timeline,hybrid-timeline}.ts` `getFromDb`,
@@ -406,6 +406,64 @@ pub async fn local_timeline_notes(
     }
     if !with_replies {
         inner.push_str(REPLY_GATE_LOCAL);
+    }
+    inner.push_str(PAGER);
+
+    let inner = expand(&inner, 4, 4, 1, 1, 2, 3, dir_asc(since_id));
+    let sql = inner
+        .replace("MUTE_SEL", &expand(MUTE_SEL, 4, 4, 1, 1, 2, 3, ""))
+        .replace("BLOCK_SEL", &expand(BLOCK_SEL, 4, 4, 1, 1, 2, 3, ""));
+
+    sqlx::query_as::<_, NoteRow>(&wrap_outer(&sql, asc))
+        .bind(until_id)
+        .bind(since_id)
+        .bind(limit)
+        .bind(me_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// notes/global-timeline (endpoints/notes/global-timeline.ts): public
+/// non-channel notes across every host, guest-visible. Logged-in viewers ride
+/// generateBaseNoteFilteringQuery + generateMutedUserRenotesQueryForNotes
+/// (BASE_ME); guests ride generateUgcVisibilityQueryForVisitor, resolved by
+/// the caller from `meta.ugcVisibilityForVisitor` (missing row → the TypeORM
+/// column default 'local', fetch_resource.rs meta_ugc idiom): 'none' → 1=0,
+/// 'local' → userHost IS NULL, 'all'/absent → no extra gate. Upstream applies
+/// NO reply gate and NO renote-channel-mute gate here (unlike the local db
+/// path — global-timeline.ts carries no ChannelMutingService leg), and no
+/// withReplies param exists in the pinned paramDef. Bind map:
+/// $1 untilId, $2 sinceId, $3 limit, $4 me (nullable).
+#[allow(clippy::too_many_arguments)]
+pub async fn global_timeline_notes(
+    pool: &PgPool,
+    me_id: Option<&str>,
+    guest_ugc: Option<&str>,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    limit: i64,
+    with_files: bool,
+    with_renotes: bool,
+) -> Result<Vec<NoteRow>, sqlx::Error> {
+    let asc = since_id.is_some();
+
+    let mut inner = String::from(INNER);
+    inner.push_str(r#"(n."visibility" = 'public') AND (n."channelId" IS NULL)"#);
+    if me_id.is_none() {
+        match guest_ugc {
+            // generateUgcVisibilityQueryForVisitor 'none' → `1=0`.
+            Some("none") => inner.push_str(" AND FALSE"),
+            // 'local' → the visitor sees local rows only.
+            Some("local") => inner.push_str(r#" AND (n."userHost" IS NULL)"#),
+            _ => {}
+        }
+    }
+    inner.push_str(BASE_ME);
+    if with_files {
+        inner.push_str(WITH_FILES);
+    }
+    if !with_renotes {
+        inner.push_str(EXCLUDE_PURE_RENOTES);
     }
     inner.push_str(PAGER);
 

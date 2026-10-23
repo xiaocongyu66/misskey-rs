@@ -122,6 +122,44 @@ pub async fn bump_poll_vote(pool: &PgPool, note_id: &str, choice: i32) -> Result
     Ok(())
 }
 
+/// `POST /api/notes/polls/recommendation` note-id read (endpoints/notes/
+/// polls/recommendation.ts L58-100): the poll-table scan — local authors only
+/// (`userHost IS NULL`), not mine, `noteVisibility = 'public'`, unexpired
+/// (`expiresAt IS NULL OR expiresAt > now()`), not already voted by me, author
+/// not muted by me, newest-first by noteId with limit/offset and the optional
+/// `excludeChannels` `channelId IS NULL` bracket. Upstream packs the notes
+/// with `detail: true` (poll body et al).
+pub async fn recommended_poll_note_ids(
+    pool: &PgPool,
+    me_id: &str,
+    limit: i64,
+    offset: i64,
+    exclude_channels: bool,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT p."noteId" FROM "poll" p
+        WHERE p."userHost" IS NULL
+          AND p."userId" != $1
+          AND p."noteVisibility" = 'public'
+          AND (p."expiresAt" IS NULL OR p."expiresAt" > now())
+          AND p."noteId" NOT IN (
+              SELECT v."noteId" FROM "poll_vote" v WHERE v."userId" = $1)
+          AND p."userId" NOT IN (
+              SELECT m."muteeId" FROM "muting" m WHERE m."muterId" = $1)
+          AND ($2 = FALSE OR p."channelId" IS NULL)
+        ORDER BY p."noteId" DESC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(me_id)
+    .bind(exclude_channels)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // queue-min: the endedPollNotification scan (upstream
 // EndedPollNotificationProcessorService.ts + the delayed job NoteCreateService
