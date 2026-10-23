@@ -14,11 +14,20 @@
 //! - The unread markers (`newUserChatMessageExists:*` /
 //!   `newRoomChatMessageExists:*`) are Redis keys upstream; this server has
 //!   no Redis client, so `chat/history` packs `isRead: true` and the
-//!   readRoomChatMessage (chat/messages/user-timeline) / readRoomChatMessage
-//!   side effects are no-ops.
-//! - Moderator overrides on show/members/message-show are not ported (the
-//!   role engine has no isModerator probe on this path); owner/member/
-//!   invitation scoping matches upstream for ordinary users.
+//!   readUserChatMessage (chat/messages/user-timeline) /
+//!   readRoomChatMessage (chat/messages/room-timeline) side effects and the
+//!   deleteRoom unread-key sweep (chat/rooms/delete) are no-ops.
+//! - Moderator overrides on show/members/message-show/delete are not ported
+//!   (the role engine has no isModerator probe on this path); owner/member/
+//!   invitation scoping matches upstream for ordinary users. Upstream's
+//!   deleteChatRoom moderation-log entry is likewise not written.
+//! - `chat/rooms/delete` deletes the room's messages/memberships/invitations
+//!   explicitly because the port schema (0001) has no `onDelete: 'CASCADE'`
+//!   FKs, unlike the upstream TypeORM entities; observable behavior matches.
+//! - `chat/rooms/mute` faithfully mirrors `ChatService.muteRoom`: when the
+//!   caller has no membership row (owners included) upstream's
+//!   `findOneByOrFail` surfaces as 500 INTERNAL_ERROR, so the port does too
+//!   (the endpoint's declared NO_SUCH_ROOM is dead meta upstream).
 //! - `chat/messages/react` / `unreact` store `"<userId>/<reaction>"` entries
 //!   in the `reactions` array (ChatService.react/unreact). Access failures
 //!   collapse to NO_SUCH_MESSAGE like upstream (existence is not disclosed).
