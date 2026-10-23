@@ -1157,6 +1157,7 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // endpoints/drive/files/* — list/show/delete/find/find-by-hash/
         // check-existence)
         || name == "drive/files"
+        || name == "drive/stream"
         || name == "drive/files/show"
         || name == "drive/files/delete"
         || name == "drive/files/find"

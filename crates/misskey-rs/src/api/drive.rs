@@ -1,6 +1,7 @@
 //! Drive domain (drive.ts arena): `drive/files/create` (multipart upload),
 //! `drive/files/attached-notes`, `drive/files/attached-chat-messages`,
-//! `drive/files/upload-from-url` + the
+//! `drive/stream` (the pinned upstream is a JSON pagination read — see the
+//! stream_list divergence note), `drive/files/upload-from-url` + the
 //! `/streaming` main-channel websocket hub the upload-finished event rides
 //! on, plus the shared `DriveFileEntityService.getPublicUrl` helper.
 //!
@@ -269,6 +270,7 @@ pub(crate) async fn handle_json(
         // arena-files: the drive/files read/lookup surface (upstream
         // endpoints/drive/files/*)
         "drive/files" => files_list(state, body, token).await,
+        "drive/stream" => stream_list(state, body, token).await,
         "drive/files/show" => files_show(state, body, token).await,
         "drive/files/delete" => files_delete(state, body, token).await,
         "drive/files/find" => files_find(state, body, token).await,
@@ -1564,6 +1566,115 @@ pub(crate) async fn files_list(state: &AppState, body: &Value, token: Option<Str
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "dbg_drive_files", error = %e, "files_list");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let out: Vec<Value> = rows.iter().map(|r| pack_drive_file(r, true)).collect();
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `drive/stream` (endpoints/drive/stream.ts). DIVERGENCE NOTE: the task
+/// brief described this name as an SSE stream of drive file changes, but the
+/// pinned upstream source (`endpoints/drive/stream.ts` at this checkout, the
+/// only registration being `endpoint-list.ts` L195) is a plain JSON
+/// endpoint — `drive/files.ts` minus the folderId/sort params. This port
+/// follows the pinned source: the same owner-scoped makePaginationQuery page
+/// (limit 1..=100 default 10, exclusive id cursors, sinceDate/untilDate as
+/// aid bounds) + the type filter (exact or `x/*` LIKE prefix), packed
+/// `packMany(files, { detail: false, self: true })`. No SSE headers,
+/// heartbeat, or event channel exist upstream at this pin; if a later
+/// upstream turns the route into an SSE feed the port needs a rebase.
+pub(crate) async fn stream_list(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id =
+        match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive_files").await {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 10i64,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=100).contains(&n) => n,
+            _ => {
+                return file_param_err("limit", "must be an integer in 1..=100");
+            }
+        },
+    };
+
+    // makePaginationQuery: id params win over their date twins.
+    let mut since_id: Option<String> = None;
+    let mut until_id: Option<String> = None;
+    match body.get("sinceId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if is_aid(s) => since_id = Some(s.clone()),
+        Some(_) => return file_param_err("sinceId", "must be an alphanumeric id"),
+    }
+    match body.get("untilId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if is_aid(s) => until_id = Some(s.clone()),
+        Some(_) => return file_param_err("untilId", "must be an alphanumeric id"),
+    }
+    if since_id.is_none() {
+        if let Some(v) = body.get("sinceDate") {
+            let Some(ms) = v.as_i64() else {
+                return file_param_err("sinceDate", "must be an integer");
+            };
+            since_id = Some(mk_types::id::gen_aid(ms));
+        }
+    }
+    if until_id.is_none() {
+        if let Some(v) = body.get("untilDate") {
+            let Some(ms) = v.as_i64() else {
+                return file_param_err("untilDate", "must be an integer");
+            };
+            until_id = Some(mk_types::id::gen_aid(ms));
+        }
+    }
+
+    // type pattern /^[a-zA-Z\/\-*]+$/: exact match, or `ends with /*` → the
+    // LIKE prefix arm. (No folderId arm — stream.ts has no folderId param.)
+    let type_exact;
+    let type_prefix;
+    match body.get("type") {
+        None | Some(Value::Null) => {
+            type_exact = None;
+            type_prefix = None;
+        }
+        Some(Value::String(s)) => {
+            let valid_pattern = !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '*' || c == '-');
+            if !valid_pattern {
+                return file_param_err("type", "must match ^[a-zA-Z/\\-*]+$ or null");
+            }
+            if s.ends_with("/*") {
+                type_exact = None;
+                type_prefix = Some(s.replace("/*", "/"));
+            } else {
+                type_exact = Some(s.clone());
+                type_prefix = None;
+            }
+        }
+        Some(_) => return file_param_err("type", "must be a string or null"),
+    }
+
+    let rows = match mk_db::drive::files_stream(
+        pool,
+        &me_id,
+        since_id.as_deref(),
+        until_id.as_deref(),
+        type_exact.as_deref(),
+        type_prefix.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive_files", error = %e, "files_stream");
             return api_err(ApiError::internal_error());
         }
     };

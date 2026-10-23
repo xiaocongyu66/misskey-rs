@@ -247,6 +247,54 @@ pub async fn files_list(
     q.build_query_as::<DriveFileRow>().fetch_all(pool).await
 }
 
+/// `drive/stream` (endpoints/drive/stream.ts): the owner-scoped page of
+/// `files_list` minus the folderId arm — the pinned upstream stream.ts takes
+/// only limit/sinceId/untilId/sinceDate/untilDate/type (no folderId, no
+/// sort), so no folder filter applies here.
+pub async fn files_stream(
+    pool: &PgPool,
+    user_id: &str,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+    type_exact: Option<&str>,
+    type_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DriveFileRow>, sqlx::Error> {
+    let mut q = sqlx::QueryBuilder::new("SELECT ");
+    q.push(FILE_COLS)
+        .push(r#" FROM "drive_file" WHERE "userId" = "#);
+    q.push_bind(user_id);
+    if let Some(t) = type_exact {
+        q.push(r#" AND "type" = "#).push_bind(t);
+    }
+    if let Some(p) = type_prefix {
+        let pattern = format!("{p}%");
+        q.push(r#" AND "type" LIKE "#).push_bind(pattern);
+    }
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (Some(s), None) => {
+            q.push(r#" AND "id" > "#).push_bind(s);
+        }
+        (None, Some(u)) => {
+            q.push(r#" AND "id" < "#).push_bind(u);
+        }
+        (None, None) => {}
+    }
+    // makePaginationQuery order: sinceId-only → ASC, otherwise DESC (the
+    // same shape files_list rides).
+    if since_id.is_some() && until_id.is_none() {
+        q.push(r#" ORDER BY "id" ASC"#);
+    } else {
+        q.push(r#" ORDER BY "id" DESC"#);
+    }
+    q.push(" LIMIT ").push_bind(limit);
+    q.build_query_as::<DriveFileRow>().fetch_all(pool).await
+}
+
 /// `drive/files/find` (find.ts): name + userId, folderId ?? IsNull. No
 /// explicit order upstream (findBy) — keep the pagination DESC shape for
 /// determinism.
