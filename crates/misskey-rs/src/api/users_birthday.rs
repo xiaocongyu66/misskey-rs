@@ -57,7 +57,7 @@ fn ok_json(v: Value) -> Response {
 }
 
 /// One raw row: the followee id + its mmdd birthday number (smallint).
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, mk_db::sqlx::FromRow)]
 struct BirthdayRow {
     user_id: String,
     birthday_date: i16,
@@ -219,7 +219,7 @@ async fn get_following_users_by_birthday(
         LIMIT $5
         "#
     );
-    let rows = sqlx::query_as::<_, BirthdayRow>(&sql)
+    let rows = mk_db::sqlx::query_as::<_, BirthdayRow>(&sql)
         .bind(me_id)
         .bind(begin)
         .bind(end)
@@ -238,7 +238,7 @@ async fn get_following_users_by_birthday(
     for row in rows {
         // me-view pack: a missing user row can't happen through the inner
         // join, but the upstream map/filter collapses such items anyway.
-        let Ok(user_row) = mk_db::user::find_user_by_id(pool, &row.user_id).await else {
+        let Ok(Some(user_row)) = mk_db::user::find_user_by_id(pool, &row.user_id).await else {
             continue;
         };
         let user = mk_core::services::user_pack::user_lite_value_with_roles(&user_row, ctx, None);
