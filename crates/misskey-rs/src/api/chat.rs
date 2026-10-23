@@ -57,6 +57,7 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/rooms/invitations/create",
     "chat/rooms/invitations/ignore",
     "chat/rooms/invitations/inbox",
+    "chat/rooms/invitations/outbox",
     "chat/messages/create-to-user",
     "chat/messages/create-to-room",
     "chat/messages/room-timeline",
@@ -443,6 +444,7 @@ pub(crate) async fn handle(
         "chat/rooms/invitations/create" => invitations_create(state, pool, body, &me_id).await,
         "chat/rooms/invitations/ignore" => invitations_ignore(pool, body, &me_id).await,
         "chat/rooms/invitations/inbox" => invitations_inbox(state, pool, body, &me_id).await,
+        "chat/rooms/invitations/outbox" => invitations_outbox(state, pool, body, &me_id).await,
         "chat/messages/create-to-user" => messages_create_to_user(state, pool, body, &me_id).await,
         "chat/messages/create-to-room" => messages_create_to_room(state, pool, body, &me_id).await,
         "chat/messages/room-timeline" => messages_room_timeline(state, pool, body, &me_id).await,
@@ -801,6 +803,38 @@ async fn invitations_inbox(
     )
     .await
     .map_err(|e| db_err("invitations_inbox", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(pack_invitation(state, pool, row, me_id).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// chat/rooms/invitations/outbox — invitations sent from one room, owner
+/// scoped (findMyRoomById). ChatService.getSentRoomInvitationsWithPagination
+/// has no `ignored` filter, so ignored-but-not-joined rows still list here.
+async fn invitations_outbox(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let room_id = required_id(body, "roomId")?;
+    let limit = limit_param(body, 30)?;
+    let (since_id, until_id) = page_ids(body)?;
+    mk_db::chat::find_owned_room(pool, room_id, me_id)
+        .await
+        .map_err(|e| db_err("invitations_outbox find_owned", e))?
+        .ok_or_else(|| no_such_room("a3c6b309-9717-4316-ae94-a69b53437237"))?;
+    let rows = mk_db::chat::invitations_sent(
+        pool,
+        room_id,
+        limit,
+        since_id.as_deref(),
+        until_id.as_deref(),
+    )
+    .await
+    .map_err(|e| db_err("invitations_outbox", e))?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         out.push(pack_invitation(state, pool, row, me_id).await?);

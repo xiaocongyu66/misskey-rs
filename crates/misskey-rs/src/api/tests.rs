@@ -19053,6 +19053,106 @@ async fn chat_rooms_delete() {
 }
 
 // ---------------------------------------------------------------------------
+// chat/rooms/invitations/outbox — upstream outbox.ts: owner-scoped sent
+// invitations for one room, packed ChatRoomInvitation. The upstream sent
+// query has no `ignored` filter (unlike the inbox), so an ignored invitation
+// still lists here.
+#[tokio::test]
+async fn chat_rooms_invitations_outbox() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_outbox").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("oba")).await;
+    let bob = signup(&app, &uname("obb")).await;
+    let carol = signup(&app, &uname("obc")).await;
+    let b = bob["id"].as_str().unwrap();
+    let c = carol["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "outbox", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let mut inv_ids = Vec::new();
+    for uid in [b, c] {
+        let (s, inv) = post_json(
+            app.clone(),
+            "/api/chat/rooms/invitations/create",
+            json!({ "roomId": room_id, "userId": uid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {inv}");
+        inv_ids.push(inv["id"].as_str().unwrap().to_string());
+    }
+
+    // -- happy path: owner sees both, newest-first -------------------------
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/outbox",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {out}");
+    let out = out.as_array().unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0]["id"], json!(inv_ids[1]));
+    assert_eq!(out[0]["userId"], json!(c));
+    assert_eq!(out[0]["user"]["id"], json!(c));
+    assert_eq!(out[0]["roomId"], json!(room_id));
+    assert_eq!(out[0]["room"]["id"], json!(room_id));
+    assert_eq!(out[1]["userId"], json!(b));
+
+    // -- ignored invitations are NOT filtered out of the outbox ------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/ignore",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/outbox",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {out}");
+    assert_eq!(out.as_array().unwrap().len(), 2);
+
+    // -- untilId paging: exclusive bound -----------------------------------
+    let (s, out) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/outbox",
+        json!({ "roomId": room_id, "untilId": inv_ids[1], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {out}");
+    let out = out.as_array().unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["id"], json!(inv_ids[0]));
+
+    // -- error path: findMyRoomById is owner-scoped → NO_SUCH_ROOM ---------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/outbox",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+}
+
+// ---------------------------------------------------------------------------
 // users/lists/list — upstream list.ts is requireCredential: false and the
 // explicit-userId arm reads `{ userId, isPublic: true }` (even for the
 // caller's own id); the no-param arm reads every list the caller owns.
