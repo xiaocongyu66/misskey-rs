@@ -140,6 +140,12 @@ mod users_more;
 // 0001 `following` x `user_profile` join with the schema's get_birthday_date()
 // mmdd index; next-occurrence date math in the module.
 mod users_birthday;
+// reset-db: the NODE_ENV=test-only database reset endpoint (upstream
+// endpoints/reset-db.ts) — config.test gate inside the handler (refusal is
+// the upstream bare 500 INTERNAL_ERROR, not a 404); truncation via
+// mk_db::user::truncate_all; redis flush + metaUpdated event are documented
+// skips in the module header.
+mod reset_db;
 // antennas-v2: antennas/* (upstream endpoints/antennas/{create,delete,list,
 // show,update,notes,remove-note}.ts; requireCredential + owner-scoped
 // NO_SUCH_ANTENNA ids per endpoint) — db paths in mk-db/src/antennas.rs (0001
@@ -1448,6 +1454,23 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
             .await;
     }
     // ==== END users-birthday DISPATCH ARM ====
+
+    // ==== reset-db DISPATCH ARM ====
+    // requireCredential: false (upstream meta has no credential gate at all —
+    // the NODE_ENV=test check lives INSIDE the endpoint and refuses with the
+    // bare 500 INTERNAL_ERROR, so the arm routes the name unconditionally and
+    // never 404s outside test mode). paramDef is empty; the body is parsed
+    // only for the invalid-JSON 400 parity.
+    if reset_db::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        if let Err(resp) = parse_json_body(req).await {
+            return resp;
+        }
+        return reset_db::handle(&state).await;
+    }
+    // ==== END reset-db DISPATCH ARM ====
 
     // ==== clips-agent DISPATCH ARM (clips/* + users/clips) ====
     // Self-contained block on the channels/ul-tl arm pattern: method check,

@@ -25027,3 +25027,100 @@ async fn polls_recommendation_scan() {
     assert_eq!(s, StatusCode::OK, "body: {res}");
     assert!(has(&res, &bp2));
 }
+
+// ---------------------------------------------------------------------------
+// reset-db: the NODE_ENV=test-only truncation endpoint (upstream
+// endpoints/reset-db.ts — requireCredential: false, gate inside the handler)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reset_db_truncates_everything_under_test_mode() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkresetdb").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = format!("rz{}", mk_types::id::gen_aid_now());
+    let user = signup(&app, &uname).await;
+    assert_eq!(user["id"].as_str().map(|s| s.len()), Some(10));
+
+    let n: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(n >= 1);
+
+    // happy path: 204 (handler returned undefined) and every table truncated
+    // — the signed-up user is gone from user + user_profile.
+    let (s, v) = post_json(app.clone(), "/api/reset-db", json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let n: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    let n: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user_profile""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn reset_db_refused_outside_test_mode() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkresetdb_gate").await;
+    let state = crate::AppState {
+        config: crate::config::Config {
+            port: 0,
+            url: "http://127.0.0.1:3000".to_string(),
+            db: None,
+            redis: None,
+            // the gate under test
+            test: false,
+            version: None,
+            raw_json: serde_json::Value::Null,
+        },
+        pool: Some(pool.clone()),
+        rate_limiter: std::sync::Arc::new(crate::ratelimit::RateLimiter::new()),
+        search_engine: std::sync::Arc::new(mk_core::services::search_bridge::NoopEngine),
+    };
+    let app = crate::build_router(state);
+
+    // seed one user row directly (non-test signup would demand captcha params)
+    let id = mk_types::id::gen_aid_now();
+    mk_db::user::insert_new_user(
+        &pool,
+        &mk_db::user::NewUser {
+            id: &id,
+            username: "rzgate",
+            username_lower: "rzgate",
+            name: None,
+            host: None,
+            token: "0123456789abcdef",
+            password_hash: "x",
+            public_key: "pub",
+            private_key: "priv",
+        },
+    )
+    .await
+    .unwrap();
+
+    // upstream: uncaught Error('NODE_ENV is not a test') → bare 500
+    // INTERNAL_ERROR; the name still routes (no 404) outside test mode.
+    let (s, v) = post_json(app, "/api/reset-db", json!({})).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INTERNAL_ERROR"));
+
+    // nothing was truncated.
+    let n: i64 = mk_db::sqlx::query_scalar(r#"SELECT count(*) FROM "user""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
