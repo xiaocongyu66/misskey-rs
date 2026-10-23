@@ -51,6 +51,7 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/rooms/leave",
     "chat/rooms/joining",
     "chat/rooms/show",
+    "chat/rooms/delete",
     "chat/rooms/update",
     "chat/rooms/members",
     "chat/rooms/invitations/create",
@@ -436,6 +437,7 @@ pub(crate) async fn handle(
         "chat/rooms/join" => rooms_join(pool, body, &me_id).await,
         "chat/rooms/leave" => rooms_leave(pool, body, &me_id).await,
         "chat/rooms/show" => rooms_show(state, pool, body, &me_id).await,
+        "chat/rooms/delete" => rooms_delete(pool, body, &me_id).await,
         "chat/rooms/update" => rooms_update(state, pool, body, &me_id).await,
         "chat/rooms/members" => rooms_members(state, pool, body, &me_id).await,
         "chat/rooms/invitations/create" => invitations_create(state, pool, body, &me_id).await,
@@ -600,6 +602,30 @@ async fn rooms_show(
         return Err(no_such_room("857ae02f-8759-4d20-9adb-6e95fffe4fd7"));
     }
     Ok(ok_json(pack_room(state, pool, &room, me_id).await?))
+}
+
+/// chat/rooms/delete — ChatService.hasPermissionToDeleteRoom is owner-only
+/// here (the upstream moderator override needs a role probe this path does
+/// not carry, same deviation as show/members). deleteRoom removes the room
+/// plus its dependent rows; the Redis unread-key sweep is a no-op.
+async fn rooms_delete(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    const NO_SUCH_ROOM: &str = "d4e3753d-97bf-4a19-ab8e-21080fbc0f4b";
+    let room_id = required_id(body, "roomId")?;
+    let room = mk_db::chat::find_room(pool, room_id)
+        .await
+        .map_err(|e| db_err("rooms_delete find_room", e))?
+        .ok_or_else(|| no_such_room(NO_SUCH_ROOM))?;
+    if room.owner_id != me_id {
+        return Err(no_such_room(NO_SUCH_ROOM));
+    }
+    mk_db::chat::delete_room(pool, &room.id)
+        .await
+        .map_err(|e| db_err("rooms_delete", e))?;
+    Ok(ok_empty())
 }
 
 /// chat/rooms/update — owner-scoped (findMyRoomById).

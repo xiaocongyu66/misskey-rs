@@ -18958,6 +18958,101 @@ async fn chat_messages_user_timeline() {
 }
 
 // ---------------------------------------------------------------------------
+// chat/rooms/delete — upstream delete.ts: owner (or moderator, not ported)
+// only, NO_SUCH_ROOM otherwise; ChatService.deleteRoom drops the room and
+// its dependent rows (upstream cascades via FK; the Redis sweep is a no-op).
+#[tokio::test]
+async fn chat_rooms_delete() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_roomdel").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("rda")).await;
+    let bob = signup(&app, &uname("rdb")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // room + invitation + join + one room message
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "doomed", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/create",
+        json!({ "roomId": room_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/join",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-room",
+        json!({ "toRoomId": room_id, "text": "bye", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // -- error path: a non-owner member gets NO_SUCH_ROOM ------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/delete",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+
+    // -- happy path: owner deletes → 204, room gone for everyone -----------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/delete",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    for tok in [at, bt] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/chat/rooms/show",
+            json!({ "roomId": room_id, "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+        assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+    }
+    // member's joining list is empty again (membership row cascaded)
+    let (s, joining) = post_json(app.clone(), "/api/chat/rooms/joining", json!({ "i": bt })).await;
+    assert_eq!(s, StatusCode::OK, "body: {joining}");
+    assert_eq!(joining, json!([]));
+
+    // -- deleting again → NO_SUCH_ROOM -------------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/delete",
+        json!({ "roomId": room_id, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_ROOM"));
+}
+
+// ---------------------------------------------------------------------------
 // users/lists/list — upstream list.ts is requireCredential: false and the
 // explicit-userId arm reads `{ userId, isPublic: true }` (even for the
 // caller's own id); the no-param arm reads every list the caller owns.

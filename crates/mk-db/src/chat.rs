@@ -617,6 +617,30 @@ pub async fn user_timeline(
     q.fetch_all(pool).await
 }
 
+/// ChatService.deleteRoom — upstream relies on `onDelete: 'CASCADE'` FKs
+/// (membership/invitation/message → room) that this schema does not carry,
+/// so the dependent rows are deleted explicitly; the Redis unread-key
+/// cleanup is a no-op (see the api chat module header).
+pub async fn delete_room(pool: &PgPool, room_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"DELETE FROM "chat_message" WHERE "toRoomId" = $1"#)
+        .bind(room_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(r#"DELETE FROM "chat_room_invitation" WHERE "roomId" = $1"#)
+        .bind(room_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(r#"DELETE FROM "chat_room_membership" WHERE "roomId" = $1"#)
+        .bind(room_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(r#"DELETE FROM "chat_room" WHERE "id" = $1"#)
+        .bind(room_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// ChatService.roomHistory — newest message per joined/owned room.
 pub async fn room_history(
     pool: &PgPool,
