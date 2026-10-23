@@ -54,6 +54,7 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/rooms/delete",
     "chat/rooms/update",
     "chat/rooms/mute",
+    "chat/rooms/owned",
     "chat/rooms/members",
     "chat/rooms/invitations/create",
     "chat/rooms/invitations/ignore",
@@ -442,6 +443,7 @@ pub(crate) async fn handle(
         "chat/rooms/delete" => rooms_delete(pool, body, &me_id).await,
         "chat/rooms/update" => rooms_update(state, pool, body, &me_id).await,
         "chat/rooms/mute" => rooms_mute(pool, body, &me_id).await,
+        "chat/rooms/owned" => rooms_owned(state, pool, body, &me_id).await,
         "chat/rooms/members" => rooms_members(state, pool, body, &me_id).await,
         "chat/rooms/invitations/create" => invitations_create(state, pool, body, &me_id).await,
         "chat/rooms/invitations/ignore" => invitations_ignore(pool, body, &me_id).await,
@@ -674,6 +676,27 @@ async fn rooms_mute(
         return Err(api_err(ApiError::internal_error()));
     }
     Ok(ok_empty())
+}
+
+/// chat/rooms/owned — rooms the caller owns
+/// (ChatService.getOwnedRoomsWithPagination), packed ChatRoom.
+async fn rooms_owned(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let limit = limit_param(body, 30)?;
+    let (since_id, until_id) = page_ids(body)?;
+    let rows =
+        mk_db::chat::rooms_owned(pool, me_id, limit, since_id.as_deref(), until_id.as_deref())
+            .await
+            .map_err(|e| db_err("rooms_owned", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(pack_room(state, pool, row, me_id).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
 }
 
 /// chat/rooms/members — member-scoped, populateUser.

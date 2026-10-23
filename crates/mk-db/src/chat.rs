@@ -150,6 +150,38 @@ pub async fn update_room(
     .await
 }
 
+/// ChatService.getOwnedRoomsWithPagination (paged, newest-first default).
+pub async fn rooms_owned(
+    pool: &PgPool,
+    owner_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatRoomRow>, sqlx::Error> {
+    let base = format!(r#"SELECT {ROOM_COLS} FROM "chat_room" WHERE "ownerId" = $1"#);
+    let sql = match (since_id, until_id) {
+        (Some(_), Some(_)) => {
+            format!(r#"{base} AND "id" > $2 AND "id" < $3 ORDER BY "id" DESC LIMIT $4"#)
+        }
+        (Some(_), None) => format!(r#"{base} AND "id" > $2 ORDER BY "id" ASC LIMIT $3"#),
+        (None, Some(_)) => format!(r#"{base} AND "id" < $2 ORDER BY "id" DESC LIMIT $3"#),
+        (None, None) => format!(r#"{base} ORDER BY "id" DESC LIMIT $2"#),
+    };
+    let mut q = sqlx::query_as::<_, ChatRoomRow>(&sql).bind(owner_id);
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q = q.bind(s).bind(u).bind(limit);
+        }
+        (Some(s), None) | (None, Some(s)) => {
+            q = q.bind(s).bind(limit);
+        }
+        (None, None) => {
+            q = q.bind(limit);
+        }
+    }
+    q.fetch_all(pool).await
+}
+
 // ==== memberships ==========================================================
 
 /// `chatRoomMembershipsRepository.findOneBy({ roomId, userId })`.

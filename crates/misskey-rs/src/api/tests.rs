@@ -19252,6 +19252,100 @@ async fn chat_rooms_mute() {
 }
 
 // ---------------------------------------------------------------------------
+// chat/rooms/owned — upstream owned.ts: rooms owned by the caller
+// (ChatService.getOwnedRoomsWithPagination), packed ChatRoom, paged.
+#[tokio::test]
+async fn chat_rooms_owned() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_owned").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("owa")).await;
+    let bob = signup(&app, &uname("owb")).await;
+    let a = alice["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // -- auth path: requireCredential, no token → CREDENTIAL_REQUIRED ------
+    let (s, v) = post_json(app.clone(), "/api/chat/rooms/owned", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    let mut alice_rooms = Vec::new();
+    for name in ["first", "second"] {
+        let (s, room) = post_json(
+            app.clone(),
+            "/api/chat/rooms/create",
+            json!({ "name": name, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {room}");
+        alice_rooms.push(room["id"].as_str().unwrap().to_string());
+    }
+    let (s, bob_room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "bobs", "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {bob_room}");
+    let bob_room_id = bob_room["id"].as_str().unwrap().to_string();
+
+    // -- happy path: only owned rooms, newest-first ------------------------
+    let (s, owned) = post_json(app.clone(), "/api/chat/rooms/owned", json!({ "i": at })).await;
+    assert_eq!(s, StatusCode::OK, "body: {owned}");
+    let owned = owned.as_array().unwrap();
+    assert_eq!(owned.len(), 2);
+    assert_eq!(owned[0]["id"], json!(alice_rooms[1]));
+    assert_eq!(owned[1]["id"], json!(alice_rooms[0]));
+    assert_eq!(owned[0]["ownerId"], json!(a));
+    assert_eq!(owned[0]["owner"]["id"], json!(a));
+
+    let (s, owned) = post_json(app.clone(), "/api/chat/rooms/owned", json!({ "i": bt })).await;
+    assert_eq!(s, StatusCode::OK, "body: {owned}");
+    let owned = owned.as_array().unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0]["id"], json!(bob_room_id));
+
+    // -- paging: untilId (DESC) and sinceId (ASC, sinceId-only) ------------
+    let (s, owned) = post_json(
+        app.clone(),
+        "/api/chat/rooms/owned",
+        json!({ "untilId": alice_rooms[1], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {owned}");
+    let owned = owned.as_array().unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0]["id"], json!(alice_rooms[0]));
+
+    let (s, owned) = post_json(
+        app.clone(),
+        "/api/chat/rooms/owned",
+        json!({ "sinceId": alice_rooms[0], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {owned}");
+    let owned = owned.as_array().unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0]["id"], json!(alice_rooms[1]));
+
+    // -- limit param is enforced (1..=100) ---------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/owned",
+        json!({ "limit": 0, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INVALID_PARAM"));
+}
+
+// ---------------------------------------------------------------------------
 // users/lists/list — upstream list.ts is requireCredential: false and the
 // explicit-userId arm reads `{ userId, isPublic: true }` (even for the
 // caller's own id); the no-param arm reads every list the caller owns.
