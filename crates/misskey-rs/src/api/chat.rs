@@ -14,7 +14,8 @@
 //! - The unread markers (`newUserChatMessageExists:*` /
 //!   `newRoomChatMessageExists:*`) are Redis keys upstream; this server has
 //!   no Redis client, so `chat/history` packs `isRead: true` and the
-//!   readRoomChatMessage side effect is a no-op.
+//!   readRoomChatMessage (chat/messages/user-timeline) / readRoomChatMessage
+//!   side effects are no-ops.
 //! - Moderator overrides on show/members/message-show are not ported (the
 //!   role engine has no isModerator probe on this path); owner/member/
 //!   invitation scoping matches upstream for ordinary users.
@@ -58,6 +59,7 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/messages/create-to-user",
     "chat/messages/create-to-room",
     "chat/messages/room-timeline",
+    "chat/messages/user-timeline",
     "chat/messages/show",
     "chat/messages/delete",
     "chat/messages/react",
@@ -292,8 +294,9 @@ async fn pack_invitation(
     }))
 }
 
-/// ChatEntityService.packMessageDetailed (also used by chat/history).
-async fn pack_message_detailed(
+/// ChatEntityService.packMessageDetailed (also used by chat/history and
+/// `drive/files/attached-chat-messages` — upstream packMessagesDetailed).
+pub(crate) async fn pack_message_detailed(
     state: &AppState,
     pool: &mk_db::sqlx::PgPool,
     message: &ChatMessageRow,
@@ -441,6 +444,7 @@ pub(crate) async fn handle(
         "chat/messages/create-to-user" => messages_create_to_user(state, pool, body, &me_id).await,
         "chat/messages/create-to-room" => messages_create_to_room(state, pool, body, &me_id).await,
         "chat/messages/room-timeline" => messages_room_timeline(state, pool, body, &me_id).await,
+        "chat/messages/user-timeline" => messages_user_timeline(state, pool, body, &me_id).await,
         "chat/messages/show" => messages_show(state, pool, body, &me_id).await,
         "chat/messages/delete" => messages_delete(pool, body, &me_id).await,
         "chat/messages/react" => messages_react(pool, body, &me_id).await,
@@ -1010,6 +1014,45 @@ async fn messages_room_timeline(
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         out.push(pack_message_lite_room(state, pool, row).await?);
+    }
+    Ok(ok_json(Value::Array(out)))
+}
+
+/// chat/messages/user-timeline — the 1on1 history with one user in both
+/// directions (ChatService.userTimeline), packed LiteFor1on1. The trailing
+/// readUserChatMessage side effect is a Redis no-op (see module header).
+async fn messages_user_timeline(
+    state: &AppState,
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let user_id = required_id(body, "userId")?;
+    let limit = limit_param(body, 10)?;
+    let (since_id, until_id) = page_ids(body)?;
+    mk_db::user::find_user_by_id(pool, user_id)
+        .await
+        .map_err(|e| db_err("user_timeline find_user", e))?
+        .ok_or_else(|| {
+            meta_err(
+                "NO_SUCH_USER",
+                "11795c64-40ea-4198-b06e-3c873ed9039d",
+                "No such user.",
+            )
+        })?;
+    let rows = mk_db::chat::user_timeline(
+        pool,
+        me_id,
+        user_id,
+        limit,
+        since_id.as_deref(),
+        until_id.as_deref(),
+    )
+    .await
+    .map_err(|e| db_err("user_timeline", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(pack_message_lite_1on1(state, pool, row).await?);
     }
     Ok(ok_json(Value::Array(out)))
 }

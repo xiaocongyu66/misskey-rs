@@ -18860,6 +18860,104 @@ async fn chat_room_and_direct_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// chat/messages/user-timeline — upstream user-timeline.ts: the 1on1 history
+// with one user in both directions (ChatService.userTimeline), packed
+// ChatMessageLiteFor1on1; the readUserChatMessage side effect is a Redis
+// no-op here (see the chat module header).
+#[tokio::test]
+async fn chat_messages_user_timeline() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_utl").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("uta")).await;
+    let bob = signup(&app, &uname("utb")).await;
+    let a = alice["id"].as_str().unwrap();
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    // -- auth path: requireCredential, no token → CREDENTIAL_REQUIRED ------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/user-timeline",
+        json!({ "userId": b }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // mutual follow opens the default chatScope 'mutual' gate, then three
+    // messages in both directions
+    for (tok, uid) in [(at, b), (bt, a)] {
+        let (s, _) = post_json(
+            app.clone(),
+            "/api/following/create",
+            json!({ "userId": uid, "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let mut ids = Vec::new();
+    for (tok, peer, text) in [(at, b, "one"), (at, b, "two"), (bt, a, "three")] {
+        let (s, m) = post_json(
+            app.clone(),
+            "/api/chat/messages/create-to-user",
+            json!({ "toUserId": peer, "text": text, "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {m}");
+        ids.push(m["id"].as_str().unwrap().to_string());
+    }
+
+    // -- happy path: newest-first across both directions --------------------
+    let (s, tl) = post_json(
+        app.clone(),
+        "/api/chat/messages/user-timeline",
+        json!({ "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {tl}");
+    let tl = tl.as_array().unwrap();
+    assert_eq!(tl.len(), 3);
+    assert_eq!(tl[0]["id"], json!(ids[2]));
+    assert_eq!(tl[1]["id"], json!(ids[1]));
+    assert_eq!(tl[2]["id"], json!(ids[0]));
+    // ChatMessageLiteFor1on1 shape: no fromUser/toUser objects
+    assert_eq!(tl[0]["fromUserId"], json!(b));
+    assert_eq!(tl[0]["toUserId"], json!(a));
+    assert!(tl[0].get("fromUser").is_none());
+    assert_eq!(tl[2]["fromUserId"], json!(a));
+    assert_eq!(tl[2]["toUserId"], json!(b));
+
+    // -- untilId paging: exclusive bound ------------------------------------
+    let (s, tl) = post_json(
+        app.clone(),
+        "/api/chat/messages/user-timeline",
+        json!({ "userId": b, "untilId": ids[1], "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {tl}");
+    let tl = tl.as_array().unwrap();
+    assert_eq!(tl.len(), 1);
+    assert_eq!(tl[0]["id"], json!(ids[0]));
+
+    // -- error path: nonexistent user → NO_SUCH_USER ------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/messages/user-timeline",
+        json!({ "userId": mk_types::id::gen_aid_now(), "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("NO_SUCH_USER"));
+}
+
+// ---------------------------------------------------------------------------
 // users/lists/list — upstream list.ts is requireCredential: false and the
 // explicit-userId arm reads `{ userId, isPublic: true }` (even for the
 // caller's own id); the no-param arm reads every list the caller owns.

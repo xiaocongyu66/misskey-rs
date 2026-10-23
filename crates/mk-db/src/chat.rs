@@ -507,6 +507,20 @@ pub async fn room_messages(
     paged_messages(pool, &base, room_id, limit, since_id, until_id).await
 }
 
+/// `drive/files/attached-chat-messages` (endpoints/drive/files/attached-
+/// chat-messages.ts): `makePaginationQuery(message).andWhere('message.fileId
+/// = :fileId')` — the same paged shape as room_messages keyed on fileId.
+pub async fn file_messages(
+    pool: &PgPool,
+    file_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    let base = format!(r#"SELECT {MESSAGE_COLS} FROM "chat_message" WHERE "fileId" = $1"#);
+    paged_messages(pool, &base, file_id, limit, since_id, until_id).await
+}
+
 async fn paged_messages(
     pool: &PgPool,
     base: &str,
@@ -561,6 +575,46 @@ pub async fn user_history(
     .bind(limit)
     .fetch_all(pool)
     .await
+}
+
+/// ChatService.userTimeline — 1on1 messages between me and one other user in
+/// both directions, paged (same makePaginationQuery shape as room_messages).
+pub async fn user_timeline(
+    pool: &PgPool,
+    me_id: &str,
+    other_id: &str,
+    limit: i64,
+    since_id: Option<&str>,
+    until_id: Option<&str>,
+) -> Result<Vec<ChatMessageRow>, sqlx::Error> {
+    let base = format!(
+        r#"SELECT {MESSAGE_COLS} FROM "chat_message"
+           WHERE (("fromUserId" = $1 AND "toUserId" = $2)
+               OR ("fromUserId" = $2 AND "toUserId" = $1))"#
+    );
+    let sql = match (since_id, until_id) {
+        (Some(_), Some(_)) => {
+            format!(r#"{base} AND "id" > $3 AND "id" < $4 ORDER BY "id" DESC LIMIT $5"#)
+        }
+        (Some(_), None) => format!(r#"{base} AND "id" > $3 ORDER BY "id" ASC LIMIT $4"#),
+        (None, Some(_)) => format!(r#"{base} AND "id" < $3 ORDER BY "id" DESC LIMIT $4"#),
+        (None, None) => format!(r#"{base} ORDER BY "id" DESC LIMIT $3"#),
+    };
+    let mut q = sqlx::query_as::<_, ChatMessageRow>(&sql)
+        .bind(me_id)
+        .bind(other_id);
+    match (since_id, until_id) {
+        (Some(s), Some(u)) => {
+            q = q.bind(s).bind(u).bind(limit);
+        }
+        (Some(s), None) | (None, Some(s)) => {
+            q = q.bind(s).bind(limit);
+        }
+        (None, None) => {
+            q = q.bind(limit);
+        }
+    }
+    q.fetch_all(pool).await
 }
 
 /// ChatService.roomHistory — newest message per joined/owned room.
