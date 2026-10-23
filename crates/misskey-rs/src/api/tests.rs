@@ -19153,6 +19153,105 @@ async fn chat_rooms_invitations_outbox() {
 }
 
 // ---------------------------------------------------------------------------
+// chat/rooms/mute — upstream mute.ts: ChatService.muteRoom flips the caller's
+// membership row. With no membership row (owners, non-members) upstream's
+// findOneByOrFail throws a non-ApiError, which the API layer renders as 500
+// INTERNAL_ERROR (the declared NO_SUCH_ROOM is dead meta); mirrored here.
+#[tokio::test]
+async fn chat_rooms_mute() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkchat_roommute").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("rma")).await;
+    let bob = signup(&app, &uname("rmb")).await;
+    let b = bob["id"].as_str().unwrap();
+    let at = alice["token"].as_str().unwrap();
+    let bt = bob["token"].as_str().unwrap();
+
+    let (s, room) = post_json(
+        app.clone(),
+        "/api/chat/rooms/create",
+        json!({ "name": "mute", "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {room}");
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/invitations/create",
+        json!({ "roomId": room_id, "userId": b, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/rooms/join",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // -- happy path: member mutes, show reflects isMuted -------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/mute",
+        json!({ "roomId": room_id, "mute": true, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/show",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["isMuted"], json!(true));
+
+    // unmute flips it back
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/mute",
+        json!({ "roomId": room_id, "mute": false, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/show",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["isMuted"], json!(false));
+
+    // -- error path: owner has no membership row → 500 INTERNAL_ERROR ------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/mute",
+        json!({ "roomId": room_id, "mute": true, "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INTERNAL_ERROR"));
+
+    // -- missing mute → invalid param --------------------------------------
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/chat/rooms/mute",
+        json!({ "roomId": room_id, "i": bt }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], json!("INVALID_PARAM"));
+}
+
+// ---------------------------------------------------------------------------
 // users/lists/list — upstream list.ts is requireCredential: false and the
 // explicit-userId arm reads `{ userId, isPublic: true }` (even for the
 // caller's own id); the no-param arm reads every list the caller owns.

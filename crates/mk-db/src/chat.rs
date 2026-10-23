@@ -223,6 +223,28 @@ pub async fn delete_membership(
         .map(|r| r.rows_affected())
 }
 
+/// ChatService.muteRoom — flip `isMuted` on the caller's membership row.
+/// Upstream's `findOneByOrFail({ roomId, userId })` throws a non-ApiError
+/// when no membership exists (owners included); the api layer maps that to
+/// INTERNAL_ERROR. Returns rows_affected so the caller can do the same.
+pub async fn set_membership_muted(
+    pool: &PgPool,
+    room_id: &str,
+    user_id: &str,
+    muted: bool,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "chat_room_membership" SET "isMuted" = $3
+           WHERE "roomId" = $1 AND "userId" = $2"#,
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .bind(muted)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
 /// ChatService.getMyMemberships (paged).
 pub async fn memberships_for_user(
     pool: &PgPool,

@@ -53,6 +53,7 @@ pub(crate) const CHAT_ENDPOINTS: &[&str] = &[
     "chat/rooms/show",
     "chat/rooms/delete",
     "chat/rooms/update",
+    "chat/rooms/mute",
     "chat/rooms/members",
     "chat/rooms/invitations/create",
     "chat/rooms/invitations/ignore",
@@ -440,6 +441,7 @@ pub(crate) async fn handle(
         "chat/rooms/show" => rooms_show(state, pool, body, &me_id).await,
         "chat/rooms/delete" => rooms_delete(pool, body, &me_id).await,
         "chat/rooms/update" => rooms_update(state, pool, body, &me_id).await,
+        "chat/rooms/mute" => rooms_mute(pool, body, &me_id).await,
         "chat/rooms/members" => rooms_members(state, pool, body, &me_id).await,
         "chat/rooms/invitations/create" => invitations_create(state, pool, body, &me_id).await,
         "chat/rooms/invitations/ignore" => invitations_ignore(pool, body, &me_id).await,
@@ -649,6 +651,29 @@ async fn rooms_update(
         .map_err(|e| db_err("rooms_update update", e))?
         .ok_or_else(|| no_such_room("fcdb0f92-bda6-47f9-bd05-343e0e020932"))?;
     Ok(ok_json(pack_room(state, pool, &room, me_id).await?))
+}
+
+/// chat/rooms/mute — ChatService.muteRoom flips the caller's membership row.
+/// Upstream's findOneByOrFail throws a non-ApiError when the caller has no
+/// membership (owners included), which the API layer renders as 500
+/// INTERNAL_ERROR; the endpoint's declared NO_SUCH_ROOM is never thrown.
+async fn rooms_mute(
+    pool: &mk_db::sqlx::PgPool,
+    body: &Value,
+    me_id: &str,
+) -> Result<Response, Response> {
+    let room_id = required_id(body, "roomId")?;
+    let mute = match body.get("mute") {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(invalid_param("mute", "required (boolean)")),
+    };
+    let updated = mk_db::chat::set_membership_muted(pool, room_id, me_id, mute)
+        .await
+        .map_err(|e| db_err("rooms_mute", e))?;
+    if updated == 0 {
+        return Err(api_err(ApiError::internal_error()));
+    }
+    Ok(ok_empty())
 }
 
 /// chat/rooms/members — member-scoped, populateUser.
