@@ -4165,14 +4165,15 @@ async fn drive_attached_chat_messages_roundtrip() {
     let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
     let a_token = alice["token"].as_str().unwrap().to_string();
     let b_token = bob["token"].as_str().unwrap().to_string();
+    let a_id = alice["id"].as_str().unwrap().to_string();
     let b_id = bob["id"].as_str().unwrap().to_string();
 
-    // 1on1 DMs need the chatScope 'mutual' gate (following both ways)
-    for tok in [&a_token, &b_token] {
+    // 1on1 DMs need the chatScope 'mutual' gate (each follows the other)
+    for (tok, uid) in [(&a_token, &b_id), (&b_token, &a_id)] {
         let (s, v) = post_json(
             app.clone(),
             "/api/following/create",
-            json!({ "userId": b_id, "i": tok }),
+            json!({ "userId": uid, "i": tok }),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "body: {v}");
@@ -4250,7 +4251,7 @@ async fn drive_attached_chat_messages_roundtrip() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
 
-    // no credential → 401 CREDENTIAL_REQUIRED
+    // no credential → 401 AUTHENTICATION_FAILED (the drive-arm token gate)
     let (s, body) = post_json(
         app.clone(),
         "/api/drive/files/attached-chat-messages",
@@ -4258,7 +4259,7 @@ async fn drive_attached_chat_messages_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+    assert_eq!(body["error"]["code"], json!("AUTHENTICATION_FAILED"));
 }
 
 // drive/stream — upstream endpoints/drive/stream.ts: the drive/files page
@@ -4369,10 +4370,10 @@ async fn drive_stream_lists_owner_files_paged() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"]["code"], json!("INVALID_PARAM"));
 
-    // no credential → 401 CREDENTIAL_REQUIRED
+    // no credential → 401 AUTHENTICATION_FAILED (the drive-arm token gate)
     let (s, body) = post_json(app.clone(), "/api/drive/stream", json!({})).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
-    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+    assert_eq!(body["error"]["code"], json!("AUTHENTICATION_FAILED"));
 }
 
 #[tokio::test]
@@ -17712,10 +17713,14 @@ async fn i_page_likes_full_page_pack() {
         .await;
         assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
     }
+    // a third user also likes page1 (bob cannot — pages/like bans self-likes
+    // with YOUR_PAGE, matching upstream pages/like.ts)
+    let carol = signup(&app, &format!("plc{}", mk_types::id::gen_aid_now())).await;
+    let ct = carol["token"].as_str().unwrap().to_string();
     let (s, v) = post_json(
         app.clone(),
         "/api/pages/like",
-        json!({ "pageId": page1, "i": bt }),
+        json!({ "pageId": page1, "i": ct }),
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "body: {v}");
@@ -17745,13 +17750,17 @@ async fn i_page_likes_full_page_pack() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["page"]["id"], json!(page1));
 
-    // bob sees only his own like (isLiked computed for bob)
-    let (s, likes) = post_json(app.clone(), "/api/i/page-likes", json!({ "i": bt })).await;
+    // carol sees only her own like (isLiked computed for carol); bob — the
+    // pages' owner, who liked nothing — sees an empty list
+    let (s, likes) = post_json(app.clone(), "/api/i/page-likes", json!({ "i": ct })).await;
     assert_eq!(s, StatusCode::OK, "body: {likes}");
     let arr = likes.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["page"]["id"], json!(page1));
     assert_eq!(arr[0]["page"]["isLiked"], json!(true));
+    let (s, likes) = post_json(app.clone(), "/api/i/page-likes", json!({ "i": bt })).await;
+    assert_eq!(s, StatusCode::OK, "body: {likes}");
+    assert_eq!(likes.as_array().unwrap().len(), 0, "body: {likes}");
 
     // no credential → 401 CREDENTIAL_REQUIRED
     let (s, body) = post_json(app.clone(), "/api/i/page-likes", json!({})).await;
