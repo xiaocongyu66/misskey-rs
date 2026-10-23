@@ -309,7 +309,7 @@ fn js_set_month_day(y: i64, month0: u32, mut day: u32) -> (i64, u32, u32) {
 fn next_occurrence(mmdd: i64, today: (i64, u32, u32)) -> String {
     let m = (mmdd / 100).max(1).min(12) as u32;
     let d = (mmdd % 100).max(1) as u32;
-    let (mut y, m, d) = js_set_month_day(today.0, m - 1, d);
+    let (mut y, mut m, mut d) = js_set_month_day(today.0, m - 1, d);
     if (y, m, d) < today {
         (y, m, d) = js_set_month_day(y + 1, m - 1, d);
     }
