@@ -24467,3 +24467,180 @@ async fn v2_admin_emoji_list_filters_pages_and_admin_gate() {
     assert_eq!(body["count"], 1);
     assert_eq!(body["allPages"], 2);
 }
+
+// ---------------------------------------------------------------------------
+// users-birthday: users/get-following-users-by-birthday (upstream
+// endpoints/users/get-following-users-by-birthday.ts @ ea2c3aed)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn users_get_following_users_by_birthday_range_and_auth() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mkbday").await;
+    let app = crate::build_router(test_state(pool.clone()));
+
+    let uname = |p: &str| format!("{p}{}", mk_types::id::gen_aid_now());
+    let alice = signup(&app, &uname("bda")).await;
+    let bob = signup(&app, &uname("bdb")).await;
+    let charlie = signup(&app, &uname("bdc")).await;
+    let dave = signup(&app, &uname("bdd")).await;
+    let eve = signup(&app, &uname("bde")).await;
+    let at = alice["token"].as_str().unwrap().to_string();
+    let (b_id, c_id, d_id, e_id) = (
+        bob["id"].as_str().unwrap().to_string(),
+        charlie["id"].as_str().unwrap().to_string(),
+        dave["id"].as_str().unwrap().to_string(),
+        eve["id"].as_str().unwrap().to_string(),
+    );
+
+    // birthdays: bob 05-10, charlie 05-20, dave 05-15 (NOT followed by
+    // alice), eve 01-05 — all via i/update (user_profile.birthday).
+    for (tok, day) in [
+        (bob["token"].as_str().unwrap(), "05-10"),
+        (charlie["token"].as_str().unwrap(), "05-20"),
+        (dave["token"].as_str().unwrap(), "05-15"),
+        (eve["token"].as_str().unwrap(), "01-05"),
+    ] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/i/update",
+            json!({ "i": tok, "birthday": format!("2000-{day}") }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+
+    // alice follows bob + charlie + eve
+    for uid in [&b_id, &c_id, &e_id] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/following/create",
+            json!({ "userId": uid, "i": at }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+
+    // next-occurrence year bump: mmdd < today → next year, else this year
+    // (same rule the endpoint implements; today read independently here).
+    let today_iso = mk_core::services::signup::ms_to_iso(super::now_ms() as i64);
+    let today = &today_iso[..10];
+    let (ty, tm, td): (i64, u32, u32) = {
+        let mut it = today.split('-');
+        (
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(1970),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+        )
+    };
+    let expect_birthday = |mm: u32, dd: u32| -> String {
+        let y = if (mm, dd) < (tm, td) { ty + 1 } else { ty };
+        format!("{y:04}-{mm:02}-{dd:02}")
+    };
+
+    // single {month, day} → exactly bob.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({ "i": at, "birthday": { "month": 5, "day": 10 } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], json!(b_id));
+    assert_eq!(v[0]["birthday"], json!(expect_birthday(5, 10)));
+    assert_eq!(v[0]["user"]["id"], json!(b_id));
+
+    // range {begin, end} → followees only, ordered by mmdd ASC; the
+    // unfollowed dave (05-15, inside the window) is excluded.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({
+            "i": at,
+            "birthday": { "begin": { "month": 5, "day": 1 }, "end": { "month": 5, "day": 31 } },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], json!(b_id));
+    assert_eq!(arr[1]["id"], json!(c_id));
+
+    // pagination: offset 1, limit 1 → second row only.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({
+            "i": at,
+            "limit": 1,
+            "offset": 1,
+            "birthday": { "begin": { "month": 5, "day": 1 }, "end": { "month": 5, "day": 31 } },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], json!(c_id));
+
+    // year wrap (12/31 → 1/1): eve's 01-05 birthday is caught.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({
+            "i": at,
+            "birthday": { "begin": { "month": 12, "day": 31 }, "end": { "month": 1, "day": 5 } },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["id"], json!(e_id));
+    assert_eq!(v[0]["birthday"], json!(expect_birthday(1, 5)));
+
+    // empty window → no rows.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({
+            "i": at,
+            "birthday": { "begin": { "month": 7, "day": 1 }, "end": { "month": 7, "day": 31 } },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v.as_array().unwrap().len(), 0);
+
+    // requireCredential: true → guest 401 CREDENTIAL_REQUIRED.
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({ "birthday": { "month": 5, "day": 10 } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+
+    // paramDef: birthday required; month out of bounds → INVALID_PARAM.
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({ "i": at }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
+
+    let (s, err) = post_json(
+        app.clone(),
+        "/api/users/get-following-users-by-birthday",
+        json!({ "i": at, "birthday": { "month": 13, "day": 1 } }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {err}");
+    assert_eq!(err["error"]["code"], json!("INVALID_PARAM"));
+}
