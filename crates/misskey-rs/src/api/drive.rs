@@ -1,5 +1,6 @@
 //! Drive domain (drive.ts arena): `drive/files/create` (multipart upload),
-//! `drive/files/attached-notes`, `drive/files/upload-from-url` + the
+//! `drive/files/attached-notes`, `drive/files/attached-chat-messages`,
+//! `drive/files/upload-from-url` + the
 //! `/streaming` main-channel websocket hub the upload-finished event rides
 //! on, plus the shared `DriveFileEntityService.getPublicUrl` helper.
 //!
@@ -263,6 +264,7 @@ pub(crate) async fn handle_json(
 ) -> Response {
     match name {
         "drive/files/attached-notes" => attached_notes(state, body, token).await,
+        "drive/files/attached-chat-messages" => attached_chat_messages(state, body, token).await,
         "drive/files/upload-from-url" => files_upload_from_url(state, body, token).await,
         // arena-files: the drive/files read/lookup surface (upstream
         // endpoints/drive/files/*)
@@ -933,6 +935,87 @@ async fn attached_notes(state: &AppState, body: &Value, token: Option<String>) -
         match super::pack_note(state, pool, note_id).await {
             Ok(n) => out.push(n),
             Err(r) => return *r,
+        }
+    }
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+/// `POST /api/drive/files/attached-chat-messages` (upstream
+/// endpoints/drive/files/attached-chat-messages.ts): requireCredential,
+/// kind read:drive. The file is looked up by `{ id, userId: me }` — the
+/// `isModerator` bypass is unported on this path (same as attached-notes);
+/// a missing or foreign file answers 400 NO_SUCH_FILE (error id
+/// 485ce26d-f5d2-4313-9783-e689d131eafb). `checkChatAvailability(me,
+/// 'read')` is not re-evaluated (the chat module treats DEFAULT_POLICIES
+/// chatAvailability=available; see the chat.rs header). Messages page via
+/// `message.fileId = file.id` + makePaginationQuery and pack with
+/// ChatEntityService.packMessagesDetailed.
+async fn attached_chat_messages(state: &AppState, body: &Value, token: Option<String>) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    let me_id = match super::require_credential_me_id(pool, token.as_deref(), "dbg_drive").await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let Some(file_id) = body.get("fileId").and_then(Value::as_str) else {
+        return api_err(ApiError::invalid_param(json!({
+            "param": "fileId",
+            "reason": "required",
+        })));
+    };
+
+    // limit 1..=100 default 10 (paramDef); sinceId/untilId nullable ids.
+    let limit = match body.get("limit") {
+        None | Some(Value::Null) => 10i64,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=100).contains(&n) => n,
+            _ => {
+                return api_err(ApiError::invalid_param(json!({
+                    "param": "limit",
+                    "reason": "must be an integer in 1..=100",
+                })));
+            }
+        },
+    };
+    let since_id = body.get("sinceId").and_then(Value::as_str);
+    let until_id = body.get("untilId").and_then(Value::as_str);
+
+    // findOneBy({ id, userId: me }) — foreign files do not exist for the
+    // caller (the moderator arm collapses to the owner check here).
+    let file = match mk_db::drive::find_drive_file(pool, file_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "find_drive_file");
+            return api_err(ApiError::internal_error());
+        }
+    };
+    let owned = matches!(&file, Some(f) if f.user_id.as_deref() == Some(me_id.as_str()));
+    if !owned {
+        return api_err(ApiError::new(
+            400,
+            mk_types::api_error::ApiErrorKind::Client,
+            "NO_SUCH_FILE",
+            "485ce26d-f5d2-4313-9783-e689d131eafb",
+            "No such file.",
+        ));
+    }
+
+    let messages = match mk_db::chat::file_messages(pool, file_id, limit, since_id, until_id).await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(target: "dbg_drive", error = %e, "chat::file_messages");
+            return api_err(ApiError::internal_error());
+        }
+    };
+
+    let mut out = Vec::with_capacity(messages.len());
+    for message in &messages {
+        match super::chat::pack_message_detailed(state, pool, message, &me_id).await {
+            Ok(m) => out.push(m),
+            Err(r) => return r,
         }
     }
     (StatusCode::OK, Json(json!(out))).into_response()
