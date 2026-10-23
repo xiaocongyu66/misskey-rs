@@ -107,8 +107,9 @@ mod announce_more;
 // mk-db/src/avatar_decoration.rs (the table ships in the 0001 baseline).
 mod avatar_decorations;
 // note-agent: notes.ts acceptance slice — notes (global list),
-// notes/polls/vote, notes/translate + the admin/update-meta
-// sensitiveWords/prohibitedWords patch (db paths in mk-db meta.rs).
+// notes/polls/vote, notes/polls/recommendation, notes/translate + the
+// admin/update-meta sensitiveWords/prohibitedWords patch (db paths in
+// mk-db meta.rs / poll.rs).
 mod note_extras;
 // notes-more: notes/* remainder batch — favorites create/delete,
 // reactions/delete, renotes, conversation, children, state, unrenote
@@ -134,6 +135,11 @@ mod lists;
 // users/lists/*, users/reactions) — api::users_more; db paths in
 // mk-db/src/lists.rs + mk-db/src/note.rs (0001 baseline).
 mod users_more;
+// users-birthday: users/get-following-users-by-birthday (upstream
+// endpoints/users/get-following-users-by-birthday.ts) — inline SQL over the
+// 0001 `following` x `user_profile` join with the schema's get_birthday_date()
+// mmdd index; next-occurrence date math in the module.
+mod users_birthday;
 // antennas-v2: antennas/* (upstream endpoints/antennas/{create,delete,list,
 // show,update,notes,remove-note}.ts; requireCredential + owner-scoped
 // NO_SUCH_ANTENNA ids per endpoint) — db paths in mk-db/src/antennas.rs (0001
@@ -394,9 +400,13 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         // mute lane: the reset the Mute e2e stream legs run before each
         // waitFire (endpoints/notifications/mark-all-as-read.ts, 204)
         || name == "notifications/mark-all-as-read"
-        // note-agent: note domain (local-timeline guest-ok)
+        // note-agent: note domain (local-timeline guest-ok; global-timeline
+        // guest-ok too — endpoints/notes/global-timeline.ts carries no
+        // requireCredential and its gtlAvailable role gate rides the
+        // default-allow arm, see social::notes_global_timeline)
         || name == "notes/timeline"
         || name == "notes/local-timeline"
+        || name == "notes/global-timeline"
         || name == "notes/hybrid-timeline"
         // note-notify: following/list (endpoints/following/list.ts) — the
         // following.notify read side (`notification: true` → notify IS NOT NULL)
@@ -417,9 +427,11 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         || name == "notes/children"
         || name == "notes/state"
         || name == "notes/unrenote"
-        // note-agent notes.ts slice (global list + polls/vote + translate)
+        // note-agent notes.ts slice (global list + polls/vote +
+        // polls/recommendation + translate)
         || name == "notes"
         || name == "notes/polls/vote"
+        || name == "notes/polls/recommendation"
         || name == "notes/translate"
         // charts3: the notes chart read (upstream endpoints/charts/notes.ts
         // has no requireCredential and no meta.errors → guests chart too;
@@ -527,6 +539,9 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         if name == "notes/local-timeline" {
             return social::notes_local_timeline(&state, &body, token.as_deref()).await;
         }
+        if name == "notes/global-timeline" {
+            return social::notes_global_timeline(&state, &body, token.as_deref()).await;
+        }
         if name == "notes/timeline" || name == "notes/hybrid-timeline" {
             return social::timeline_or_hybrid(&state, name.as_str(), &body, token.as_deref())
                 .await;
@@ -588,7 +603,10 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         if name == "notes" {
             return note_extras::notes_list(&state, &body, token.as_deref()).await;
         }
-        if name == "notes/polls/vote" || name == "notes/translate" {
+        if name == "notes/polls/vote"
+            || name == "notes/polls/recommendation"
+            || name == "notes/translate"
+        {
             return note_extras::handle(&state, name.as_str(), &body, token).await;
         }
         // charts3 arm: span required enum day|hour, limit 1..500 default 30,
@@ -1133,6 +1151,7 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
     // the endpoint bodies in api::drive (db paths in mk-db/src/drive.rs,
     // the /streaming hub routed in main.rs).
     if name == "drive/files/attached-notes"
+        || name == "drive/files/attached-chat-messages"
         || name == "drive/files/upload-from-url"
         // arena-files: the drive/files read/lookup surface (upstream
         // endpoints/drive/files/* — list/show/delete/find/find-by-hash/
@@ -1393,6 +1412,41 @@ pub async fn dispatch(State(state): State<AppState>, mut req: Request) -> Respon
         return users_more::handle(&state, name.as_str(), &body, token, credential_declared).await;
     }
     // ==== END users-more DISPATCH ARM ====
+
+    // ==== users-birthday DISPATCH ARM (users/get-following-users-by-birthday) ====
+    // Self-contained block on the users-more arm pattern: method check, body
+    // parsing, token extraction and the credential-declared probe live here;
+    // the requireCredential gate + endpoint body live in api::users_birthday
+    // (inline SQL over the 0001 following x user_profile join). The name does
+    // not collide with any earlier arm.
+    if users_birthday::handles(name.as_str()) {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let headers = req.headers().clone();
+        let body = match parse_json_body(req).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        // Upstream handleRequest: a non-string `i` → `reply.code(400)` empty.
+        let credential_declared = body.get("i").is_some()
+            || headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.starts_with("Bearer "))
+                .unwrap_or(false);
+        let token = extract_token(&body, &headers);
+        if token.is_none() {
+            if let Some(v) = body.get("i") {
+                if v.as_str().is_none() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        return users_birthday::handle(&state, name.as_str(), &body, token, credential_declared)
+            .await;
+    }
+    // ==== END users-birthday DISPATCH ARM ====
 
     // ==== clips-agent DISPATCH ARM (clips/* + users/clips) ====
     // Self-contained block on the channels/ul-tl arm pattern: method check,

@@ -1,11 +1,15 @@
 //! note-agent: the notes.ts acceptance rest — `notes` (global list),
-//! `notes/polls/vote`, `notes/translate` and the sensitiveWords /
-//! prohibitedWords patch of `admin/update-meta`.
+//! `notes/polls/vote`, `notes/polls/recommendation`, `notes/translate` and
+//! the sensitiveWords / prohibitedWords patch of `admin/update-meta`.
 //!
 //! Upstream refs: `endpoints/notes.ts` (public + localOnly filters, no
 //! credential), `endpoints/notes/polls/vote.ts` (NO_SUCH_NOTE on invisible,
 //! NO_POLL, ALREADY_EXPIRED, INVALID_CHOICE, ALREADY_VOTED,
-//! `votes[$1] = votes[$1] + 1`), `endpoints/notes/translate.ts`
+//! `votes[$1] = votes[$1] + 1`), `endpoints/notes/polls/recommendation.ts`
+//! (requireCredential read:account; the pinned upstream recommendation is a
+//! pure SQL scan over `poll` — local public unexpired polls not yet voted by
+//! the caller, author unmuted, noteId DESC with limit/offset and the
+//! `excludeChannels` bracket — no Redis engine), `endpoints/notes/translate.ts`
 //! (canUseTranslator → note → invisible → empty text 204 → deeplAuthKey
 //! UNAVAILABLE ladder), `endpoints/admin/update-meta.ts` (requireAdministrator
 //! + the word-list params the meta row carries).
@@ -49,9 +53,74 @@ pub(crate) async fn handle(
 ) -> Response {
     match name {
         "notes/polls/vote" => polls_vote(state, body, token.as_deref()).await,
+        "notes/polls/recommendation" => polls_recommendation(state, body, token.as_deref()).await,
         "notes/translate" => translate(state, body, token.as_deref()).await,
         _ => api_err(ApiError::unknown_endpoint()),
     }
+}
+
+/// `POST /api/notes/polls/recommendation` (requireCredential, kind
+/// read:account; endpoints/notes/polls/recommendation.ts): the poll-table
+/// recommendation scan (mk_db::poll::recommended_poll_note_ids) — no Redis
+/// engine involved in the pinned upstream, so this is a faithful port, not an
+/// approximation. The picked notes pack with `detail: true` (pack_note_for).
+pub(crate) async fn polls_recommendation(
+    state: &AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return api_err(ApiError::internal_error());
+    };
+    // requireCredential: a declared-but-unresolvable credential →
+    // AUTHENTICATION_FAILED, no credential at all → CREDENTIAL_REQUIRED
+    // (require_checked_user's credential-declared ladder).
+    let declared = body.get("i").is_some();
+    let me_id = match super::social::require_checked_user(pool, token, declared).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let limit = match body.get("limit") {
+        None => 10i64,
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(l) if (1..=100).contains(&l) => l,
+            _ => return invalid("limit", "must be 1..100"),
+        },
+        Some(_) => return invalid("limit", "must be an integer"),
+    };
+    let offset = match body.get("offset") {
+        None => 0i64,
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(o) if o >= 0 => o,
+            _ => return invalid("offset", "must be a non-negative integer"),
+        },
+        Some(_) => return invalid("offset", "must be an integer"),
+    };
+    let exclude_channels = match body.get("excludeChannels") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return invalid("excludeChannels", "must be a boolean"),
+    };
+
+    let ids =
+        match mk_db::poll::recommended_poll_note_ids(pool, &me_id, limit, offset, exclude_channels)
+            .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "recommended_poll_note_ids");
+                return api_err(ApiError::internal_error());
+            }
+        };
+
+    let mut out = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match super::pack_note_for(state, pool, id, Some(&me_id)).await {
+            Ok(n) => out.push(n),
+            Err(resp) => return *resp,
+        }
+    }
+    (StatusCode::OK, Json(Value::Array(out))).into_response()
 }
 
 /// `POST /api/notes` — the global list (visibility='public' + localOnly=FALSE;

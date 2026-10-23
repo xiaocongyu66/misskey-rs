@@ -1461,6 +1461,73 @@ pub(crate) async fn notes_local_timeline(
     .await
 }
 
+/// `POST /api/notes/global-timeline` (guest ok): public non-channel notes
+/// across every host (endpoints/notes/global-timeline.ts). Divergence note:
+/// the upstream `gtlAvailable` role-policy gate resolves to the default-allow
+/// arm the rest of this workspace pins (api::streaming header note) — the
+/// GTL_DISABLED error path is unreachable under the default policies.
+pub(crate) async fn notes_global_timeline(
+    state: &crate::api::AppState,
+    body: &Value,
+    token: Option<&str>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return crate::api::api_err(crate::api::ApiError::internal_error());
+    };
+    let me_id: Option<String> = require_checked_user(pool, token, false).await.ok();
+    // generateUgcVisibilityQueryForVisitor is a guests-only gate; the meta
+    // read mirrors fetch_resource::meta_ugc (missing row → the TypeORM column
+    // default 'local').
+    let guest_ugc: Option<String> = if me_id.is_none() {
+        match mk_db::sqlx::query_scalar::<_, Option<String>>(
+            r#"SELECT "ugcVisibilityForVisitor" FROM "meta" ORDER BY "id" DESC LIMIT 1"#,
+        )
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(v) => Some(v.flatten().unwrap_or_else(|| "local".to_string())),
+            Err(e) => {
+                tracing::error!(target: "dbg_notes", error = %e, "global-timeline meta ugc");
+                return crate::api::api_err(crate::api::ApiError::internal_error());
+            }
+        }
+    } else {
+        None
+    };
+    // makePaginationQuery: id params win; the date params fold into generated
+    // aid boundary ids (QueryService `idService.gen(sinceDate/untilDate)`).
+    let since_id = opt_id(body, "sinceId").or_else(|| {
+        body.get("sinceDate")
+            .and_then(|v| v.as_i64())
+            .map(mk_types::id::gen_aid)
+    });
+    let until_id = opt_id(body, "untilId").or_else(|| {
+        body.get("untilDate")
+            .and_then(|v| v.as_i64())
+            .map(mk_types::id::gen_aid)
+    });
+    run_list(
+        state,
+        pool,
+        mk_db::timelines::global_timeline_notes(
+            pool,
+            me_id.as_deref(),
+            guest_ugc.as_deref(),
+            since_id.as_deref(),
+            until_id.as_deref(),
+            opt_i(body, "limit", 10).clamp(1, 100),
+            body.get("withFiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            body.get("withRenotes")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        )
+        .await,
+    )
+    .await
+}
+
 /// `POST /api/notes/hybrid-timeline` (requireCredential): social timeline.
 pub(crate) async fn notes_hybrid_timeline(
     state: &crate::api::AppState,
