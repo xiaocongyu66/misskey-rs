@@ -4148,6 +4148,119 @@ async fn drive_attached_notes_roundtrip() {
     assert_eq!(s, StatusCode::NO_CONTENT);
 }
 
+// drive/files/attached-chat-messages — upstream
+// endpoints/drive/files/attached-chat-messages.ts (no upstream e2e at the
+// pin; the attached-notes drive.ts pins own the error shape: NO_SUCH_FILE on
+// foreign/unknown files, packMessagesDetailed rows for the owner).
+#[tokio::test]
+async fn drive_attached_chat_messages_roundtrip() {
+    if std::env::var("DATABASE_URL").is_err() {
+        return;
+    }
+    init_tracing();
+    let pool = fresh_pool("mktest_drive_chatmsg").await;
+    let app = crate::build_router(test_state(pool));
+
+    let alice = signup(&app, &format!("alice{}", mk_types::id::gen_aid_now())).await;
+    let bob = signup(&app, &format!("bob{}", mk_types::id::gen_aid_now())).await;
+    let a_token = alice["token"].as_str().unwrap().to_string();
+    let b_token = bob["token"].as_str().unwrap().to_string();
+    let b_id = bob["id"].as_str().unwrap().to_string();
+
+    // 1on1 DMs need the chatScope 'mutual' gate (following both ways)
+    for tok in [&a_token, &b_token] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/following/create",
+            json!({ "userId": b_id, "i": tok }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+
+    // multipart upload (jpeg magic bytes — mirrors the attached-notes pin)
+    let mut body: Vec<u8> =
+        b"--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chat.jpg\"\r\n\r\n"
+            .to_vec();
+    body.extend_from_slice(b"\xFF\xD8\xFF\xe0jpeg-bytes");
+    body.extend_from_slice(b"\r\n--XX\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n");
+    body.extend_from_slice(a_token.as_bytes());
+    body.extend_from_slice(b"\r\n--XX--\r\n");
+    let (s, file) = post_multipart(
+        app.clone(),
+        "/api/drive/files/create",
+        "multipart/form-data; boundary=XX",
+        body,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {file}");
+    let file_id = file["id"].as_str().unwrap().to_string();
+
+    // DM carrying the file (fileId-only messages are legal upstream) + one
+    // text DM that must NOT appear under the file
+    let (s, dm) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-user",
+        json!({ "toUserId": b_id, "fileId": file_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {dm}");
+    let dm_id = dm["id"].as_str().unwrap().to_string();
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/chat/messages/create-to-user",
+        json!({ "toUserId": b_id, "text": "no file here", "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // owner sees only the file message (packMessagesDetailed shape)
+    let (s, msgs) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-chat-messages",
+        json!({ "fileId": file_id, "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {msgs}");
+    let arr = msgs.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "body: {msgs}");
+    assert_eq!(arr[0]["id"], json!(dm_id));
+    assert_eq!(arr[0]["fromUserId"], json!(alice["id"]));
+    assert_eq!(arr[0]["fileId"], json!(file_id));
+    assert_eq!(arr[0]["file"]["id"], json!(file_id));
+    assert!(arr[0]["fromUser"]["id"].is_string(), "body: {msgs}");
+
+    // unknown file under the caller → NO_SUCH_FILE (485ce26d…)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-chat-messages",
+        json!({ "fileId": "x".repeat(24), "i": a_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // foreign file → NO_SUCH_FILE (the moderator bypass is unported)
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-chat-messages",
+        json!({ "fileId": file_id, "i": b_token }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("NO_SUCH_FILE"));
+
+    // no credential → 401 CREDENTIAL_REQUIRED
+    let (s, body) = post_json(
+        app.clone(),
+        "/api/drive/files/attached-chat-messages",
+        json!({ "fileId": file_id }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"]["code"], json!("CREDENTIAL_REQUIRED"));
+}
+
 #[tokio::test]
 async fn announcements_auto_archive_cycle() {
     if std::env::var("DATABASE_URL").is_err() {
