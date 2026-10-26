@@ -147,27 +147,9 @@ async fn signup_duplicated_username() {
 }
 
 async fn fresh_pool(db: &str) -> mk_db::sqlx::PgPool {
-    // The runner occasionally wedges the first 0001 DDL for a fresh db (the
-    // advisory lock was acquired, then the DDL sat for 30+ minutes). The
-    // connection sets lock_timeout, so a stuck DDL now errors after 60s;
-    // retry on a rebuilt db, which DROP ... WITH (FORCE)s any stragglers.
-    let mut last = String::new();
-    for attempt in 1..=3 {
-        let pool = mk_db::test_support::fresh_db(db).await;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            mk_db::run_migrations(&pool),
-        )
-        .await
-        {
-            Ok(Ok(())) => return pool,
-            Ok(Err(e)) => last = format!("{e}"),
-            Err(_) => last = "timed out".to_string(),
-        }
-        pool.close().await;
-        eprintln!("fresh_pool({db}) migration attempt {attempt} failed: {last}");
-    }
-    panic!("fresh_pool({db}) migrations never succeeded: {last}");
+    // fresh_db clones the migrated template, so no migration work happens
+    // here; a stray run_migrations in the test is a no-op.
+    mk_db::test_support::fresh_db(db).await
 }
 
 async fn signup(app: &axum::Router, username: &str) -> Value {

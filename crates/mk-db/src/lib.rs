@@ -206,12 +206,18 @@ pub mod test_support {
     use super::*;
     use sqlx::postgres::PgConnectOptions;
 
+    /// One migrated database per PG server; every test clones it, which is
+    /// milliseconds instead of running the 40k-line 0001 DDL 200+ times.
+    const TEMPLATE_DB: &str = "mk_schema_template";
+    const TEMPLATE_LOCK: i64 = 0x6d6b_746d_706c_0001;
+
     pub async fn fresh_db(db_suffix: &str) -> PgPool {
         let base = std::env::var("DATABASE_URL").unwrap_or_default();
         assert!(!base.is_empty(), "DATABASE_URL required for db tests");
 
         let admin_url = swap_db(&base, "postgres");
         let admin = connect(&admin_url).await.expect("connect admin db");
+        ensure_template(&base, &admin).await;
         sqlx::query(&format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             db_suffix
@@ -219,15 +225,57 @@ pub mod test_support {
         .execute(&admin)
         .await
         .expect("drop stale test db");
-        sqlx::query(&format!("CREATE DATABASE {}", db_suffix))
-            .execute(&admin)
-            .await
-            .expect("create test db");
+        sqlx::query(&format!(
+            "CREATE DATABASE {} TEMPLATE {}",
+            db_suffix, TEMPLATE_DB
+        ))
+        .execute(&admin)
+        .await
+        .expect("clone template db");
         admin.close().await;
 
         connect(&swap_db(&base, db_suffix))
             .await
             .expect("connect test db")
+    }
+
+    async fn template_exists(admin: &PgPool) -> bool {
+        sqlx::query_scalar::<_, i32>("SELECT 1 FROM pg_database WHERE datname = $1")
+            .bind(TEMPLATE_DB)
+            .fetch_optional(admin)
+            .await
+            .expect("probe template db")
+            .is_some()
+    }
+
+    async fn ensure_template(base: &str, admin: &PgPool) {
+        if template_exists(admin).await {
+            return;
+        }
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(TEMPLATE_LOCK)
+            .execute(admin)
+            .await
+            .expect("template lock");
+        // Re-check under the lock: a sibling test binary may have built it
+        // between our probe and the lock.
+        if !template_exists(admin).await {
+            sqlx::query(&format!("CREATE DATABASE {}", TEMPLATE_DB))
+                .execute(admin)
+                .await
+                .expect("create template db");
+            let tpl = connect(&swap_db(base, TEMPLATE_DB))
+                .await
+                .expect("connect template db");
+            super::run_migrations(&tpl).await.expect("migrate template");
+            // CREATE DATABASE ... TEMPLATE refuses to run while the source
+            // still has connections, so close before returning.
+            tpl.close().await;
+        }
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(TEMPLATE_LOCK)
+            .execute(admin)
+            .await;
     }
 
     fn swap_db(url: &str, db: &str) -> String {
