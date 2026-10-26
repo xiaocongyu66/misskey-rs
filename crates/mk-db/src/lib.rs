@@ -252,16 +252,20 @@ pub mod test_support {
         if template_exists(admin).await {
             return;
         }
+        // pg_advisory_lock is session-scoped: lock and unlock must run on the
+        // same connection, otherwise the lock leaks and every other test
+        // binary waits forever (this wedged CI at 17+ minutes).
+        let mut conn = admin.acquire().await.expect("acquire admin conn");
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(TEMPLATE_LOCK)
-            .execute(admin)
+            .execute(&mut *conn)
             .await
             .expect("template lock");
         // Re-check under the lock: a sibling test binary may have built it
         // between our probe and the lock.
         if !template_exists(admin).await {
             sqlx::query(&format!("CREATE DATABASE {}", TEMPLATE_DB))
-                .execute(admin)
+                .execute(&mut *conn)
                 .await
                 .expect("create template db");
             let tpl = connect(&swap_db(base, TEMPLATE_DB))
@@ -269,12 +273,12 @@ pub mod test_support {
                 .expect("connect template db");
             super::run_migrations(&tpl).await.expect("migrate template");
             // CREATE DATABASE ... TEMPLATE refuses to run while the source
-            // still has connections, so close before returning.
+            // still has connections, so close before releasing the lock.
             tpl.close().await;
         }
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(TEMPLATE_LOCK)
-            .execute(admin)
+            .execute(&mut *conn)
             .await;
     }
 
