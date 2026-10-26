@@ -69,8 +69,7 @@ async fn signup_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mksignup_roundtrip").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mksignup_roundtrip").await;
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool));
@@ -125,8 +124,7 @@ async fn signup_duplicated_username() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mksignup_dup").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mksignup_dup").await;
 
     let username = format!("bob{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(test_state(pool));
@@ -149,9 +147,27 @@ async fn signup_duplicated_username() {
 }
 
 async fn fresh_pool(db: &str) -> mk_db::sqlx::PgPool {
-    let pool = mk_db::test_support::fresh_db(db).await;
-    mk_db::run_migrations(&pool).await.unwrap();
-    pool
+    // The runner occasionally wedges the first 0001 DDL for a fresh db (the
+    // advisory lock was acquired, then the DDL sat for 30+ minutes). The
+    // connection sets lock_timeout, so a stuck DDL now errors after 60s;
+    // retry on a rebuilt db, which DROP ... WITH (FORCE)s any stragglers.
+    let mut last = String::new();
+    for attempt in 1..=3 {
+        let pool = mk_db::test_support::fresh_db(db).await;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            mk_db::run_migrations(&pool),
+        )
+        .await
+        {
+            Ok(Ok(())) => return pool,
+            Ok(Err(e)) => last = format!("{e}"),
+            Err(_) => last = "timed out".to_string(),
+        }
+        pool.close().await;
+        eprintln!("fresh_pool({db}) migration attempt {attempt} failed: {last}");
+    }
+    panic!("fresh_pool({db}) migrations never succeeded: {last}");
 }
 
 async fn signup(app: &axum::Router, username: &str) -> Value {
@@ -3191,8 +3207,7 @@ async fn frequently_replied_orders_and_gates() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("freq_replied").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("freq_replied").await;
     let app = crate::build_router(test_state(pool));
 
     let alice = signup(&app, "fqa").await;
@@ -3412,8 +3427,7 @@ async fn pinned_users_lists_meta_accts() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("freq_pinned").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("freq_pinned").await;
     let app = crate::build_router(test_state(pool));
 
     let root = signup(&app, "root").await;
@@ -3491,8 +3505,7 @@ async fn delete_account_by_self_soft_flag_and_listed() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("delacct_self").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("delacct_self").await;
     let dbp = pool.clone();
     let app = crate::build_router(test_state(pool));
 
@@ -3624,8 +3637,7 @@ async fn delete_account_by_admin_gates_and_moderation_log() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("delacct_admin").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("delacct_admin").await;
     let dbp = pool.clone();
     let app = crate::build_router(test_state(pool));
 
@@ -3714,8 +3726,7 @@ async fn freq_pack_silenced_user_equals_users_show() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("freq_silenced_pack").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("freq_silenced_pack").await;
     let app = crate::build_router(test_state(pool));
 
     let root = signup(&app, "root").await;
@@ -3832,8 +3843,7 @@ async fn channels_follow_arena() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_channels_follow").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_channels_follow").await;
     let app = crate::build_router(test_state(pool));
 
     let (a_token, _) = channels_signup(app.clone(), "alice").await;
@@ -3882,8 +3892,7 @@ async fn channels_slice_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_channels_slice").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_channels_slice").await;
     let app = crate::build_router(test_state(pool));
 
     // the OWNER registers first: upstream SignupService L160-162 stamps the
@@ -4382,8 +4391,7 @@ async fn announcements_auto_archive_cycle() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_ann_archive").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_ann_archive").await;
     let app = crate::build_router(test_state(pool));
 
     // first signup = the SignupService rootUserId stroke-in proxy (the e2e
@@ -4516,8 +4524,7 @@ async fn announcements_invalid_dates_and_read_flow() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_ann_read").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_ann_read").await;
     let app = crate::build_router(test_state(pool));
 
     let admin = signup(&app, "root").await;
@@ -8275,9 +8282,8 @@ async fn clips_arena_crud_favorite_notes() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkclips_arena").await;
+    let pool = fresh_pool("mkclips_arena").await;
     // pool re-borrowed by the asserts below (E0382 triage, same as 05d5116)
-    mk_db::run_migrations(&pool).await.unwrap();
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
     // cross-lane compile triage (block lane): the pool is re-borrowed by the
@@ -11539,8 +11545,7 @@ async fn oauth_bearer_scope_gate() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkoauth_bearer").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkoauth_bearer").await;
 
     let username = format!("alice{}", mk_types::id::gen_aid_now());
     let app = crate::build_router(crate::AppState {
@@ -14634,8 +14639,7 @@ async fn fed2_verify_and_route_create_note_local_loop() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkfed2create").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkfed2create").await;
     let (author_id, private_pem) = fed2_user(&pool, "fed2author").await;
     let actor_uri = format!("https://{FED2_HOST}/users/{author_id}");
 
@@ -14716,8 +14720,7 @@ async fn fed2_follow_like_and_undo_rows() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkfed2follow").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkfed2follow").await;
     let (follower_id, follower_pem) = fed2_user(&pool, "fed2follower").await;
     let (followee_id, followee_pem) = fed2_user(&pool, "fed2followee").await;
     let follower_uri = format!("https://{FED2_HOST}/users/{follower_id}");
@@ -14942,8 +14945,7 @@ async fn fed2_unverifiable_routes_err_and_still_202s() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkfed2tamper").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkfed2tamper").await;
     let (author_id, private_pem) = fed2_user(&pool, "fed2author2").await;
     let actor_uri = format!("https://{FED2_HOST}/users/{author_id}");
 
@@ -16730,8 +16732,7 @@ async fn fed2_remote_activity_routing_persists_rows() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkfed2remote").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkfed2remote").await;
 
     let actor_uri = "https://remote.example/users/alice";
     let actor_doc = serde_json::json!({
@@ -16852,8 +16853,7 @@ async fn admin_emoji_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_emoji").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_admin_emoji").await;
     let app = crate::build_router(test_state(pool.clone()));
 
     // first signup = root (admin), second = plain user.
@@ -17059,8 +17059,7 @@ async fn admin_emoji_bulk_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_emoji_bulk").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_admin_emoji_bulk").await;
     let app = crate::build_router(test_state(pool.clone()));
 
     let admin = signup(&app, "root").await;
@@ -17212,8 +17211,7 @@ async fn admin_roles_crud_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_roles_crud").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_admin_roles_crud").await;
     let app = crate::build_router(test_state(pool));
 
     let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
@@ -17317,8 +17315,7 @@ async fn admin_ad_crud_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_admin_ad_crud").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_admin_ad_crud").await;
     let app = crate::build_router(test_state(pool));
 
     let root = signup(&app, &format!("root{}", mk_types::id::gen_aid_now())).await;
@@ -18627,8 +18624,7 @@ async fn channels_mute_delete_list_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkchannels_mute").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkchannels_mute").await;
     let app = crate::build_router(test_state(pool));
 
     let (a_token, _) = channels_signup(app.clone(), "alice").await;
@@ -18707,8 +18703,7 @@ async fn clips_remove_note_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkclips_remove_note").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkclips_remove_note").await;
     let app = crate::build_router(test_state(pool));
 
     let (a_token, _) = channels_signup(app.clone(), "alice").await;
@@ -18782,8 +18777,7 @@ async fn flash_arena_crud_like_list() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkflash_arena").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkflash_arena").await;
     let app = crate::build_router(test_state(pool));
 
     let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
@@ -20238,8 +20232,7 @@ async fn avatar_decorations_roundtrip() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_avatar_decorations").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_avatar_decorations").await;
     let app = crate::build_router(test_state(pool.clone()));
 
     // first signup = root (admin), second = plain user.
@@ -20612,8 +20605,7 @@ async fn pages_arena_crud_like_list() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mkpages_arena").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mkpages_arena").await;
     let app = crate::build_router(test_state(pool));
 
     let (a_token, a_id) = channels_signup(app.clone(), "alice").await;
@@ -22004,8 +21996,7 @@ async fn i_update_email_and_revoke_token() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mktest_i_small").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mktest_i_small").await;
     let app = crate::build_router(test_state(pool.clone()));
 
     let user = signup(&app, &format!("iu{}", mk_types::id::gen_aid_now())).await;
@@ -23753,8 +23744,7 @@ async fn notes_clips_lists_public_clips_containing_note() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_notes_clips").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_notes_clips").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nuc{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -23818,8 +23808,7 @@ async fn notes_show_partial_bulk_returns_minimal_packs() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_bulk").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_bulk").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nub{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -23864,8 +23853,7 @@ async fn users_flashs_lists_public_flashes_of_user() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_flashs").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_flashs").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nuf{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -23904,8 +23892,7 @@ async fn users_gallery_posts_lists_posts_of_user() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_gallery").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_gallery").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nug{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -23948,8 +23935,7 @@ async fn users_pages_lists_public_pages_of_user() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_pages").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_pages").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nup{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -23988,8 +23974,7 @@ async fn roles_list_and_show_public_explorable() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_roles").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_roles").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("nur{}", mk_types::id::gen_aid_now());
     let (_, v) = post_json(
@@ -24201,8 +24186,7 @@ async fn roles_users_lists_role_assignments() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_roles_users").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_roles_users").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, user_id) = nu2_signup(&app, &pool, "ru").await;
 
@@ -24244,8 +24228,7 @@ async fn roles_notes_lists_role_holder_notes() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_roles_notes").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_roles_notes").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, user_id) = nu2_signup(&app, &pool, "rn").await;
 
@@ -24292,8 +24275,7 @@ async fn users_achievements_returns_profile_array() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_ach").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_ach").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (_token, user_id) = nu2_signup(&app, &pool, "ac").await;
 
@@ -24308,8 +24290,7 @@ async fn users_recommendation_excludes_self_and_followees() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_rec").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_rec").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, me_id) = nu2_signup(&app, &pool, "ra").await;
     let (_btoken, bob_id) = nu2_signup(&app, &pool, "rb").await;
@@ -24336,8 +24317,7 @@ async fn users_featured_notes_returns_public_notes() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_feat").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_feat").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, user_id) = nu2_signup(&app, &pool, "fe").await;
 
@@ -24368,8 +24348,7 @@ async fn following_requests_reject_removes_pending() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_reject").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_reject").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, alice_id) = nu2_signup(&app, &pool, "rj").await;
     let (_btoken, bob_id) = nu2_signup(&app, &pool, "rk").await;
@@ -24412,8 +24391,7 @@ async fn following_requests_sent_lists_outgoing() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_sent").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_sent").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (_atoken, alice_id) = nu2_signup(&app, &pool, "sa").await;
     let (btoken, bob_id) = nu2_signup(&app, &pool, "sb").await;
@@ -24441,8 +24419,7 @@ async fn following_update_all_updates_rows() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_updall").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_updall").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (token, alice_id) = nu2_signup(&app, &pool, "ua").await;
     let (_btoken, bob_id) = nu2_signup(&app, &pool, "ub").await;
@@ -24478,8 +24455,7 @@ async fn hashtags_search_matches_prefix() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_tags").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_tags").await;
     let app = crate::build_router(test_state(pool.clone()));
 
     for (id, name, count) in [("h1", "misskey", 5), ("h2", "mastodon", 10)] {
@@ -24514,8 +24490,7 @@ async fn username_available_detects_existing_and_reserved() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_uname").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_uname").await;
     let app = crate::build_router(test_state(pool.clone()));
     let username = format!("un{}", &mk_types::id::gen_aid_now()[..8]);
     let (_, _) = post_json(
@@ -24559,8 +24534,7 @@ async fn email_address_available_checks_format_and_use() {
         return;
     }
     init_tracing();
-    let pool = mk_db::test_support::fresh_db("mknu2_email").await;
-    mk_db::run_migrations(&pool).await.unwrap();
+    let pool = fresh_pool("mknu2_email").await;
     let app = crate::build_router(test_state(pool.clone()));
     let (_token, user_id) = nu2_signup(&app, &pool, "em").await;
 

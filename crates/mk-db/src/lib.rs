@@ -149,7 +149,21 @@ pub mod hashtag;
 pub mod auth;
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new().max_connections(20).connect(url).await
+    // A migration DDL that waits on a lock must fail visibly instead of
+    // sitting forever: CI wedged for 30+ minutes inside the 0001 DDL with the
+    // advisory lock already acquired. 60s is well above normal lock waits.
+    PgPoolOptions::new()
+        .max_connections(20)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '60000ms'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
 }
 
 /// Runs the embedded migrations (baseline `0001_init.sql` is generated in CI
