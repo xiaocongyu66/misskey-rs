@@ -37,8 +37,16 @@ jobs:
       - name: Test
         # Tests clone a pre-migrated template database instead of replaying
         # the 40k-line 0001 DDL per test, so one serial process is fast.
-        timeout-minutes: 20
-        run: cargo test --workspace -- --test-threads=1
+        timeout-minutes: 30
+        # cargo test --workspace runs one process per test target, all in
+        # parallel; their migrations contend on sqlx's global advisory lock
+        # (lock_timeout does not reliably interrupt that wait). Run the
+        # binaries one at a time instead.
+        run: |
+          cargo test -p misskey-rs --bins -- --test-threads=1
+          cargo test -p mk-db --lib -- --test-threads=1
+          cargo test -p mk-core --lib -- --test-threads=1
+          cargo test -p mk-ap --lib -- --test-threads=1
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/misskey_test
       - name: Dump Postgres state (diagnostics)
