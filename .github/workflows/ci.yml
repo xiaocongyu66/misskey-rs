@@ -23,7 +23,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
           --shm-size=1g
-          --tmpfs /var/lib/postgresql/data/pg_wal:size=1g
+          --tmpfs /var/lib/postgresql/data:size=6g
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
