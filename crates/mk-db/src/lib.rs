@@ -235,6 +235,12 @@ pub mod test_support {
     const TEMPLATE_DB: &str = "mk_schema_template";
     const TEMPLATE_LOCK: i64 = 0x6d6b_746d_706c_0001;
 
+    /// The db this process handed out last. Clones are ~20MB each, so a full
+    /// serial suite would otherwise pile 165 of them into the tmpfs and hit
+    /// "No space left on device". Each process only drops its own previous
+    /// db, so parallel test binaries never touch each other's.
+    static PREV_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
     pub async fn fresh_db(db_suffix: &str) -> PgPool {
         let base = std::env::var("DATABASE_URL").unwrap_or_default();
         assert!(!base.is_empty(), "DATABASE_URL required for db tests");
@@ -242,6 +248,17 @@ pub mod test_support {
         let admin_url = swap_db(&base, "postgres");
         let admin = connect_test(&admin_url).await;
         ensure_template(&base, &admin).await;
+        let prev = {
+            let mut guard = PREV_DB.lock().unwrap();
+            guard.replace(db_suffix.to_string())
+        };
+        if let Some(prev) = prev {
+            if prev != db_suffix {
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", prev))
+                    .execute(&admin)
+                    .await;
+            }
+        }
         sqlx::query(&format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             db_suffix
