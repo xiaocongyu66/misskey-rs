@@ -206,6 +206,30 @@ pub mod test_support {
     use super::*;
     use sqlx::postgres::PgConnectOptions;
 
+    /// Test connections skip WAL fsync: the 0001 DDL commits thousands of
+    /// times and a slow runner disk turned each fsync into a wedge. Test data
+    /// has no durability requirement. statement_timeout keeps a pathological
+    /// DDL from sitting silently for the whole job.
+    async fn connect_test(url: &str) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(10)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    for stmt in [
+                        "SET synchronous_commit = off",
+                        "SET lock_timeout = '60000ms'",
+                        "SET statement_timeout = '300s'",
+                    ] {
+                        sqlx::query(stmt).execute(&mut *conn).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await
+            .expect("connect test db")
+    }
+
     /// One migrated database per PG server; every test clones it, which is
     /// milliseconds instead of running the 40k-line 0001 DDL 200+ times.
     const TEMPLATE_DB: &str = "mk_schema_template";
@@ -216,7 +240,7 @@ pub mod test_support {
         assert!(!base.is_empty(), "DATABASE_URL required for db tests");
 
         let admin_url = swap_db(&base, "postgres");
-        let admin = connect(&admin_url).await.expect("connect admin db");
+        let admin = connect_test(&admin_url).await;
         ensure_template(&base, &admin).await;
         sqlx::query(&format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
@@ -234,9 +258,7 @@ pub mod test_support {
         .expect("clone template db");
         admin.close().await;
 
-        connect(&swap_db(&base, db_suffix))
-            .await
-            .expect("connect test db")
+        connect_test(&swap_db(&base, db_suffix)).await
     }
 
     async fn template_exists(admin: &PgPool) -> bool {
@@ -268,9 +290,7 @@ pub mod test_support {
                 .execute(&mut *conn)
                 .await
                 .expect("create template db");
-            let tpl = connect(&swap_db(base, TEMPLATE_DB))
-                .await
-                .expect("connect template db");
+            let tpl = connect_test(&swap_db(base, TEMPLATE_DB)).await;
             super::run_migrations(&tpl).await.expect("migrate template");
             // CREATE DATABASE ... TEMPLATE refuses to run while the source
             // still has connections, so close before releasing the lock.
