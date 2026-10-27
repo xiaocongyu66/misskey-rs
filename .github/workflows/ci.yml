@@ -33,6 +33,26 @@ jobs:
         run: cargo fmt --all --check
       - name: Build
         run: cargo build --workspace --all-targets
+      - name: Tune Postgres for tests
+        # The 0001 migration commits thousands of times; when WAL buffers fill
+        # it forces an XLogFlush, and fsync() is an uninterruptible syscall, so
+        # neither statement_timeout nor synchronous_commit can stop a slow
+        # runner disk from wedging the job for 20+ minutes. Test data has no
+        # durability requirement: turn fsync off at the server.
+        run: |
+          CID=$(docker ps -q -f ancestor=postgres:16)
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET fsync = off"
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET full_page_writes = off"
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET synchronous_commit = off"
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET wal_level = minimal"
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET max_wal_size = '4GB'"
+          docker exec $CID psql -U postgres -c "ALTER SYSTEM SET checkpoint_timeout = '30min'"
+          docker restart $CID
+          for i in $(seq 1 60); do
+            docker exec $CID pg_isready -U postgres && break
+            sleep 2
+          done
+          docker exec $CID psql -U postgres -c "SHOW fsync" 
       - name: Test
         # Tests clone a pre-migrated template database instead of replaying
         # the 40k-line 0001 DDL per test, so one serial process is fast.
